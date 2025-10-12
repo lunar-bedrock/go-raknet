@@ -4,11 +4,12 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"github.com/sandertv/go-raknet/internal/message"
 	"hash/crc32"
 	"log/slog"
 	"net"
 	"time"
+
+	"github.com/sandertv/go-raknet/internal/message"
 )
 
 type connectionHandler interface {
@@ -164,7 +165,7 @@ func (h listenerConnectionHandler) handle(conn *Conn, b []byte) (handled bool, e
 		return true, nil
 	case message.IDDetectLostConnections:
 		// Let the other end know the connection is still alive.
-		return true, conn.send(&message.ConnectedPing{PingTime: timestamp()})
+		return true, conn.send(&message.ConnectedPing{PingTime: uptime()})
 	default:
 		return false, nil
 	}
@@ -177,7 +178,7 @@ func (h listenerConnectionHandler) handleConnectionRequest(conn *Conn, b []byte)
 	if err := pk.UnmarshalBinary(b); err != nil {
 		return fmt.Errorf("read CONNECTION_REQUEST: %w", err)
 	}
-	return conn.send(&message.ConnectionRequestAccepted{ClientAddress: resolve(conn.raddr), PingTime: pk.RequestTime, PongTime: timestamp()})
+	return conn.send(&message.ConnectionRequestAccepted{ClientAddress: resolve(conn.raddr), PingTime: pk.RequestTime, PongTime: uptime()})
 }
 
 // handleNewIncomingConnection handles an incoming connection packet from the
@@ -229,7 +230,7 @@ func (h dialerConnectionHandler) handle(conn *Conn, b []byte) (handled bool, err
 		return true, nil
 	case message.IDDetectLostConnections:
 		// Let the other end know the connection is still alive.
-		return true, conn.send(&message.ConnectedPing{PingTime: timestamp()})
+		return true, conn.send(&message.ConnectedPing{PingTime: uptime()})
 	default:
 		return false, nil
 	}
@@ -247,7 +248,7 @@ func (h dialerConnectionHandler) handleConnectionRequestAccepted(conn *Conn, b [
 		return errUnexpectedAdditionalCRA
 	default:
 		// Make sure to send NewIncomingConnection before closing conn.connected.
-		err := conn.send(&message.NewIncomingConnection{ServerAddress: resolve(conn.raddr), PingTime: pk.PongTime, PongTime: timestamp()})
+		err := conn.send(&message.NewIncomingConnection{ServerAddress: resolve(conn.raddr), PingTime: pk.PongTime, PongTime: uptime()})
 		close(conn.connected)
 		return err
 	}
@@ -256,13 +257,13 @@ func (h dialerConnectionHandler) handleConnectionRequestAccepted(conn *Conn, b [
 // handleConnectedPing handles a connected ping packet inside of buffer b. An
 // error is returned if the packet was invalid.
 func handleConnectedPing(conn *Conn, b []byte) error {
-	pk := message.ConnectedPing{}
+	pk := &message.ConnectedPing{}
 	if err := pk.UnmarshalBinary(b); err != nil {
 		return fmt.Errorf("read CONNECTED_PING: %w", err)
 	}
 	// Respond with a connected pong that has the ping timestamp found in the
 	// connected ping, and our own timestamp for the pong timestamp.
-	return conn.send(&message.ConnectedPong{PingTime: pk.PingTime, PongTime: timestamp()})
+	return conn.send(&message.ConnectedPong{PingTime: pk.PingTime, PongTime: uptime()})
 }
 
 // handleConnectedPong handles a connected pong packet inside of buffer b. An

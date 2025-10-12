@@ -6,8 +6,6 @@ import (
 	"encoding"
 	"errors"
 	"fmt"
-	"github.com/sandertv/go-raknet/internal"
-	"github.com/sandertv/go-raknet/internal/message"
 	"io"
 	"net"
 	"net/netip"
@@ -15,6 +13,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/sandertv/go-raknet/internal"
+	"github.com/sandertv/go-raknet/internal/message"
 )
 
 const (
@@ -162,7 +163,7 @@ func (conn *Conn) startTicking() {
 			}
 			if i%5 == 0 {
 				// Ping the other end periodically to prevent timeouts.
-				_ = conn.send(&message.ConnectedPing{PingTime: timestamp()})
+				_ = conn.send(&message.ConnectedPing{PingTime: uptime()})
 
 				conn.mu.Lock()
 				if t.Sub(*conn.lastActivity.Load()) > time.Second*5+conn.retransmission.rtt(t)*2 {
@@ -653,6 +654,12 @@ func (conn *Conn) writeTo(p []byte, raddr net.Addr) error {
 		conn.handler.log().Error("write to: "+err.Error(), "raddr", raddr.String())
 	}
 	return nil
+}
+
+var startTime = time.Now()
+
+func uptime() int64 {
+	return time.Since(startTime).Milliseconds()
 }
 
 // timestamp returns a timestamp in milliseconds.
