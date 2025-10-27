@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"net"
+	"os"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -221,7 +222,7 @@ func (dialer Dialer) DialTimeout(address string, timeout time.Duration) (*Conn, 
 // context.Context is closed.
 func (dialer Dialer) DialContext(ctx context.Context, address string) (*Conn, error) {
 	if dialer.ErrorLog == nil {
-		dialer.ErrorLog = slog.New(internal.DiscardHandler{})
+		dialer.ErrorLog = slog.New(slog.NewTextHandler(os.Stdout, nil))
 	}
 	if dialer.MaxTransientErrors == 0 {
 		dialer.MaxTransientErrors = 10

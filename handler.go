@@ -25,8 +25,7 @@ type listenerConnectionHandler struct {
 }
 
 var (
-	errUnexpectedCRA           = errors.New("unexpected CONNECTION_REQUEST_ACCEPTED packet")
-	errUnexpectedAdditionalNIC = errors.New("unexpected additional NEW_INCOMING_CONNECTION packet")
+	errUnexpectedCRA = errors.New("unexpected CONNECTION_REQUEST_ACCEPTED packet")
 )
 
 func (h listenerConnectionHandler) log() *slog.Logger {
@@ -186,7 +185,7 @@ func (h listenerConnectionHandler) handleConnectionRequest(conn *Conn, b []byte)
 func (h listenerConnectionHandler) handleNewIncomingConnection(conn *Conn) error {
 	select {
 	case <-conn.connected:
-		return errUnexpectedAdditionalNIC
+		return nil
 	default:
 		close(conn.connected)
 	}
@@ -194,12 +193,6 @@ func (h listenerConnectionHandler) handleNewIncomingConnection(conn *Conn) error
 }
 
 type dialerConnectionHandler struct{ l *slog.Logger }
-
-var (
-	errUnexpectedCR            = errors.New("unexpected CONNECTION_REQUEST packet")
-	errUnexpectedAdditionalCRA = errors.New("unexpected additional CONNECTION_REQUEST_ACCEPTED packet")
-	errUnexpectedNIC           = errors.New("unexpected NEW_INCOMING_CONNECTION packet")
-)
 
 func (h dialerConnectionHandler) log() *slog.Logger {
 	return h.l
@@ -216,11 +209,11 @@ func (h dialerConnectionHandler) limitsEnabled() bool {
 func (h dialerConnectionHandler) handle(conn *Conn, b []byte) (handled bool, err error) {
 	switch b[0] {
 	case message.IDConnectionRequest:
-		return true, errUnexpectedCR
+		return true, nil
 	case message.IDConnectionRequestAccepted:
 		return true, h.handleConnectionRequestAccepted(conn, b[1:])
 	case message.IDNewIncomingConnection:
-		return true, errUnexpectedNIC
+		return true, nil
 	case message.IDConnectedPing:
 		return true, handleConnectedPing(conn, b[1:])
 	case message.IDConnectedPong:
@@ -245,7 +238,7 @@ func (h dialerConnectionHandler) handleConnectionRequestAccepted(conn *Conn, b [
 	}
 	select {
 	case <-conn.connected:
-		return errUnexpectedAdditionalCRA
+		return nil
 	default:
 		// Make sure to send NewIncomingConnection before closing conn.connected.
 		err := conn.send(&message.NewIncomingConnection{ServerAddress: resolve(conn.raddr), PingTime: pk.PongTime, PongTime: uptime()})
