@@ -258,8 +258,12 @@ func (conn *Conn) write(b []byte) (n int, err error) {
 		copy(pk.content, content)
 
 		pk.orderIndex = orderIndex
+		pk.orderChannel = 0
 		pk.messageIndex = conn.messageIndex.Inc()
-		if pk.split = len(fragments) > 1; pk.split {
+		pk.split = len(fragments) > 1
+		fmt.Printf("[RAKNET DEBUG SEND] Creating packet: orderIndex=%d, orderChannel=%d, messageIndex=%d, split=%v, fragmentCount=%d\n",
+			pk.orderIndex, pk.orderChannel, pk.messageIndex, pk.split, len(fragments))
+		if pk.split {
 			// If there were more than one fragment, the pk was split, so we
 			// need to make sure we set the appropriate fields.
 			pk.splitCount = uint32(len(fragments))
@@ -453,12 +457,12 @@ func (conn *Conn) receivePacket(packet *packet) error {
 		// If it isn't a reliable ordered packet, handle it immediately.
 		return conn.handlePacket(packet.content)
 	}
-	if !conn.packetQueue.put(packet.orderIndex, packet.content) {
+	if !conn.packetQueue.put(packet.orderChannel, packet.orderIndex, packet.content) {
 		// An ordered packet arrived twice.
 		return nil
 	}
-	if conn.packetQueue.WindowSize() > maxWindowSize && conn.handler.limitsEnabled() {
-		return fmt.Errorf("packet queue window size is too big (%v-%v)", conn.packetQueue.lowest, conn.packetQueue.highest)
+	if size := conn.packetQueue.WindowSize(); size > maxWindowSize && conn.handler.limitsEnabled() {
+		return fmt.Errorf("packet queue window size is too big (%v)", size)
 	}
 	for _, content := range conn.packetQueue.fetch() {
 		if err := conn.handlePacket(content); err != nil {

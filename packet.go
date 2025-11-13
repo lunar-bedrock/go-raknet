@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 )
 
@@ -56,6 +57,7 @@ type packet struct {
 	messageIndex  uint24
 	sequenceIndex uint24
 	orderIndex    uint24
+	orderChannel  byte
 
 	content []byte
 
@@ -82,8 +84,9 @@ func (pk *packet) write(buf *bytes.Buffer) {
 	}
 	if pk.sequencedOrOrdered() {
 		writeUint24(buf, pk.orderIndex)
-		// Order channel, we don't care about this.
-		buf.WriteByte(0)
+		buf.WriteByte(pk.orderChannel)
+		fmt.Printf("[RAKNET DEBUG WRITE] reliability=%d, orderIndex=%d, orderChannel=%d, split=%v\n",
+			pk.reliability, pk.orderIndex, pk.orderChannel, pk.split)
 	}
 	if pk.split {
 		writeUint32(buf, pk.splitCount)
@@ -129,6 +132,9 @@ func (pk *packet) read(b []byte) (int, error) {
 			return 0, io.ErrUnexpectedEOF
 		}
 		pk.orderIndex = loadUint24(b[offset:])
+		pk.orderChannel = b[offset+3]
+		fmt.Printf("[RAKNET DEBUG READ] reliability=%d, orderIndex=%d, orderChannel=%d, split=%v, contentLen=%d\n",
+			pk.reliability, pk.orderIndex, pk.orderChannel, pk.split, n)
 		// Order channel (byte)
 		offset += 4
 	}
