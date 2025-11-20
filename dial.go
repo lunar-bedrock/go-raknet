@@ -472,6 +472,10 @@ func isTransientUDPReadError(err error) bool {
 		switch errno {
 		case syscall.ECONNREFUSED, syscall.EHOSTUNREACH, syscall.ENETUNREACH, syscall.ECONNRESET:
 			return true
+		case syscall.EMSGSIZE:
+			// Message too long - received datagram larger than buffer
+			// This can happen with malformed or malicious packets during handshake
+			return true
 		}
 	}
 	return false
