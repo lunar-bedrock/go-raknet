@@ -314,7 +314,11 @@ type connState struct {
 	maxTransientErrors  int8
 }
 
-var mtuSizes = []uint16{1492, 1200, 576}
+const (
+	maxSupportedMTU = 1492
+	minSupportedMTU = 576
+)
+var mtuSizes = []uint16{maxSupportedMTU, 1200, minSupportedMTU}
 
 // discoverMTU starts discovering an MTU size, the maximum packet size we
 // can send, by sending multiple open connection request 1 packets to the
