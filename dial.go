@@ -9,7 +9,6 @@ import (
 	"net"
 	"os"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/sandertv/go-raknet/internal"
@@ -462,25 +461,4 @@ func (state *connState) openConnectionRequest2(mtu uint16) {
 // close closes the underlying connection.
 func (state *connState) close() {
 	_ = state.conn.Close()
-}
-
-// isTransientUDPReadError returns true for read errors on connected UDP sockets
-// commonly caused by ICMP errors. These may be due to lossy client networks or
-// normal transient conditions, and are safe to retry during the handshake.
-func isTransientUDPReadError(err error) bool {
-	if err == nil {
-		return false
-	}
-	var errno syscall.Errno
-	if errors.As(err, &errno) {
-		switch errno {
-		case syscall.ECONNREFUSED, syscall.EHOSTUNREACH, syscall.ENETUNREACH, syscall.ECONNRESET:
-			return true
-		case syscall.EMSGSIZE:
-			// Message too long - received datagram larger than buffer
-			// This can happen with malformed or malicious packets during handshake
-			return true
-		}
-	}
-	return false
 }
