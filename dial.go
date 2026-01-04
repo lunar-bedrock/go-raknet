@@ -106,7 +106,7 @@ type Dialer struct {
 	// If there is no limit it will continue to retry reading until the context deadline.
 	// Default is 10. -1 means no limit.
 	// This is only used for the initial connection handshake.
-	MaxTransientErrors int8
+	MaxTransientErrors int
 }
 
 // Ping sends a ping to an address and returns the response obtained. If
@@ -247,7 +247,6 @@ func (dialer Dialer) DialContext(ctx context.Context, address string) (*Conn, er
 	} else if err = cs.openConnection(ctx); err != nil {
 		return nil, dialer.error("dial", fmt.Errorf("open connection: %w", err))
 	}
-
 	return dialer.connect(ctx, cs)
 }
 
@@ -310,14 +309,15 @@ type connState struct {
 
 	ticker *time.Ticker
 
-	transientErrorCount int8
-	maxTransientErrors  int8
+	transientErrorCount int
+	maxTransientErrors  int
 }
 
 const (
 	maxSupportedMTU = 1492
 	minSupportedMTU = 576
 )
+
 var mtuSizes = []uint16{maxSupportedMTU, 1200, minSupportedMTU}
 
 // discoverMTU starts discovering an MTU size, the maximum packet size we
