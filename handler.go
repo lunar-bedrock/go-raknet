@@ -120,15 +120,28 @@ func (h listenerConnectionHandler) handleOpenConnectionRequest2(b []byte, addr n
 	}
 	mtuSize := min(pk.MTU, maxMTUSize)
 
-	data, _ := (&message.OpenConnectionReply2{ServerGUID: h.l.id, ClientAddress: resolve(addr), MTU: mtuSize}).MarshalBinary()
-	if _, err := h.l.conn.WriteTo(data, addr); err != nil {
-		return fmt.Errorf("send OPEN_CONNECTION_REPLY_2: %w", err)
+	addrPort := resolve(addr)
+
+	// If we already have a connection/session for this address, this packet is
+	// a duplicate/retry (client may have missed our Reply2). Re-send Reply2,
+	// mirroring tokio-raknet's behavior.
+	if existing, found := h.l.connections.Load(addrPort); found {
+		conn := existing.(*Conn)
+		data, _ := (&message.OpenConnectionReply2{
+			ServerGUID:    h.l.id,
+			ClientAddress: addrPort,
+			MTU:           conn.mtu,
+		}).MarshalBinary()
+		_, err := h.l.conn.WriteTo(data, addr)
+		return err
 	}
 
-	go func() {
-		conn := newConn(h.l.conn, addr, mtuSize, h)
-		h.l.connections.Store(resolve(addr), conn)
+	// Create and store the connection *before* replying so immediate retries can
+	// find the session and we avoid spawning duplicate conns.
+	conn := newConn(h.l.conn, addr, mtuSize, h)
+	h.l.connections.Store(addrPort, conn)
 
+	go func() {
 		t := time.NewTimer(time.Second * 10)
 		defer t.Stop()
 		select {
@@ -138,12 +151,26 @@ func (h listenerConnectionHandler) handleOpenConnectionRequest2(b []byte, addr n
 			h.l.incoming <- conn
 		case <-h.l.closed:
 			_ = conn.Close()
+			h.l.connections.Delete(addrPort)
 		case <-t.C:
 			// It took too long to complete this connection. We close it and go
 			// back to accepting.
 			_ = conn.Close()
+			h.l.connections.Delete(addrPort)
 		}
 	}()
+
+	data, _ := (&message.OpenConnectionReply2{
+		ServerGUID:    h.l.id,
+		ClientAddress: addrPort,
+		MTU:           conn.mtu,
+	}).MarshalBinary()
+	if _, err := h.l.conn.WriteTo(data, addr); err != nil {
+		// Best-effort cleanup: if we couldn't reply, tear down the pending conn.
+		h.l.connections.Delete(addrPort)
+		conn.closeImmediately()
+		return fmt.Errorf("send OPEN_CONNECTION_REPLY_2: %w", err)
+	}
 	return nil
 }
 

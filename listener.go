@@ -3,7 +3,6 @@ package raknet
 import (
 	"errors"
 	"fmt"
-	"github.com/sandertv/go-raknet/internal"
 	"log/slog"
 	"maps"
 	"math"
@@ -12,6 +11,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/sandertv/go-raknet/internal"
+	"github.com/sandertv/go-raknet/internal/message"
 )
 
 // UpstreamPacketListener allows for a custom PacketListener implementation.
@@ -188,7 +190,7 @@ func (listener *Listener) listen() {
 				close(listener.incoming)
 				return
 			}
-			listener.conf.ErrorLog.Error("read from: " + err.Error(), "raddr", addrStr)
+			listener.conf.ErrorLog.Error("read from: "+err.Error(), "raddr", addrStr)
 			continue
 		} else if n == 0 || listener.sec.blocked(addr) {
 			continue
@@ -203,6 +205,17 @@ func (listener *Listener) listen() {
 // handle handles an incoming packet in buffer b from the address passed. If
 // not successful, an error is returned describing the issue.
 func (listener *Listener) handle(b []byte, addr net.Addr) error {
+	// Check if this is an unconnected handshake packet. These should always
+	// be handled by handleUnconnected, even if a connection already exists
+	// (to support retries during handshake).
+	if len(b) > 0 {
+		switch b[0] {
+		case message.IDUnconnectedPing, message.IDUnconnectedPingOpenConnections,
+			message.IDOpenConnectionRequest1, message.IDOpenConnectionRequest2:
+			return listener.handler.handleUnconnected(b, addr)
+		}
+	}
+
 	value, found := listener.connections.Load(resolve(addr))
 	if !found {
 		return listener.handler.handleUnconnected(b, addr)
