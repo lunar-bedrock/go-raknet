@@ -121,6 +121,12 @@ func (h listenerConnectionHandler) handleOpenConnectionRequest2(b []byte, addr n
 		pk.Cookie != h.cookie(addr, h.previousSalt.Load()) {
 		return fmt.Errorf("handle OPEN_CONNECTION_REQUEST_2: invalid cookie '%x', expected '%x'", pk.Cookie, expected)
 	}
+
+	// Vanilla clients always provide a negative ClientGUID.
+	if pk.ClientGUID >= 0 {
+		return fmt.Errorf("handle OPEN_CONNECTION_REQUEST_2: invalid ClientGUID '%d', expected negative", pk.ClientGUID)
+	}
+
 	mtuSize := min(pk.MTU, maxMTUSize)
 
 	data, _ := (&message.OpenConnectionReply2{ServerGUID: h.l.id, ClientAddress: resolve(addr), MTU: mtuSize}).MarshalBinary()
@@ -167,7 +173,7 @@ func (h listenerConnectionHandler) handle(conn *Conn, b []byte) (handled bool, e
 		return true, nil
 	case message.IDDetectLostConnections:
 		// Let the other end know the connection is still alive.
-		return true, conn.send(&message.ConnectedPing{PingTime: uptime()})
+		return true, conn.send(&message.ConnectedPing{PingTime: timestamp()})
 	default:
 		return false, nil
 	}
@@ -180,7 +186,7 @@ func (h listenerConnectionHandler) handleConnectionRequest(conn *Conn, b []byte)
 	if err := pk.UnmarshalBinary(b); err != nil {
 		return fmt.Errorf("read CONNECTION_REQUEST: %w", err)
 	}
-	return conn.send(&message.ConnectionRequestAccepted{ClientAddress: resolve(conn.raddr), PingTime: pk.RequestTime, PongTime: uptime()})
+	return conn.send(&message.ConnectionRequestAccepted{ClientAddress: resolve(conn.raddr), PingTime: pk.RequestTime, PongTime: timestamp()})
 }
 
 // handleNewIncomingConnection handles an incoming connection packet from the
@@ -226,7 +232,7 @@ func (h dialerConnectionHandler) handle(conn *Conn, b []byte) (handled bool, err
 		return true, nil
 	case message.IDDetectLostConnections:
 		// Let the other end know the connection is still alive.
-		return true, conn.send(&message.ConnectedPing{PingTime: uptime()})
+		return true, conn.send(&message.ConnectedPing{PingTime: timestamp()})
 	default:
 		return false, nil
 	}
@@ -244,7 +250,7 @@ func (h dialerConnectionHandler) handleConnectionRequestAccepted(conn *Conn, b [
 		return nil
 	default:
 		// Make sure to send NewIncomingConnection before closing conn.connected.
-		err := conn.send(&message.NewIncomingConnection{ServerAddress: resolve(conn.raddr), PingTime: pk.PongTime, PongTime: uptime()})
+		err := conn.send(&message.NewIncomingConnection{ServerAddress: resolve(conn.raddr), PingTime: pk.PongTime, PongTime: timestamp()})
 		close(conn.connected)
 		return err
 	}

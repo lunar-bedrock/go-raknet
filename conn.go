@@ -163,7 +163,7 @@ func (conn *Conn) startTicking() {
 			}
 			if i%5 == 0 {
 				// Ping the other end periodically to prevent timeouts.
-				_ = conn.send(&message.ConnectedPing{PingTime: uptime()})
+				_ = conn.send(&message.ConnectedPing{PingTime: timestamp()})
 
 				conn.mu.Lock()
 				if t.Sub(*conn.lastActivity.Load()) > time.Second*5+conn.retransmission.rtt(t)*2 {
@@ -682,13 +682,10 @@ func (conn *Conn) writeTo(p []byte, raddr net.Addr) error {
 	return nil
 }
 
+// startTime is the time the system or client was started.
 var startTime = time.Now()
 
-func uptime() int64 {
-	return time.Since(startTime).Milliseconds()
-}
-
-// timestamp returns a timestamp in milliseconds.
+// timestamp returns a timestamp since startTime in milliseconds.
 func timestamp() int64 {
-	return time.Now().UnixNano() / int64(time.Millisecond)
+	return time.Since(startTime).Milliseconds()
 }
