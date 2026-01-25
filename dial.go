@@ -188,7 +188,8 @@ func (dialer Dialer) dial(ctx context.Context, address string) (net.Conn, error)
 }
 
 // dialerID is a counter used to produce an ID for the client.
-var dialerID = rand.Int64()
+// This should always be negative as per the vanilla client implementation.
+var dialerID = -rand.Int64()
 
 // Dial attempts to dial a RakNet connection to the address passed. The address
 // may be either an IP address or a hostname, combined with a port that is
@@ -370,7 +371,7 @@ func (state *connState) discoverMTU(ctx context.Context) error {
 func (state *connState) request1(ctx context.Context, sizes []uint16) {
 	state.ticker.Reset(time.Second / 2)
 	for _, size := range sizes {
-		for range 3 {
+		for range 4 {
 			state.openConnectionRequest1(size)
 			select {
 			case <-state.ticker.C:

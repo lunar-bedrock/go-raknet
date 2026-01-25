@@ -122,6 +122,12 @@ func (h listenerConnectionHandler) handleOpenConnectionRequest2(b []byte, addr n
 		pk.Cookie != h.cookie(addr, h.previousSalt.Load()) {
 		return fmt.Errorf("handle OPEN_CONNECTION_REQUEST_2: invalid cookie '%x', expected '%x'", pk.Cookie, expected)
 	}
+
+	// Vanilla clients always provide a negative ClientGUID.
+	if pk.ClientGUID >= 0 {
+		return fmt.Errorf("handle OPEN_CONNECTION_REQUEST_2: invalid ClientGUID '%d', expected negative", pk.ClientGUID)
+	}
+
 	mtuSize := min(pk.MTU, maxMTUSize)
 
 	data, _ := (&message.OpenConnectionReply2{ServerGUID: h.l.id, ClientAddress: resolve(addr), MTU: mtuSize}).MarshalBinary()

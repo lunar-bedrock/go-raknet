@@ -682,7 +682,10 @@ func (conn *Conn) writeTo(p []byte, raddr net.Addr) error {
 	return nil
 }
 
-// timestamp returns a timestamp in milliseconds.
+// startTime is the time the system or client was started.
+var startTime = time.Now()
+
+// timestamp returns a timestamp since startTime in milliseconds.
 func timestamp() int64 {
-	return time.Now().UnixNano() / int64(time.Millisecond)
+	return time.Since(startTime).Milliseconds()
 }
