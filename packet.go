@@ -3,7 +3,6 @@ package raknet
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
 	"io"
 )
 
@@ -126,9 +125,6 @@ func (pk *packet) read(b []byte) (int, error) {
 	pk.reliability = reliability((header & 224) >> 5)
 
 	n := binary.BigEndian.Uint16(b[1:]) >> 3
-	if n == 0 {
-		return 0, errors.New("invalid packet length: cannot be 0")
-	}
 	offset := 3
 
 	if pk.reliability.reliable() {

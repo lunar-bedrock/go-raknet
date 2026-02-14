@@ -236,6 +236,9 @@ func (conn *Conn) writeWithReliability(b []byte, rel reliability) (n int, err er
 	case <-conn.ctx.Done():
 		return 0, conn.error(net.ErrClosed, "write")
 	default:
+		if len(b) == 0 {
+			return 0, nil
+		}
 		conn.mu.Lock()
 		defer conn.mu.Unlock()
 		n, err = conn.write(b, rel)
@@ -492,14 +495,13 @@ func (conn *Conn) receivePacket(packet *packet) error {
 	return nil
 }
 
-var errZeroPacket = errors.New("handle packet: zero packet length")
-
 // handlePacket handles a packet serialised in byte slice b. If not successful,
 // an error is returned. If the packet was not handled by RakNet, it is sent to
 // the packet channel.
 func (conn *Conn) handlePacket(b []byte) error {
 	if len(b) == 0 {
-		return errZeroPacket
+		// Empty packets can safely be ignored.
+		return nil
 	}
 	if conn.closing.Load() != 0 {
 		// Don't continue handling packets if the connection is being closed.
@@ -552,7 +554,7 @@ func (conn *Conn) receiveSplitPacket(p *packet) error {
 	}
 	m[p.splitIndex] = p.content
 
-	if slices.ContainsFunc(m, func(i []byte) bool { return len(i) == 0 }) {
+	if slices.ContainsFunc(m, func(i []byte) bool { return i == nil }) {
 		// We haven't yet received all split fragments, so we cannot add the
 		// packets together yet.
 		return nil
