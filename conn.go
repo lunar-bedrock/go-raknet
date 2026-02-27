@@ -45,6 +45,9 @@ type Conn struct {
 	conn    net.PacketConn
 	raddr   net.Addr
 	handler connectionHandler
+	// clientGUID is the GUID observed in OPEN_CONNECTION_REQUEST_2 and later
+	// validated against CONNECTION_REQUEST on listeners.
+	clientGUID int64
 
 	once      sync.Once
 	connected chan struct{}

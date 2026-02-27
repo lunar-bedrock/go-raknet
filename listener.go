@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/sandertv/go-raknet/internal"
+	"github.com/sandertv/go-raknet/internal/message"
 )
 
 // UpstreamPacketListener allows for a custom PacketListener implementation.
@@ -41,6 +42,9 @@ type ListenConfig struct {
 	// BlockDuration defaults to 10s. If set to a negative value, IP addresses
 	// are never blocked on errors.
 	BlockDuration time.Duration
+	// MaxConnections limits the number of active incoming connections. A value
+	// of 0 means no limit.
+	MaxConnections int
 }
 
 // Listener implements a RakNet connection listener. It follows the same
@@ -62,6 +66,8 @@ type Listener struct {
 	// connections is a map of currently active connections, indexed by their
 	// address.
 	connections sync.Map
+	// connectionCount tracks the number of currently active connections.
+	connectionCount atomic.Int64
 
 	// id is a random server ID generated upon starting listening. It is used
 	// several times throughout the connection sequence of RakNet.
@@ -218,6 +224,9 @@ func (listener *Listener) handle(b []byte, addr net.Addr) error {
 		return listener.handler.handleUnconnected(b, addr)
 	}
 	conn := value.(*Conn)
+	if len(b) != 0 && b[0] == message.IDOpenConnectionRequest2 {
+		return listener.handler.handleOpenConnectionRequest2Duplicate(conn, b[1:], addr)
+	}
 	select {
 	case <-conn.ctx.Done():
 		// Connection was closed already.

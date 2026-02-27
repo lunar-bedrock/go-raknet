@@ -1,6 +1,7 @@
 package raknet
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -242,8 +243,11 @@ func (dialer Dialer) DialContext(ctx context.Context, address string) (*Conn, er
 	}
 	defer cs.ticker.Stop()
 	if err = cs.discoverMTU(ctx); err != nil {
+		cs.close()
 		return nil, dialer.error("dial", fmt.Errorf("discover mtu: %w", err))
-	} else if err = cs.openConnection(ctx); err != nil {
+	}
+	if err = cs.openConnection(ctx); err != nil {
+		cs.close()
 		return nil, dialer.error("dial", fmt.Errorf("open connection: %w", err))
 	}
 	return dialer.connect(ctx, cs)
@@ -257,13 +261,17 @@ func (dialer Dialer) connect(ctx context.Context, state *connState) (*Conn, erro
 		return nil, dialer.error("dial", fmt.Errorf("send connection request: %w", err))
 	}
 
-	go dialer.clientListen(conn, state.conn)
+	handshakeErr := make(chan error, 1)
+	go dialer.clientListen(conn, state.conn, handshakeErr)
 
 	select {
 	case <-conn.connected:
 		// Remove connection deadline.
 		_ = conn.conn.SetDeadline(time.Time{})
 		return conn, nil
+	case err := <-handshakeErr:
+		_ = conn.Close()
+		return nil, dialer.error("dial", err)
 	case <-ctx.Done():
 		_ = conn.Close()
 		return nil, dialer.error("dial", ctx.Err())
@@ -272,7 +280,7 @@ func (dialer Dialer) connect(ctx context.Context, state *connState) (*Conn, erro
 
 // clientListen makes the RakNet connection passed listen as a client for
 // packets received in the connection passed.
-func (dialer Dialer) clientListen(rakConn *Conn, conn net.Conn) {
+func (dialer Dialer) clientListen(rakConn *Conn, conn net.Conn, handshakeErr chan<- error) {
 	// Create a buffer with the maximum size a UDP packet sent over RakNet is
 	// allowed to have. We can re-use this buffer for each packet.
 	b := make([]byte, rakConn.effectiveMTU())
@@ -282,6 +290,15 @@ func (dialer Dialer) clientListen(rakConn *Conn, conn net.Conn) {
 			err = rakConn.receive(b[:n])
 		}
 		if err != nil {
+			if errors.Is(err, ErrConnectionRequestFailed) {
+				select {
+				case <-rakConn.connected:
+					// Unexpected if already connected.
+				case handshakeErr <- ErrConnectionRequestFailed:
+				default:
+				}
+				return
+			}
 			if errors.Is(err, net.ErrClosed) {
 				return
 			}
@@ -312,6 +329,44 @@ type connState struct {
 	maxTransientErrors  int
 }
 
+var unconnectedStatusMagic = [16]byte{0x00, 0xff, 0xff, 0x00, 0xfe, 0xfe, 0xfe, 0xfe, 0xfd, 0xfd, 0xfd, 0xfd, 0x12, 0x34, 0x56, 0x78}
+
+// handleUnconnectedStatusPacket checks if b contains an unconnected status
+// packet and returns a sentinel error in that case.
+func (state *connState) handleUnconnectedStatusPacket(b []byte) error {
+	if len(b) < 17 || !bytes.Equal(b[1:17], unconnectedStatusMagic[:]) {
+		return nil
+	}
+	switch b[0] {
+	case message.IDConnectionRequestFailed:
+		pk := &message.ConnectionRequestFailed{}
+		if err := pk.UnmarshalBinary(b[1:]); err != nil {
+			return fmt.Errorf("read CONNECTION_REQUEST_FAILED: %w", err)
+		}
+		return ErrConnectionRequestFailed
+	case message.IDAlreadyConnected:
+		pk := &message.AlreadyConnected{}
+		if err := pk.UnmarshalBinary(b[1:]); err != nil {
+			return fmt.Errorf("read ALREADY_CONNECTED: %w", err)
+		}
+		return ErrAlreadyConnected
+	case message.IDNoFreeIncomingConnections:
+		pk := &message.NoFreeIncomingConnections{}
+		if err := pk.UnmarshalBinary(b[1:]); err != nil {
+			return fmt.Errorf("read NO_FREE_INCOMING_CONNECTIONS: %w", err)
+		}
+		return ErrNoFreeIncomingConnections
+	case message.IDIPRecentlyConnected:
+		pk := &message.IPRecentlyConnected{}
+		if err := pk.UnmarshalBinary(b[1:]); err != nil {
+			return fmt.Errorf("read IP_RECENTLY_CONNECTED: %w", err)
+		}
+		return ErrIPRecentlyConnected
+	default:
+		return nil
+	}
+}
+
 var mtuSizes = []uint16{1492, 1200, 576}
 
 // discoverMTU starts discovering an MTU size, the maximum packet size we
@@ -338,6 +393,10 @@ func (state *connState) discoverMTU(ctx context.Context) error {
 		}
 		if n == 0 {
 			continue
+		}
+		if err := state.handleUnconnectedStatusPacket(b[:n]); err != nil {
+			state.close()
+			return err
 		}
 		switch b[0] {
 		case message.IDOpenConnectionReply1:
@@ -406,6 +465,10 @@ func (state *connState) openConnection(ctx context.Context) error {
 		}
 		if n == 0 {
 			continue
+		}
+		if err := state.handleUnconnectedStatusPacket(b[:n]); err != nil {
+			state.close()
+			return err
 		}
 		if b[0] != message.IDOpenConnectionReply2 {
 			continue

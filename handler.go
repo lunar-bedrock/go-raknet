@@ -1,6 +1,7 @@
 package raknet
 
 import (
+	"encoding"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -40,7 +41,50 @@ func (h listenerConnectionHandler) limitsEnabled() bool {
 }
 
 func (h listenerConnectionHandler) close(conn *Conn) {
-	h.l.connections.Delete(resolve(conn.raddr))
+	if h.l.connections.CompareAndDelete(resolve(conn.raddr), conn) {
+		h.l.connectionCount.Add(-1)
+	}
+}
+
+func (h listenerConnectionHandler) sendUnconnected(addr net.Addr, pk encoding.BinaryMarshaler) error {
+	data, _ := pk.MarshalBinary()
+	_, err := h.l.conn.WriteTo(data, addr)
+	return err
+}
+
+func (h listenerConnectionHandler) handleAlreadyConnected(addr net.Addr) error {
+	return h.sendUnconnected(addr, &message.AlreadyConnected{ServerGUID: h.l.id})
+}
+
+func (h listenerConnectionHandler) sendOpenConnectionReply2(addr net.Addr, mtu uint16) error {
+	return h.sendUnconnected(addr, &message.OpenConnectionReply2{ServerGUID: h.l.id, ClientAddress: resolve(addr), MTU: mtu})
+}
+
+func (h listenerConnectionHandler) sendNoFreeIncomingConnections(addr net.Addr) error {
+	return h.sendUnconnected(addr, &message.NoFreeIncomingConnections{ServerGUID: h.l.id})
+}
+
+func (h listenerConnectionHandler) handleOpenConnectionRequest2Duplicate(conn *Conn, b []byte, addr net.Addr) error {
+	pk, err := h.readOpenConnectionRequest2(b, addr)
+	if err != nil {
+		return err
+	}
+	if pk.ClientGUID != conn.clientGUID {
+		if h.l.conf.DisableCookies {
+			return h.handleAlreadyConnected(addr)
+		}
+		// With a verified cookie we can trust source ownership and replace the
+		// previous connection, matching Cloudburst's reconnect behavior.
+		// readOpenConnectionRequest2 already validated the replacement payload.
+		conn.closeImmediately()
+		return h.handleOpenConnectionRequest2Packet(pk, addr)
+	}
+	select {
+	case <-conn.connected:
+		return h.handleAlreadyConnected(addr)
+	default:
+		return h.sendOpenConnectionReply2(addr, conn.mtu)
+	}
 }
 
 // cookie calculates a cookie for the net.Addr passed. It is calculated as a
@@ -58,6 +102,22 @@ func (h listenerConnectionHandler) cookie(addr net.Addr, salt uint64) uint32 {
 	// A new salt is calculated every time a Listener is created and we don't
 	// have any data that needs to protected. We just need a fast hash.
 	return crc32.ChecksumIEEE(b)
+}
+
+func (h listenerConnectionHandler) readOpenConnectionRequest2(b []byte, addr net.Addr) (*message.OpenConnectionRequest2, error) {
+	pk := &message.OpenConnectionRequest2{ServerHasSecurity: !h.l.conf.DisableCookies}
+	if err := pk.UnmarshalBinary(b); err != nil {
+		return nil, fmt.Errorf("read OPEN_CONNECTION_REQUEST_2: %w", err)
+	}
+	if expected := h.cookie(addr, h.cookieSalt.Load()); pk.Cookie != expected &&
+		pk.Cookie != h.cookie(addr, h.previousSalt.Load()) {
+		return nil, fmt.Errorf("handle OPEN_CONNECTION_REQUEST_2: invalid cookie '%x', expected '%x'", pk.Cookie, expected)
+	}
+	// Vanilla clients always provide a negative ClientGUID.
+	if pk.ClientGUID >= 0 {
+		return nil, fmt.Errorf("handle OPEN_CONNECTION_REQUEST_2: invalid ClientGUID '%d', expected negative", pk.ClientGUID)
+	}
+	return pk, nil
 }
 
 func (h listenerConnectionHandler) handleUnconnected(b []byte, addr net.Addr) error {
@@ -98,6 +158,8 @@ func (h listenerConnectionHandler) handleOpenConnectionRequest1(b []byte, addr n
 	if err := pk.UnmarshalBinary(b); err != nil {
 		return fmt.Errorf("read OPEN_CONNECTION_REQUEST_1: %w", err)
 	}
+	// TODO: Add an explicit, user-managed ban list check for unconnected handshakes.
+	// TODO: Consider rejecting at REQUEST_1 when MaxConnections is reached to fail earlier.
 	mtuSize := min(pk.MTU, maxMTUSize)
 
 	if pk.ClientProtocol != protocolVersion {
@@ -114,31 +176,36 @@ func (h listenerConnectionHandler) handleOpenConnectionRequest1(b []byte, addr n
 // handleOpenConnectionRequest2 handles an open connection request 2 packet
 // stored in buffer b, coming from an address.
 func (h listenerConnectionHandler) handleOpenConnectionRequest2(b []byte, addr net.Addr) error {
-	pk := &message.OpenConnectionRequest2{ServerHasSecurity: !h.l.conf.DisableCookies}
-	if err := pk.UnmarshalBinary(b); err != nil {
-		return fmt.Errorf("read OPEN_CONNECTION_REQUEST_2: %w", err)
+	pk, err := h.readOpenConnectionRequest2(b, addr)
+	if err != nil {
+		return err
 	}
-	if expected := h.cookie(addr, h.cookieSalt.Load()); pk.Cookie != expected &&
-		pk.Cookie != h.cookie(addr, h.previousSalt.Load()) {
-		return fmt.Errorf("handle OPEN_CONNECTION_REQUEST_2: invalid cookie '%x', expected '%x'", pk.Cookie, expected)
-	}
+	return h.handleOpenConnectionRequest2Packet(pk, addr)
+}
 
-	// Vanilla clients always provide a negative ClientGUID.
-	if pk.ClientGUID >= 0 {
-		return fmt.Errorf("handle OPEN_CONNECTION_REQUEST_2: invalid ClientGUID '%d', expected negative", pk.ClientGUID)
-	}
+func (h listenerConnectionHandler) handleOpenConnectionRequest2Packet(pk *message.OpenConnectionRequest2, addr net.Addr) error {
+	// TODO: Verify pk.ServerAddress matches the listener address receiving this packet.
 
 	mtuSize := min(pk.MTU, maxMTUSize)
 
-	data, _ := (&message.OpenConnectionReply2{ServerGUID: h.l.id, ClientAddress: resolve(addr), MTU: mtuSize}).MarshalBinary()
-	if _, err := h.l.conn.WriteTo(data, addr); err != nil {
+	if maxConnections := h.l.conf.MaxConnections; maxConnections > 0 && h.l.connectionCount.Load() >= int64(maxConnections) {
+		if err := h.sendNoFreeIncomingConnections(addr); err != nil {
+			return fmt.Errorf("send NO_FREE_INCOMING_CONNECTIONS: %w", err)
+		}
+		return nil
+	}
+
+	conn := newConn(h.l.conn, addr, mtuSize, h)
+	conn.clientGUID = pk.ClientGUID
+	h.l.connections.Store(resolve(addr), conn)
+	h.l.connectionCount.Add(1)
+
+	if err := h.sendOpenConnectionReply2(addr, conn.mtu); err != nil {
+		conn.closeImmediately()
 		return fmt.Errorf("send OPEN_CONNECTION_REPLY_2: %w", err)
 	}
 
 	go func() {
-		conn := newConn(h.l.conn, addr, mtuSize, h)
-		h.l.connections.Store(resolve(addr), conn)
-
 		t := time.NewTimer(time.Second * 10)
 		defer t.Stop()
 		select {
@@ -187,6 +254,13 @@ func (h listenerConnectionHandler) handleConnectionRequest(conn *Conn, b []byte)
 	if err := pk.UnmarshalBinary(b); err != nil {
 		return fmt.Errorf("read CONNECTION_REQUEST: %w", err)
 	}
+	if pk.Secure || pk.ClientGUID != conn.clientGUID {
+		if err := conn.send(&message.ConnectionRequestFailed{ServerGUID: h.l.id}); err != nil {
+			return fmt.Errorf("send CONNECTION_REQUEST_FAILED: %w", err)
+		}
+		conn.closeImmediately()
+		return nil
+	}
 	return conn.send(&message.ConnectionRequestAccepted{ClientAddress: resolve(conn.raddr), PingTime: pk.RequestTime, PongTime: timestamp()})
 }
 
@@ -207,6 +281,7 @@ type dialerConnectionHandler struct{ l *slog.Logger }
 var (
 	errUnexpectedCR            = errors.New("unexpected CONNECTION_REQUEST packet")
 	errUnexpectedAdditionalCRA = errors.New("unexpected additional CONNECTION_REQUEST_ACCEPTED packet")
+	errUnexpectedCRF           = errors.New("unexpected CONNECTION_REQUEST_FAILED packet")
 	errUnexpectedNIC           = errors.New("unexpected NEW_INCOMING_CONNECTION packet")
 )
 
@@ -228,6 +303,8 @@ func (h dialerConnectionHandler) handle(conn *Conn, b []byte) (handled bool, err
 		return true, errUnexpectedCR
 	case message.IDConnectionRequestAccepted:
 		return true, h.handleConnectionRequestAccepted(conn, b[1:])
+	case message.IDConnectionRequestFailed:
+		return true, h.handleConnectionRequestFailed(conn, b[1:])
 	case message.IDNewIncomingConnection:
 		return true, errUnexpectedNIC
 	case message.IDConnectedPing:
@@ -242,6 +319,19 @@ func (h dialerConnectionHandler) handle(conn *Conn, b []byte) (handled bool, err
 		return true, conn.send(&message.ConnectedPing{PingTime: timestamp()})
 	default:
 		return false, nil
+	}
+}
+
+func (h dialerConnectionHandler) handleConnectionRequestFailed(conn *Conn, b []byte) error {
+	pk := &message.ConnectionRequestFailed{}
+	if err := pk.UnmarshalBinary(b); err != nil {
+		return fmt.Errorf("read CONNECTION_REQUEST_FAILED: %w", err)
+	}
+	select {
+	case <-conn.connected:
+		return errUnexpectedCRF
+	default:
+		return ErrConnectionRequestFailed
 	}
 }
 

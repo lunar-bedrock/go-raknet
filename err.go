@@ -15,6 +15,18 @@ var (
 	// ErrNotSupported is returned for deadline methods of a Conn, which are not
 	// supported on a raknet.Conn.
 	ErrNotSupported = errors.New("feature not supported")
+	// ErrConnectionRequestFailed is returned when a server rejects the
+	// CONNECTION_REQUEST in the online stage.
+	ErrConnectionRequestFailed = errors.New("connection request failed")
+	// ErrAlreadyConnected is returned when a server reports that this address is
+	// already connected.
+	ErrAlreadyConnected = errors.New("already connected")
+	// ErrNoFreeIncomingConnections is returned when a server has no room for new
+	// incoming connections.
+	ErrNoFreeIncomingConnections = errors.New("no free incoming connections")
+	// ErrIPRecentlyConnected is returned when a server reports that this address
+	// has connected too recently.
+	ErrIPRecentlyConnected = errors.New("ip recently connected")
 )
 
 // error wraps the error passed into a net.OpError with the op as operation and

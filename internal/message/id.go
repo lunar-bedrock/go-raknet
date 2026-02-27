@@ -12,10 +12,14 @@ const (
 	IDOpenConnectionReply2           byte = 0x08
 	IDConnectionRequest              byte = 0x09
 	IDConnectionRequestAccepted      byte = 0x10
+	IDConnectionRequestFailed        byte = 0x11
+	IDAlreadyConnected               byte = 0x12
 	IDNewIncomingConnection          byte = 0x13
+	IDNoFreeIncomingConnections      byte = 0x14
 	IDDisconnectNotification         byte = 0x15
 
 	IDIncompatibleProtocolVersion byte = 0x19
+	IDIPRecentlyConnected         byte = 0x1a
 
 	IDUnconnectedPong byte = 0x1c
 )
