@@ -55,13 +55,21 @@ func (c *ElasticChan[T]) Send(val T) {
 	c.ch <- val
 }
 
-// growSend grows the channel to double the capacity, copying all values
-// currently in the channel, and sends the value to the new channel.
+// growSend grows the channel to double the capacity, capped by the configured
+// limit, copying all values currently in the channel, and sends the value to
+// the new channel.
 func (c *ElasticChan[T]) growSend(val T) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.grow(max(cap(c.ch)*2, int(c.lim)))
+	next := cap(c.ch) * 2
+	if next == 0 {
+		next = 1
+	}
+	if lim := int(c.lim); next > lim {
+		next = lim
+	}
+	c.grow(next)
 	c.ch <- val
 }
 
