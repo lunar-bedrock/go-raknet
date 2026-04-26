@@ -13,10 +13,10 @@ type resendMap struct {
 	inFlightBytes  int
 }
 
-// resendRecord represents a single packet with a timestamp from when it was
+// resendRecord represents a single datagram with a timestamp from when it was
 // initially sent. It may be either acknowledged or NACKed by the other end.
 type resendRecord struct {
-	pk        *packet
+	packets   []*packet
 	timestamp time.Time
 	length    int
 }
@@ -29,26 +29,31 @@ func newRecoveryQueue() *resendMap {
 	}
 }
 
-// add puts a packet at the index passed and records the current time.
-func (m *resendMap) add(index uint24, pk *packet, length int) {
+// add puts a datagram at the index passed and records the current time.
+func (m *resendMap) add(index uint24, packets []*packet, length int) {
 	if old, ok := m.unacknowledged[index]; ok {
 		m.inFlightBytes -= old.length
 	}
-	m.unacknowledged[index] = resendRecord{pk: pk, timestamp: time.Now(), length: length}
+	m.unacknowledged[index] = resendRecord{packets: packets, timestamp: time.Now(), length: length}
 	m.inFlightBytes += length
 }
 
-// acknowledge marks a packet with the index passed as acknowledged. The packet
+// acknowledge marks a datagram with the index passed as acknowledged. The datagram
 // is removed from the resendMap and returned if found.
 func (m *resendMap) acknowledge(index uint24) (resendRecord, bool) {
 	return m.remove(index, 1)
 }
 
-// retransmit looks up a packet with an index from the resendMap so that it may
+// retransmit looks up a datagram with an index from the resendMap so that it may
 // be resent.
-func (m *resendMap) retransmit(index uint24) (*packet, bool) {
+func (m *resendMap) retransmit(index uint24) ([]*packet, bool) {
 	record, ok := m.remove(index, 2)
-	return record.pk, ok
+	return record.packets, ok
+}
+
+func (m *resendMap) record(index uint24) (resendRecord, bool) {
+	record, ok := m.unacknowledged[index]
+	return record, ok
 }
 
 // remove deletes an index from the resendMap and adds the time since the
