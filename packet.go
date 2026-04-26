@@ -15,6 +15,9 @@ const (
 	bitFlagACK = 0x40
 	// bitFlagNACK is set for every NACK packet.
 	bitFlagNACK = 0x20
+	// bitFlagContinuousSend is set when more datagrams are queued after the
+	// current one, allowing peers to treat the sender as bandwidth limited.
+	bitFlagContinuousSend = 0x08
 	// bitFlagNeedsBAndAS is set for every datagram with packet data, but is not
 	// actually used.
 	bitFlagNeedsBAndAS = 0x04
@@ -114,6 +117,27 @@ func (pk *packet) write(buf *bytes.Buffer) {
 		writeUint32(buf, pk.splitIndex)
 	}
 	buf.Write(pk.content)
+}
+
+func (pk *packet) size() int {
+	size := 1 + 2 + len(pk.content)
+	if pk.reliability.reliable() {
+		size += 3
+	}
+	if pk.reliability.sequenced() {
+		size += 3
+	}
+	if pk.reliability.sequencedOrOrdered() {
+		size += 3 + 1
+	}
+	if pk.split {
+		size += splitAdditionalSize
+	}
+	return size
+}
+
+func (pk *packet) datagramSize() int {
+	return 1 + 3 + pk.size()
 }
 
 // read reads a packet and its content from the buffer passed.
