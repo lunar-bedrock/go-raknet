@@ -2,6 +2,8 @@ package raknet
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -54,18 +56,28 @@ func TestConnQueuesReliableDatagramsUntilAck(t *testing.T) {
 	conn := newTestConn(428)
 
 	first := testReliablePacket(360)
-	second := testReliablePacket(360)
-	if err := conn.queueDatagram(first); err != nil {
+	second := testReliablePacket(100)
+	third := testReliablePacket(100)
+	if err := conn.queuePacket(first); err != nil {
 		t.Fatalf("queue first datagram: %v", err)
 	}
-	if err := conn.queueDatagram(second); err != nil {
+	if err := conn.flushSendQueueLocked(); err != nil {
+		t.Fatalf("flush first datagram: %v", err)
+	}
+	if err := conn.queuePacket(second); err != nil {
 		t.Fatalf("queue second datagram: %v", err)
+	}
+	if err := conn.flushSendQueueLocked(); err != nil {
+		t.Fatalf("flush second datagram: %v", err)
+	}
+	if err := conn.queuePacket(third); err != nil {
+		t.Fatalf("queue third datagram: %v", err)
 	}
 	if got := conn.conn.(*recordingPacketConn).writes(); got != 1 {
 		t.Fatalf("writes before ACK = %v, want 1", got)
 	}
-	if got := len(conn.sendQueue); got != 1 {
-		t.Fatalf("queued datagrams before ACK = %v, want 1", got)
+	if got := len(conn.sendQueue); got != 2 {
+		t.Fatalf("queued datagrams before ACK = %v, want 2", got)
 	}
 
 	ackBuf := bytes.NewBuffer(nil)
@@ -76,8 +88,46 @@ func TestConnQueuesReliableDatagramsUntilAck(t *testing.T) {
 	if got := conn.conn.(*recordingPacketConn).writes(); got != 2 {
 		t.Fatalf("writes after ACK = %v, want 2", got)
 	}
+	if got := countDatagramPackets(t, conn.conn.(*recordingPacketConn).lastWrite()); got != 2 {
+		t.Fatalf("packets in flushed datagram = %v, want 2", got)
+	}
 	if got := len(conn.sendQueue); got != 0 {
 		t.Fatalf("queued datagrams after ACK = %v, want 0", got)
+	}
+}
+
+func TestConnRejectsFullSendQueue(t *testing.T) {
+	conn := newTestConn(428)
+	conn.sendQueueBytes = maxSendQueueBytes
+	pk := testReliablePacket(1)
+	if err := conn.queuePacket(pk); !errors.Is(err, ErrSendQueueFull) {
+		t.Fatalf("queue packet error = %v, want %v", err, ErrSendQueueFull)
+	}
+	conn.putPackets(pk)
+}
+
+func TestCloseImmediatelyBypassesCongestionQueue(t *testing.T) {
+	conn := newTestConn(428)
+	first := testReliablePacket(360)
+	second := testReliablePacket(360)
+	if err := conn.queuePacket(first); err != nil {
+		t.Fatalf("queue first datagram: %v", err)
+	}
+	if err := conn.flushSendQueueLocked(); err != nil {
+		t.Fatalf("flush first datagram: %v", err)
+	}
+	if err := conn.queuePacket(second); err != nil {
+		t.Fatalf("queue second datagram: %v", err)
+	}
+	if got := conn.conn.(*recordingPacketConn).writes(); got != 1 {
+		t.Fatalf("writes before close = %v, want 1", got)
+	}
+	conn.closeImmediately()
+	if got := conn.conn.(*recordingPacketConn).writes(); got != 2 {
+		t.Fatalf("writes after close = %v, want disconnect datagram", got)
+	}
+	if got := len(conn.sendQueue); got != 0 {
+		t.Fatalf("queued datagrams after close = %v, want 0", got)
 	}
 }
 
@@ -92,7 +142,10 @@ func testReliablePacket(size int) *packet {
 
 func newTestConn(mtu uint16) *Conn {
 	raddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 19132}
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Conn{
+		ctx:            ctx,
+		cancelFunc:     cancel,
 		conn:           &recordingPacketConn{laddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 19133}},
 		raddr:          raddr,
 		mtu:            mtu,
@@ -102,6 +155,7 @@ func newTestConn(mtu uint16) *Conn {
 		nackBuf:        bytes.NewBuffer(make([]byte, 0, 64)),
 		retransmission: newRecoveryQueue(),
 		congestion:     newCongestionWindow(mtu - 28),
+		resendSet:      make(map[uint24]struct{}),
 	}
 }
 
@@ -142,6 +196,32 @@ func (c *recordingPacketConn) SetWriteDeadline(time.Time) error {
 
 func (c *recordingPacketConn) writes() int {
 	return len(c.bufs)
+}
+
+func (c *recordingPacketConn) lastWrite() []byte {
+	if len(c.bufs) == 0 {
+		return nil
+	}
+	return c.bufs[len(c.bufs)-1]
+}
+
+func countDatagramPackets(t *testing.T, datagram []byte) int {
+	t.Helper()
+	if len(datagram) < 4 {
+		t.Fatalf("datagram too short: %v", len(datagram))
+	}
+	payload := datagram[4:]
+	var count int
+	for len(payload) > 0 {
+		pk := new(packet)
+		n, err := pk.read(payload)
+		if err != nil {
+			t.Fatalf("read packet %v: %v", count, err)
+		}
+		payload = payload[n:]
+		count++
+	}
+	return count
 }
 
 type testConnectionHandler struct{}

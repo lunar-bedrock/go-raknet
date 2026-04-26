@@ -15,6 +15,9 @@ var (
 	// ErrNotSupported is returned for deadline methods of a Conn, which are not
 	// supported on a raknet.Conn.
 	ErrNotSupported = errors.New("feature not supported")
+	// ErrSendQueueFull is returned when a Conn has queued too much outbound
+	// reliable data waiting for congestion control to allow transmission.
+	ErrSendQueueFull = errors.New("send queue full")
 )
 
 // error wraps the error passed into a net.OpError with the op as operation and
