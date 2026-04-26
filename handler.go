@@ -174,7 +174,7 @@ func (h listenerConnectionHandler) handle(conn *Conn, b []byte) (handled bool, e
 		return true, nil
 	case message.IDDetectLostConnections:
 		// Let the other end know the connection is still alive.
-		return true, conn.send(&message.ConnectedPing{PingTime: timestamp()})
+		return true, conn.sendUnreliable(&message.ConnectedPing{PingTime: timestamp()})
 	default:
 		return false, nil
 	}
@@ -239,7 +239,7 @@ func (h dialerConnectionHandler) handle(conn *Conn, b []byte) (handled bool, err
 		return true, nil
 	case message.IDDetectLostConnections:
 		// Let the other end know the connection is still alive.
-		return true, conn.send(&message.ConnectedPing{PingTime: timestamp()})
+		return true, conn.sendUnreliable(&message.ConnectedPing{PingTime: timestamp()})
 	default:
 		return false, nil
 	}

@@ -73,10 +73,18 @@ func (w *congestionWindow) onAck(rtt time.Duration, sequenceNumber, nextSequence
 	}
 }
 
-func (w *congestionWindow) onNAK() {
-	if !w.backoffThisBlock {
-		w.ssThresh = w.cwnd * 0.75
+func (w *congestionWindow) onNAK(nextSequenceNumber uint24) {
+	if w.backoffThisBlock {
+		return
 	}
+	mtu := float64(w.mtu)
+	w.ssThresh = w.cwnd * 0.75
+	if w.ssThresh < mtu {
+		w.ssThresh = mtu
+	}
+	w.cwnd = w.ssThresh
+	w.nextCongestionControlBlock = nextSequenceNumber
+	w.backoffThisBlock = true
 }
 
 func (w *congestionWindow) onResend(nextSequenceNumber uint24) {
@@ -95,17 +103,25 @@ func (w *congestionWindow) onResend(nextSequenceNumber uint24) {
 
 func (w *congestionWindow) rto() time.Duration {
 	const (
+		initialRTO         = 300 * time.Millisecond
 		maxThreshold       = 2 * time.Second
 		additionalVariance = 30 * time.Millisecond
 	)
 	if w.estimatedRTT == unsetRTT {
-		return maxThreshold
+		return initialRTO
 	}
 	threshold := 2*w.estimatedRTT + 4*w.deviationRTT + additionalVariance
 	if threshold > maxThreshold {
 		return maxThreshold
 	}
 	return threshold
+}
+
+func (w *congestionWindow) retransmissionBandwidth() int {
+	if int(w.cwnd) < w.mtu {
+		return w.mtu
+	}
+	return int(w.cwnd)
 }
 
 func (w *congestionWindow) inSlowStart() bool {
