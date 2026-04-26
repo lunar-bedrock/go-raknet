@@ -120,24 +120,24 @@ func (pk *packet) write(buf *bytes.Buffer) {
 }
 
 func (pk *packet) size() int {
-	size := 1 + 2 + len(pk.content)
-	if pk.reliability.reliable() {
+	return packetSize(len(pk.content), pk.reliability, pk.split)
+}
+
+func packetSize(contentLength int, rel reliability, split bool) int {
+	size := 1 + 2 + contentLength
+	if rel.reliable() {
 		size += 3
 	}
-	if pk.reliability.sequenced() {
+	if rel.sequenced() {
 		size += 3
 	}
-	if pk.reliability.sequencedOrOrdered() {
+	if rel.sequencedOrOrdered() {
 		size += 3 + 1
 	}
-	if pk.split {
+	if split {
 		size += splitAdditionalSize
 	}
 	return size
-}
-
-func (pk *packet) datagramSize() int {
-	return 1 + 3 + pk.size()
 }
 
 // read reads a packet and its content from the buffer passed.

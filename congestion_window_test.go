@@ -9,6 +9,8 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"github.com/sandertv/go-raknet/internal/message"
 )
 
 func TestCongestionWindowTransmissionBandwidth(t *testing.T) {
@@ -26,6 +28,9 @@ func TestCongestionWindowTransmissionBandwidth(t *testing.T) {
 
 func TestCongestionWindowAckNakAndResend(t *testing.T) {
 	win := newCongestionWindow(1000)
+	if got, want := win.rto(), 300*time.Millisecond; got != want {
+		t.Fatalf("initial rto = %v, want %v", got, want)
+	}
 	win.onAck(100*time.Millisecond, 0, 1)
 	if win.cwnd != 2000 {
 		t.Fatalf("cwnd after first ACK = %v, want 2000", win.cwnd)
@@ -34,20 +39,25 @@ func TestCongestionWindowAckNakAndResend(t *testing.T) {
 		t.Fatalf("rto after first ACK = %v, want %v", got, want)
 	}
 
-	win.onNAK()
+	win.onNAK(2)
 	if got, want := win.ssThresh, 1500.0; got != want {
 		t.Fatalf("ssThresh after NACK = %v, want %v", got, want)
 	}
+	if got, want := win.cwnd, 1500.0; got != want {
+		t.Fatalf("cwnd after NACK = %v, want %v", got, want)
+	}
 
 	win.onAck(100*time.Millisecond, 1, 2)
-	if win.cwnd <= 2000 {
-		t.Fatalf("cwnd after second ACK = %v, want growth", win.cwnd)
+	if win.cwnd <= 1500 || win.cwnd >= 2000 {
+		t.Fatalf("cwnd after second ACK = %v, want controlled growth from NACK window", win.cwnd)
 	}
-	win.onResend(2)
-	if got, want := win.cwnd, 1000.0; got != want {
+	timeoutWin := newCongestionWindow(1000)
+	timeoutWin.cwnd = 2500
+	timeoutWin.onResend(2)
+	if got, want := timeoutWin.cwnd, 1000.0; got != want {
 		t.Fatalf("cwnd after resend = %v, want %v", got, want)
 	}
-	if got, want := win.ssThresh, 1250.0; got != want {
+	if got, want := timeoutWin.ssThresh, 1250.0; got != want {
 		t.Fatalf("ssThresh after resend = %v, want %v", got, want)
 	}
 }
@@ -96,6 +106,26 @@ func TestConnQueuesReliableDatagramsUntilAck(t *testing.T) {
 	}
 }
 
+func TestConnPacesTimeoutResendsWithCongestionWindow(t *testing.T) {
+	conn := newTestConn(428)
+	for seq := uint24(0); seq < 3; seq++ {
+		pk := testReliablePacket(360)
+		conn.retransmission.add(seq, []*packet{pk}, 1+3+pk.size())
+		conn.resendSet[seq] = struct{}{}
+		conn.resendQueue = append(conn.resendQueue, seq)
+	}
+
+	if err := conn.flushResendQueueLocked(); err != nil {
+		t.Fatalf("flush resend queue: %v", err)
+	}
+	if got := conn.conn.(*recordingPacketConn).writes(); got != 1 {
+		t.Fatalf("resend writes = %v, want 1", got)
+	}
+	if got := len(conn.resendQueue); got != 2 {
+		t.Fatalf("remaining resend queue = %v, want 2", got)
+	}
+}
+
 func TestConnRejectsFullSendQueue(t *testing.T) {
 	conn := newTestConn(428)
 	conn.sendQueueBytes = maxSendQueueBytes
@@ -104,6 +134,74 @@ func TestConnRejectsFullSendQueue(t *testing.T) {
 		t.Fatalf("queue packet error = %v, want %v", err, ErrSendQueueFull)
 	}
 	conn.putPackets(pk)
+}
+
+func TestConnRejectsFullWriteWithoutConsumingIndexes(t *testing.T) {
+	conn := newTestConn(428)
+	conn.sendQueueBytes = maxSendQueueBytes
+
+	if n, err := conn.write(bytes.Repeat([]byte{1}, 600), reliabilityReliableOrdered); !errors.Is(err, ErrSendQueueFull) {
+		t.Fatalf("write error = %v, want %v", err, ErrSendQueueFull)
+	} else if n != 0 {
+		t.Fatalf("write n = %v, want 0", n)
+	}
+	if conn.orderIndex != 0 || conn.messageIndex != 0 || conn.splitID != 0 {
+		t.Fatalf("indexes after rejected write = order %v message %v split %v, want all zero", conn.orderIndex, conn.messageIndex, conn.splitID)
+	}
+	if got := conn.conn.(*recordingPacketConn).writes(); got != 0 {
+		t.Fatalf("writes after rejected write = %v, want 0", got)
+	}
+
+	conn.sendQueueBytes = 0
+	if n, err := conn.write([]byte{1}, reliabilityReliableOrdered); err != nil {
+		t.Fatalf("write after freeing queue: %v", err)
+	} else if n != 1 {
+		t.Fatalf("write after freeing queue n = %v, want 1", n)
+	}
+	pk := firstDatagramPacket(t, conn.conn.(*recordingPacketConn).lastWrite())
+	if pk.orderIndex != 0 || pk.messageIndex != 0 {
+		t.Fatalf("first sent indexes = order %v message %v, want 0/0", pk.orderIndex, pk.messageIndex)
+	}
+}
+
+func TestConnRejectsWriteWhenInFlightAtLimit(t *testing.T) {
+	conn := newTestConn(428)
+	conn.retransmission.inFlightBytes = maxSendQueueBytes
+
+	if n, err := conn.write([]byte{1}, reliabilityReliableOrdered); !errors.Is(err, ErrSendQueueFull) {
+		t.Fatalf("write error = %v, want %v", err, ErrSendQueueFull)
+	} else if n != 0 {
+		t.Fatalf("write n = %v, want 0", n)
+	}
+	if conn.orderIndex != 0 || conn.messageIndex != 0 {
+		t.Fatalf("indexes after rejected in-flight write = order %v message %v, want zero", conn.orderIndex, conn.messageIndex)
+	}
+}
+
+func TestDetectLostConnectionsBypassesFullReliableQueue(t *testing.T) {
+	conn := newTestConn(428)
+	conn.sendQueueBytes = maxSendQueueBytes
+
+	handled, err := (listenerConnectionHandler{}).handle(conn, []byte{message.IDDetectLostConnections})
+	if err != nil {
+		t.Fatalf("handle detect lost connections: %v", err)
+	}
+	if !handled {
+		t.Fatal("detect lost connections was not handled")
+	}
+	if got := conn.conn.(*recordingPacketConn).writes(); got != 1 {
+		t.Fatalf("writes after detect lost connections = %v, want 1", got)
+	}
+	pk := firstDatagramPacket(t, conn.conn.(*recordingPacketConn).lastWrite())
+	if pk.reliability != reliabilityUnreliable {
+		t.Fatalf("detect lost connections reliability = %v, want unreliable", pk.reliability)
+	}
+	if len(pk.content) == 0 || pk.content[0] != message.IDConnectedPing {
+		t.Fatalf("detect lost connections response id = %v, want connected ping", pk.content)
+	}
+	if conn.orderIndex != 0 || conn.messageIndex != 0 {
+		t.Fatalf("indexes after unreliable keepalive = order %v message %v, want zero", conn.orderIndex, conn.messageIndex)
+	}
 }
 
 func TestCloseImmediatelyBypassesCongestionQueue(t *testing.T) {
@@ -222,6 +320,18 @@ func countDatagramPackets(t *testing.T, datagram []byte) int {
 		count++
 	}
 	return count
+}
+
+func firstDatagramPacket(t *testing.T, datagram []byte) *packet {
+	t.Helper()
+	if len(datagram) < 4 {
+		t.Fatalf("datagram too short: %v", len(datagram))
+	}
+	pk := new(packet)
+	if _, err := pk.read(datagram[4:]); err != nil {
+		t.Fatalf("read first packet: %v", err)
+	}
+	return pk
 }
 
 type testConnectionHandler struct{}

@@ -212,7 +212,7 @@ func (conn *Conn) startTicking() {
 			}
 			if t.Sub(lastPing) >= time.Millisecond*500 {
 				// Ping the other end periodically to prevent timeouts.
-				_ = conn.send(&message.ConnectedPing{PingTime: timestamp()})
+				_ = conn.sendUnreliable(&message.ConnectedPing{PingTime: timestamp()})
 				lastPing = t
 
 				conn.mu.Lock()
@@ -303,20 +303,17 @@ func (conn *Conn) writeWithReliability(b []byte, rel reliability) (n int, err er
 // simultaneously from multiple goroutines, but will write one by one. Unlike
 // Write, write will not lock.
 func (conn *Conn) write(b []byte, rel reliability) (n int, err error) {
-	packets, n := conn.packetsForWrite(b, rel)
+	fragments := split(b, conn.effectiveMTU())
 	if rel.reliable() {
-		queuedBytes := 0
-		for _, pk := range packets {
-			queuedBytes += pk.size()
-		}
-		if conn.sendQueueBytes+queuedBytes > maxSendQueueBytes {
+		queuedBytes := packetsSize(fragments, rel)
+		if conn.queuedReliableBytes()+queuedBytes > maxSendQueueBytes {
 			_ = conn.flushSendQueueLocked()
 		}
-		if conn.sendQueueBytes+queuedBytes > maxSendQueueBytes {
-			conn.putPackets(packets...)
+		if conn.queuedReliableBytes()+queuedBytes > maxSendQueueBytes {
 			return 0, ErrSendQueueFull
 		}
 	}
+	packets, n := conn.packetsForFragments(fragments, rel)
 	for i, pk := range packets {
 		if err = conn.queuePacket(pk); err != nil {
 			conn.putPackets(packets[i:]...)
@@ -332,7 +329,10 @@ func (conn *Conn) write(b []byte, rel reliability) (n int, err error) {
 }
 
 func (conn *Conn) packetsForWrite(b []byte, rel reliability) ([]*packet, int) {
-	fragments := split(b, conn.effectiveMTU())
+	return conn.packetsForFragments(split(b, conn.effectiveMTU()), rel)
+}
+
+func (conn *Conn) packetsForFragments(fragments [][]byte, rel reliability) ([]*packet, int) {
 	var orderIndex uint24
 	if rel.sequencedOrOrdered() {
 		orderIndex = conn.orderIndex.Inc()
@@ -371,6 +371,14 @@ func (conn *Conn) packetsForWrite(b []byte, rel reliability) ([]*packet, int) {
 		n += len(content)
 	}
 	return packets, n
+}
+
+func packetsSize(fragments [][]byte, rel reliability) (size int) {
+	split := len(fragments) > 1
+	for _, content := range fragments {
+		size += packetSize(len(content), rel, split)
+	}
+	return size
 }
 
 // Read reads from the connection into the byte slice passed. If successful,
@@ -778,7 +786,7 @@ func (conn *Conn) handleNACK(b []byte) error {
 	}
 	for _, sequenceNumber := range nack.packets {
 		if _, ok := conn.retransmission.unacknowledged[sequenceNumber]; ok {
-			conn.congestion.onNAK()
+			conn.congestion.onNAK(conn.seq)
 			break
 		}
 	}
@@ -807,7 +815,7 @@ func (conn *Conn) flushResendQueue() {
 }
 
 func (conn *Conn) flushResendQueueLocked() error {
-	budget := conn.retransmission.inFlight()
+	budget := conn.congestion.retransmissionBandwidth()
 	for budget > 0 && len(conn.resendQueue) > 0 {
 		sequenceNumber := conn.resendQueue[0]
 		conn.resendQueue = conn.resendQueue[1:]
@@ -841,12 +849,16 @@ func (conn *Conn) queuePacket(pk *packet) error {
 		return err
 	}
 	size := pk.size()
-	if conn.sendQueueBytes+size > maxSendQueueBytes {
+	if conn.queuedReliableBytes()+size > maxSendQueueBytes {
 		return ErrSendQueueFull
 	}
 	conn.sendQueue = append(conn.sendQueue, pk)
 	conn.sendQueueBytes += size
 	return nil
+}
+
+func (conn *Conn) queuedReliableBytes() int {
+	return conn.sendQueueBytes + conn.retransmission.inFlight()
 }
 
 func (conn *Conn) flushSendQueue() {
