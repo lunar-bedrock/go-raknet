@@ -62,6 +62,24 @@ func TestCongestionWindowAckNakAndResend(t *testing.T) {
 	}
 }
 
+func TestCongestionWindowTimeoutOverridesPriorNAKBackoff(t *testing.T) {
+	win := newCongestionWindow(1000)
+	win.cwnd = 4000
+
+	win.onNAK(2)
+	if got, want := win.cwnd, 3000.0; got != want {
+		t.Fatalf("cwnd after NACK = %v, want %v", got, want)
+	}
+
+	win.onResend(2)
+	if got, want := win.cwnd, 1000.0; got != want {
+		t.Fatalf("cwnd after timeout following NACK = %v, want %v", got, want)
+	}
+	if got, want := win.ssThresh, 1500.0; got != want {
+		t.Fatalf("ssThresh after timeout following NACK = %v, want %v", got, want)
+	}
+}
+
 func TestConnQueuesReliableDatagramsUntilAck(t *testing.T) {
 	conn := newTestConn(428)
 
@@ -268,7 +286,7 @@ func TestConnCheckResendDoesNotBackoffAlreadyQueuedTimeout(t *testing.T) {
 	if got, want := conn.congestion.cwnd, 3000.0; got != want {
 		t.Fatalf("cwnd after already queued timeout = %v, want %v", got, want)
 	}
-	if conn.congestion.backoffThisBlock {
+	if conn.congestion.resendBackoffThisBlock {
 		t.Fatal("already queued timeout triggered congestion backoff")
 	}
 	if got := conn.conn.(*recordingPacketConn).writes(); got != 0 {
@@ -281,7 +299,7 @@ func TestConnCheckResendDoesNotBackoffAlreadyQueuedTimeout(t *testing.T) {
 	if got, want := conn.congestion.cwnd, 400.0; got != want {
 		t.Fatalf("cwnd after newly queued timeout = %v, want %v", got, want)
 	}
-	if !conn.congestion.backoffThisBlock {
+	if !conn.congestion.resendBackoffThisBlock {
 		t.Fatal("newly queued timeout did not trigger congestion backoff")
 	}
 }
