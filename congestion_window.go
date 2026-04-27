@@ -98,7 +98,7 @@ func (w *congestionWindow) onNAK() {
 
 func (w *congestionWindow) onResend(nextSequenceNumber uint24) {
 	mtu := float64(w.mtu)
-	if w.resendBackoffThisBlock || w.cwnd <= mtu {
+	if w.resendBackoffThisBlock || w.cwnd <= mtu*2 {
 		return
 	}
 	w.ssThresh = w.cwnd * 0.5

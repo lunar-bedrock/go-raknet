@@ -252,41 +252,44 @@ func TestInboundSplitBytesDoNotConsumeSendQueueBudget(t *testing.T) {
 	}
 }
 
-func TestReceiveSplitPacketPolicyCapsFollowHandlerLimits(t *testing.T) {
+func TestReceiveSplitPacketCapsIgnoreHandlerLimits(t *testing.T) {
 	conn := newNoLimitSecurityTestConn(t)
-	if err := conn.receiveSplitPacket(splitPart(1, maxSplitCount+1, 0, []byte{1})); err != nil {
-		t.Fatalf("receive oversized split with disabled limits: %v", err)
+	if err := conn.receiveSplitPacket(splitPart(1, maxSplitCount+1, 0, []byte{1})); err == nil {
+		t.Fatal("receive oversized split with disabled limits succeeded, want error")
 	}
-	if got := len(conn.splits[1].packets); got != maxSplitCount+1 {
-		t.Fatalf("split count with disabled limits = %v, want %v", got, maxSplitCount+1)
+	if got := len(conn.splits); got != 0 {
+		t.Fatalf("split assemblies after oversized split rejection = %v, want 0", got)
 	}
 
 	conn = newNoLimitSecurityTestConn(t)
-	for id := uint16(0); id <= maxConcurrentSplits; id++ {
+	for id := uint16(0); id < maxConcurrentSplits; id++ {
 		if err := conn.receiveSplitPacket(splitPart(id, 2, 0, []byte{1})); err != nil {
 			t.Fatalf("receive split %v with disabled limits: %v", id, err)
 		}
 	}
-	if got := len(conn.splits); got != maxConcurrentSplits+1 {
-		t.Fatalf("split assemblies with disabled limits = %v, want %v", got, maxConcurrentSplits+1)
+	if err := conn.receiveSplitPacket(splitPart(maxConcurrentSplits, 2, 0, []byte{1})); err == nil {
+		t.Fatal("receive split over concurrent cap with disabled limits succeeded, want error")
+	}
+	if got := len(conn.splits); got != maxConcurrentSplits {
+		t.Fatalf("split assemblies after concurrent cap rejection = %v, want %v", got, maxConcurrentSplits)
 	}
 
 	conn = newNoLimitSecurityTestConn(t)
 	conn.splitBytes = maxSplitBytes
-	if err := conn.receiveSplitPacket(splitPart(1, 2, 0, []byte{1})); err != nil {
-		t.Fatalf("receive split over byte cap with disabled limits: %v", err)
+	if err := conn.receiveSplitPacket(splitPart(1, 2, 0, []byte{1})); err == nil {
+		t.Fatal("receive split over byte cap with disabled limits succeeded, want error")
 	}
 
 	conn = newNoLimitSecurityTestConn(t)
 	if err := conn.receiveSplitPacket(splitPart(1, 2, 0, []byte{1})); err != nil {
-		t.Fatalf("receive split before disabled-limit expiry check: %v", err)
+		t.Fatalf("receive split before expiry check with disabled limits: %v", err)
 	}
 	conn.splits[1].lastSeen = time.Now().Add(-splitPacketTTL - time.Second)
 	if err := conn.receiveSplitPacket(splitPart(2, 2, 0, []byte{2})); err != nil {
-		t.Fatalf("receive split after disabled-limit expiry check: %v", err)
+		t.Fatalf("receive split after expiry check with disabled limits: %v", err)
 	}
-	if _, ok := conn.splits[1]; !ok {
-		t.Fatal("split assembly expired while limits were disabled")
+	if _, ok := conn.splits[1]; ok {
+		t.Fatal("split assembly did not expire with disabled limits")
 	}
 }
 
