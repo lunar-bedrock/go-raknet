@@ -26,6 +26,19 @@ const (
 	minMTUSize    = 400
 	maxMTUSize    = 1492
 	maxWindowSize = 2048
+
+	// maxSplitCount is the maximum number of fragments accepted for one split
+	// packet when connection limits are enabled.
+	maxSplitCount = 512
+	// maxConcurrentSplits is the maximum number of incomplete split-packet
+	// assemblies retained per connection when connection limits are enabled.
+	maxConcurrentSplits = 16
+	// maxSplitBytes is the maximum total split-fragment payload retained per
+	// connection when connection limits are enabled.
+	maxSplitBytes = 8 * 1024 * 1024
+	// splitPacketTTL is how long an incomplete split-packet assembly may remain
+	// in memory before it is discarded.
+	splitPacketTTL = 30 * time.Second
 )
 
 // Conn represents a connection to a specific client. It is not a real
@@ -64,10 +77,11 @@ type Conn struct {
 	// losing bytes.
 	mtu uint16
 
-	// splits is a map of slices indexed by split IDs. The length of each of the
-	// slices is equal to the split count, and packets are positioned in that
-	// slice indexed by the split index.
-	splits map[uint16][][]byte
+	// splits is a map of partial split-packet assemblies indexed by split ID.
+	splits map[uint16]*splitAssembly
+	// splitBytes is the total payload bytes currently retained by all partial
+	// split-packet assemblies.
+	splitBytes int
 
 	// win is an ordered queue used to track which datagrams were received and
 	// which datagrams were missing, so that we can send NACKs to request
@@ -94,6 +108,21 @@ type Conn struct {
 	lastActivity atomic.Pointer[time.Time]
 }
 
+// splitAssembly tracks the fragments received for a single split packet until
+// the complete payload can be reassembled or the assembly expires.
+type splitAssembly struct {
+	// packets stores fragments by their split index. nil entries are still
+	// missing.
+	packets [][]byte
+	// created records when this split assembly was allocated.
+	created time.Time
+	// lastSeen is refreshed whenever a new fragment is accepted for this
+	// assembly.
+	lastSeen time.Time
+	// bytes is the sum of fragment payload sizes retained by this assembly.
+	bytes int
+}
+
 // newConn constructs a new connection specifically dedicated to the address
 // passed.
 func newConn(conn net.PacketConn, raddr net.Addr, mtu uint16, h connectionHandler) *Conn {
@@ -106,7 +135,7 @@ func newConn(conn net.PacketConn, raddr net.Addr, mtu uint16, h connectionHandle
 		pk:             new(packet),
 		connected:      make(chan struct{}),
 		packets:        internal.Chan[[]byte](4, 4096),
-		splits:         make(map[uint16][][]byte),
+		splits:         make(map[uint16]*splitAssembly),
 		win:            newDatagramWindow(),
 		packetQueue:    newPacketQueue(),
 		retransmission: newRecoveryQueue(),
@@ -400,6 +429,7 @@ var packetPool = sync.Pool{New: func() any { return &packet{reliability: reliabi
 func (conn *Conn) receive(b []byte) error {
 	t := time.Now()
 	conn.lastActivity.Store(&t)
+	conn.expireSplits(t)
 
 	switch {
 	case b[0]&bitFlagACK != 0:
@@ -412,6 +442,18 @@ func (conn *Conn) receive(b []byte) error {
 	return nil
 }
 
+// validateDatagramWindow rejects datagrams that would grow the receive window
+// past the configured limit before missing ranges are materialised into NACKs.
+func (conn *Conn) validateDatagramWindow(seq uint24) error {
+	if !conn.handler.limitsEnabled() || conn.win.seen(seq) {
+		return nil
+	}
+	if size := conn.win.sizeWith(seq); size > maxWindowSize {
+		return fmt.Errorf("receive datagram: queue window size is too big (%v-%v)", conn.win.lowest, seq+1)
+	}
+	return nil
+}
+
 // receiveDatagram handles the receiving of a datagram found in buffer b. If
 // successful, all packets inside the datagram are handled. if not, an error is
 // returned.
@@ -420,6 +462,9 @@ func (conn *Conn) receiveDatagram(b []byte) error {
 		return fmt.Errorf("read datagram: %w", io.ErrUnexpectedEOF)
 	}
 	seq := loadUint24(b)
+	if err := conn.validateDatagramWindow(seq); err != nil {
+		return err
+	}
 	if !conn.win.add(seq) {
 		// Datagram was already received, this might happen if a packet took a
 		// long time to arrive, and we already sent a NACK for it. This is
@@ -527,39 +572,75 @@ func resolve(addr net.Addr) netip.AddrPort {
 	return netip.AddrPort{}
 }
 
+// expireSplits removes split-packet assemblies that have not completed within
+// splitPacketTTL and releases their retained byte accounting.
+func (conn *Conn) expireSplits(now time.Time) {
+	if !conn.handler.limitsEnabled() {
+		return
+	}
+	for id, split := range conn.splits {
+		if now.Sub(split.lastSeen) < splitPacketTTL {
+			continue
+		}
+		conn.splitBytes -= split.bytes
+		delete(conn.splits, id)
+	}
+	if conn.splitBytes < 0 {
+		conn.splitBytes = 0
+	}
+}
+
 // receiveSplitPacket handles a passed split packet. If it is the last split
 // packet of its sequence, it will continue handling the full packet as it
 // otherwise would. An error is returned if the packet was not valid.
 func (conn *Conn) receiveSplitPacket(p *packet) error {
-	const maxSplitCount = 512
-	const maxConcurrentSplits = 16
+	now := time.Now()
+	conn.expireSplits(now)
 
-	if p.splitCount > maxSplitCount && conn.handler.limitsEnabled() {
+	if p.splitCount < 2 {
+		return fmt.Errorf("split packet: split count %v is below the minimum 2", p.splitCount)
+	}
+	limits := conn.handler.limitsEnabled()
+	if p.splitCount > maxSplitCount && limits {
 		return fmt.Errorf("split packet: split count %v exceeds the maximum %v", p.splitCount, maxSplitCount)
 	}
-	if len(conn.splits) > maxConcurrentSplits && conn.handler.limitsEnabled() {
-		return fmt.Errorf("split packet: maximum concurrent splits %v reached", maxConcurrentSplits)
+	if p.splitIndex >= p.splitCount {
+		return fmt.Errorf("split packet: split index %v is out of range (0 - %v)", p.splitIndex, p.splitCount-1)
 	}
-	m, ok := conn.splits[p.splitID]
+	split, ok := conn.splits[p.splitID]
+	if ok && uint32(len(split.packets)) != p.splitCount {
+		return fmt.Errorf("split packet: split count %v conflicts with existing count %v", p.splitCount, len(split.packets))
+	}
+	if ok && split.packets[p.splitIndex] != nil {
+		return nil
+	}
+	if conn.splitBytes+len(p.content) > maxSplitBytes && limits {
+		return fmt.Errorf("split packet: split packet bytes exceed the maximum %v", maxSplitBytes)
+	}
 	if !ok {
-		m = make([][]byte, p.splitCount)
-		conn.splits[p.splitID] = m
+		if len(conn.splits) >= maxConcurrentSplits && limits {
+			return fmt.Errorf("split packet: maximum concurrent splits %v reached", maxConcurrentSplits)
+		}
+		split = &splitAssembly{packets: make([][]byte, p.splitCount), created: now, lastSeen: now}
+		conn.splits[p.splitID] = split
 	}
-	if p.splitIndex > uint32(len(m)-1) {
-		// The split index was either negative or was bigger than the slice
-		// size, meaning the packet is invalid.
-		return fmt.Errorf("split packet: split index %v is out of range (0 - %v)", p.splitIndex, len(m)-1)
-	}
-	m[p.splitIndex] = p.content
+	split.packets[p.splitIndex] = p.content
+	split.lastSeen = now
+	split.bytes += len(p.content)
+	conn.splitBytes += len(p.content)
 
-	if slices.ContainsFunc(m, func(i []byte) bool { return len(i) == 0 }) {
+	if slices.ContainsFunc(split.packets, func(i []byte) bool { return i == nil }) {
 		// We haven't yet received all split fragments, so we cannot add the
 		// packets together yet.
 		return nil
 	}
-	p.content = slices.Concat(m...)
+	p.content = slices.Concat(split.packets...)
 
 	delete(conn.splits, p.splitID)
+	conn.splitBytes -= split.bytes
+	if conn.splitBytes < 0 {
+		conn.splitBytes = 0
+	}
 	return conn.receivePacket(p)
 }
 
