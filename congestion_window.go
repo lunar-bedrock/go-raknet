@@ -42,18 +42,8 @@ func (w *congestionWindow) transmissionBandwidth(inFlightBytes int) int {
 }
 
 func (w *congestionWindow) onAck(rtt time.Duration, sequenceNumber, nextSequenceNumber uint24) {
-	if rtt <= 0 {
+	if !w.observeRTT(rtt) {
 		return
-	}
-	w.lastRTT = rtt
-	if w.estimatedRTT == unsetRTT {
-		w.estimatedRTT = rtt
-		w.deviationRTT = rtt
-	} else {
-		const d = 0.05
-		difference := float64(rtt - w.estimatedRTT)
-		w.estimatedRTT += time.Duration(d * difference)
-		w.deviationRTT += time.Duration(d * (math.Abs(difference) - float64(w.deviationRTT)))
 	}
 
 	newBlock := sequenceGreaterThan(sequenceNumber, w.nextCongestionControlBlock)
@@ -71,6 +61,23 @@ func (w *congestionWindow) onAck(rtt time.Duration, sequenceNumber, nextSequence
 	} else if newBlock {
 		w.cwnd += mtu * mtu / w.cwnd
 	}
+}
+
+func (w *congestionWindow) observeRTT(rtt time.Duration) bool {
+	if rtt <= 0 {
+		return false
+	}
+	w.lastRTT = rtt
+	if w.estimatedRTT == unsetRTT {
+		w.estimatedRTT = rtt
+		w.deviationRTT = rtt
+	} else {
+		const d = 0.05
+		difference := float64(rtt - w.estimatedRTT)
+		w.estimatedRTT += time.Duration(d * difference)
+		w.deviationRTT += time.Duration(d * (math.Abs(difference) - float64(w.deviationRTT)))
+	}
+	return true
 }
 
 func (w *congestionWindow) onNAK(nextSequenceNumber uint24) {
