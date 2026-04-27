@@ -80,6 +80,19 @@ func TestCongestionWindowTimeoutOverridesPriorNAKBackoff(t *testing.T) {
 	}
 }
 
+func TestCongestionWindowResendBackoffWaitsForTwoMTUWindow(t *testing.T) {
+	win := newCongestionWindow(1000)
+	win.cwnd = 2000
+
+	win.onResend(2)
+	if got, want := win.cwnd, 2000.0; got != want {
+		t.Fatalf("cwnd after resend at two MTU = %v, want %v", got, want)
+	}
+	if win.resendBackoffThisBlock {
+		t.Fatal("resend at two MTU triggered congestion backoff")
+	}
+}
+
 func TestConnQueuesReliableDatagramsUntilAck(t *testing.T) {
 	conn := newTestConn(428)
 

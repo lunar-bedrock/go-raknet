@@ -854,9 +854,6 @@ func resolve(addr net.Addr) netip.AddrPort {
 // expireSplits removes split-packet assemblies that have not completed within
 // splitPacketTTL and releases their retained byte accounting.
 func (conn *Conn) expireSplits(now time.Time) {
-	if !conn.handler.limitsEnabled() {
-		return
-	}
 	for id, split := range conn.splits {
 		if now.Sub(split.lastSeen) < splitPacketTTL {
 			continue
@@ -879,8 +876,7 @@ func (conn *Conn) receiveSplitPacket(p *packet) error {
 	if p.splitCount < 2 {
 		return fmt.Errorf("split packet: split count %v is below the minimum 2", p.splitCount)
 	}
-	limits := conn.handler.limitsEnabled()
-	if p.splitCount > maxSplitCount && limits {
+	if p.splitCount > maxSplitCount {
 		return fmt.Errorf("split packet: split count %v exceeds the maximum %v", p.splitCount, maxSplitCount)
 	}
 	if p.splitIndex >= p.splitCount {
@@ -893,11 +889,11 @@ func (conn *Conn) receiveSplitPacket(p *packet) error {
 	if ok && split.packets[p.splitIndex] != nil {
 		return nil
 	}
-	if conn.splitBytes+len(p.content) > maxSplitBytes && limits {
+	if conn.splitBytes+len(p.content) > maxSplitBytes {
 		return fmt.Errorf("split packet: split packet bytes exceed the maximum %v", maxSplitBytes)
 	}
 	if !ok {
-		if len(conn.splits) >= maxConcurrentSplits && limits {
+		if len(conn.splits) >= maxConcurrentSplits {
 			return fmt.Errorf("split packet: maximum concurrent splits %v reached", maxConcurrentSplits)
 		}
 		split = &splitAssembly{packets: make([][]byte, p.splitCount), created: now, lastSeen: now}
