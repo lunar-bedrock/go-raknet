@@ -41,6 +41,9 @@ const (
 	splitPacketTTL = 30 * time.Second
 
 	maxSendQueueBytes = 64 * 1024 * 1024
+	// maxOrderedQueueBytes bounds payload retained by out-of-order reliable
+	// ordered packets.
+	maxOrderedQueueBytes = maxWindowSize * maxMTUSize
 )
 
 // Conn represents a connection to a specific client. It is not a real
@@ -96,9 +99,13 @@ type Conn struct {
 	// in an ACK and the slice is cleared.
 	ackSlice []uint24
 
-	// packetQueue is an ordered queue containing packets indexed by their order
-	// index.
-	packetQueue *packetQueue
+	// packetQueues are ordered queues containing reliable ordered packets per
+	// RakNet order channel.
+	packetQueues map[byte]*packetQueue
+	// orderedQueuePackets and orderedQueueBytes track retained reliable ordered
+	// packets waiting for earlier order indexes.
+	orderedQueuePackets int
+	orderedQueueBytes   int
 	// packets is a channel containing content of packets that were fully
 	// processed. Calling Conn.Read() consumes a value from this channel.
 	packets *internal.ElasticChan[[]byte]
@@ -109,7 +116,7 @@ type Conn struct {
 	congestion     *congestionWindow
 	sendQueue      []*packet
 	sendQueueBytes int
-	resendQueue    []uint24
+	resendQueue    []resendQueueItem
 	resendSet      map[uint24]struct{}
 
 	lastActivity atomic.Pointer[time.Time]
@@ -130,6 +137,11 @@ type splitAssembly struct {
 	bytes int
 }
 
+type resendQueueItem struct {
+	sequenceNumber uint24
+	due            time.Time
+}
+
 // newConn constructs a new connection specifically dedicated to the address
 // passed.
 func newConn(conn net.PacketConn, raddr net.Addr, mtu uint16, h connectionHandler) *Conn {
@@ -144,7 +156,7 @@ func newConn(conn net.PacketConn, raddr net.Addr, mtu uint16, h connectionHandle
 		packets:        internal.Chan[[]byte](4, 4096),
 		splits:         make(map[uint16]*splitAssembly),
 		win:            newDatagramWindow(),
-		packetQueue:    newPacketQueue(),
+		packetQueues:   make(map[byte]*packetQueue),
 		retransmission: newRecoveryQueue(),
 		congestion:     newCongestionWindow(mtu - 28),
 		resendSet:      make(map[uint24]struct{}),
@@ -216,7 +228,7 @@ func (conn *Conn) startTicking() {
 				lastPing = t
 
 				conn.mu.Lock()
-				if t.Sub(*conn.lastActivity.Load()) > time.Second*5+conn.retransmission.rtt(t)*2 {
+				if t.Sub(*conn.lastActivity.Load()) > time.Second*5+conn.congestion.rto()*2 {
 					// No activity for too long: Start timeout.
 					_ = conn.Close()
 				}
@@ -252,20 +264,18 @@ func (conn *Conn) checkResend(now time.Time) {
 
 	var (
 		resend []uint24
-		delay  = conn.congestion.rto()
 	)
 
 	for seq, t := range conn.retransmission.unacknowledged {
 		// These packets have not been acknowledged for too long: We resend them
 		// by ourselves, even though no NACK has been issued yet.
-		if now.Sub(t.timestamp) > delay {
+		if !now.Before(t.nextSend) {
 			resend = append(resend, seq)
 		}
 	}
-	if conn.queueResendsLocked(resend) > 0 {
+	if conn.queueResendsLocked(resend, now, resendReasonTimeout) > 0 {
 		conn.congestion.onResend(conn.seq)
 	}
-	_ = conn.flushResendQueueLocked()
 }
 
 // Write writes a buffer b over the RakNet connection. The amount of bytes
@@ -435,7 +445,7 @@ func (conn *Conn) closeImmediately() {
 		for _, record := range conn.retransmission.unacknowledged {
 			conn.putPackets(record.packets...)
 		}
-		clear(conn.retransmission.unacknowledged)
+		conn.retransmission.clear()
 		conn.putPackets(conn.sendQueue...)
 		conn.sendQueue = nil
 		conn.sendQueueBytes = 0
@@ -588,19 +598,65 @@ func (conn *Conn) receivePacket(packet *packet) error {
 		// If it isn't a reliable ordered packet, handle it immediately.
 		return conn.handlePacket(packet.content)
 	}
-	if !conn.packetQueue.put(packet.orderIndex, packet.content) {
+	queue := conn.packetQueue(packet.orderChannel)
+	if queue.contains(packet.orderIndex) {
 		// An ordered packet arrived twice.
 		return nil
 	}
-	if conn.packetQueue.WindowSize() > maxWindowSize && conn.handler.limitsEnabled() {
-		return fmt.Errorf("packet queue window size is too big (%v-%v)", conn.packetQueue.lowest, conn.packetQueue.highest)
+	if err := conn.reserveOrderedPacket(queue, packet); err != nil {
+		return err
 	}
-	for _, content := range conn.packetQueue.fetch() {
+	if !queue.put(packet.orderIndex, packet.content) {
+		conn.releaseOrderedPacket(packet.content)
+		return nil
+	}
+	for _, content := range queue.fetch() {
+		conn.releaseOrderedPacket(content)
 		if err := conn.handlePacket(content); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func (conn *Conn) packetQueue(channel byte) *packetQueue {
+	queue := conn.packetQueues[channel]
+	if queue == nil {
+		queue = newPacketQueue()
+		conn.packetQueues[channel] = queue
+	}
+	return queue
+}
+
+func (conn *Conn) reserveOrderedPacket(queue *packetQueue, packet *packet) error {
+	if !conn.handler.limitsEnabled() {
+		return nil
+	}
+	if queue.WindowSizeWith(packet.orderIndex) > maxWindowSize {
+		return fmt.Errorf("packet queue window size is too big (%v-%v)", queue.lowest, packet.orderIndex+1)
+	}
+	if conn.orderedQueuePackets+1 > maxWindowSize {
+		return fmt.Errorf("ordered packet queue is too big (%v packets)", conn.orderedQueuePackets+1)
+	}
+	if conn.orderedQueueBytes+len(packet.content) > maxOrderedQueueBytes {
+		return fmt.Errorf("ordered packet queue is too big (%v bytes)", conn.orderedQueueBytes+len(packet.content))
+	}
+	conn.orderedQueuePackets++
+	conn.orderedQueueBytes += len(packet.content)
+	return nil
+}
+
+func (conn *Conn) releaseOrderedPacket(content []byte) {
+	if !conn.handler.limitsEnabled() {
+		return
+	}
+	if conn.orderedQueuePackets > 0 {
+		conn.orderedQueuePackets--
+	}
+	conn.orderedQueueBytes -= len(content)
+	if conn.orderedQueueBytes < 0 {
+		conn.orderedQueueBytes = 0
+	}
 }
 
 var errZeroPacket = errors.New("handle packet: zero packet length")
@@ -755,17 +811,22 @@ func (conn *Conn) handleACK(b []byte) error {
 	if err := ack.read(b); err != nil {
 		return fmt.Errorf("read ACK: %w", err)
 	}
+	now := time.Now()
+	acked := false
 	for _, sequenceNumber := range ack.packets {
 		// Take out all stored packets from the recovery queue.
 		if record, ok := conn.retransmission.acknowledge(sequenceNumber); ok {
 			delete(conn.resendSet, sequenceNumber)
-			rtt := time.Since(record.timestamp)
+			rtt := now.Sub(record.lastSent)
 			conn.congestion.onAck(rtt, sequenceNumber, conn.seq)
-			conn.rtt.Store(int64(conn.retransmission.rtt(time.Now())))
+			acked = true
 			// Clear the packet and return it to the pool so that it may be
 			// re-used.
 			conn.putPackets(record.packets...)
 		}
+	}
+	if acked {
+		conn.rtt.Store(int64(conn.congestion.smoothedRTT()))
 	}
 	_ = conn.flushSendQueueLocked()
 	return nil
@@ -781,22 +842,41 @@ func (conn *Conn) handleNACK(b []byte) error {
 	if err := nack.read(b); err != nil {
 		return fmt.Errorf("read NACK: %w", err)
 	}
-	if conn.queueResendsLocked(nack.packets) > 0 {
+	if conn.queueResendsLocked(nack.packets, time.Now(), resendReasonNACK) > 0 {
 		conn.congestion.onNAK(conn.seq)
 	}
-	return conn.flushResendQueueLocked()
+	return nil
 }
 
-func (conn *Conn) queueResendsLocked(sequenceNumbers []uint24) (queued int) {
+type resendReason byte
+
+const (
+	resendReasonNACK resendReason = iota
+	resendReasonTimeout
+)
+
+func (conn *Conn) queueResendsLocked(sequenceNumbers []uint24, now time.Time, reason resendReason) (queued int) {
 	for _, sequenceNumber := range sequenceNumbers {
 		if _, ok := conn.resendSet[sequenceNumber]; ok {
 			continue
 		}
-		if _, ok := conn.retransmission.unacknowledged[sequenceNumber]; !ok {
+		record, ok := conn.retransmission.unacknowledged[sequenceNumber]
+		if !ok {
 			continue
 		}
+		due := time.Time{}
+		switch reason {
+		case resendReasonNACK:
+			if nackDue := record.lastSent.Add(conn.congestion.nackResendDelay()); now.Before(nackDue) {
+				due = nackDue
+			}
+		case resendReasonTimeout:
+			if !conn.retransmission.markTimeoutQueued(sequenceNumber, now, conn.congestion.rto()) {
+				continue
+			}
+		}
 		conn.resendSet[sequenceNumber] = struct{}{}
-		conn.resendQueue = append(conn.resendQueue, sequenceNumber)
+		conn.resendQueue = append(conn.resendQueue, resendQueueItem{sequenceNumber: sequenceNumber, due: due})
 		queued++
 	}
 	return queued
@@ -811,30 +891,52 @@ func (conn *Conn) flushResendQueue() {
 
 func (conn *Conn) flushResendQueueLocked() error {
 	budget := conn.congestion.retransmissionBandwidth()
+	now := time.Now()
 	for budget > 0 && len(conn.resendQueue) > 0 {
-		sequenceNumber := conn.resendQueue[0]
-		conn.resendQueue = conn.resendQueue[1:]
-		delete(conn.resendSet, sequenceNumber)
+		index := conn.nextDueResend(now)
+		if index < 0 {
+			return nil
+		}
+		item := conn.resendQueue[index]
+		sequenceNumber := item.sequenceNumber
 
 		record, ok := conn.retransmission.record(sequenceNumber)
 		if !ok {
+			conn.removeResendQueueIndex(index)
+			delete(conn.resendSet, sequenceNumber)
 			continue
 		}
 		if record.length > budget {
-			conn.resendSet[sequenceNumber] = struct{}{}
-			conn.resendQueue = append([]uint24{sequenceNumber}, conn.resendQueue...)
 			return nil
 		}
-		packets, ok := conn.retransmission.retransmit(sequenceNumber)
+		conn.removeResendQueueIndex(index)
+		delete(conn.resendSet, sequenceNumber)
+		record, ok = conn.retransmission.retransmit(sequenceNumber)
 		if !ok {
 			continue
 		}
-		if err := conn.sendDatagram(packets); err != nil {
+		if err := conn.sendDatagramTracked(record.packets, record.retainedBytes, &record); err != nil {
+			conn.retransmission.restore(sequenceNumber, record)
 			return err
 		}
 		budget -= record.length
 	}
 	return nil
+}
+
+func (conn *Conn) nextDueResend(now time.Time) int {
+	for i, item := range conn.resendQueue {
+		if !now.Before(item.due) {
+			return i
+		}
+	}
+	return -1
+}
+
+func (conn *Conn) removeResendQueueIndex(index int) {
+	copy(conn.resendQueue[index:], conn.resendQueue[index+1:])
+	conn.resendQueue[len(conn.resendQueue)-1] = resendQueueItem{}
+	conn.resendQueue = conn.resendQueue[:len(conn.resendQueue)-1]
 }
 
 func (conn *Conn) queuePacket(pk *packet) error {
@@ -843,7 +945,7 @@ func (conn *Conn) queuePacket(pk *packet) error {
 		conn.putPackets(pk)
 		return err
 	}
-	size := pk.size()
+	size := pk.accountedSize()
 	if conn.queuedReliableBytes()+size > maxSendQueueBytes {
 		return ErrSendQueueFull
 	}
@@ -853,7 +955,7 @@ func (conn *Conn) queuePacket(pk *packet) error {
 }
 
 func (conn *Conn) queuedReliableBytes() int {
-	return conn.sendQueueBytes + conn.retransmission.inFlight()
+	return conn.sendQueueBytes + conn.retransmission.retained()
 }
 
 func (conn *Conn) flushSendQueue() {
@@ -875,7 +977,7 @@ func (conn *Conn) flushSendQueueLocked() error {
 		if conn.sendQueueBytes < 0 {
 			conn.sendQueueBytes = 0
 		}
-		if err := conn.sendDatagram(packets); err != nil {
+		if err := conn.sendDatagramTracked(packets, queuedBytes, nil); err != nil {
 			conn.sendQueue = append(packets, conn.sendQueue...)
 			conn.sendQueueBytes += queuedBytes
 			return err
@@ -906,7 +1008,7 @@ func (conn *Conn) nextSendBatch(budget int) (packets []*packet, queuedBytes int)
 		}
 		packets = append(packets, pk)
 		length = nextLength
-		queuedBytes += packetSize
+		queuedBytes += pk.accountedSize()
 	}
 	return packets, queuedBytes
 }
@@ -914,6 +1016,10 @@ func (conn *Conn) nextSendBatch(budget int) (packets []*packet, queuedBytes int)
 // sendDatagram sends a datagram over the connection that includes the packet
 // passed. It is assigned a new sequence number and added to the retransmission.
 func (conn *Conn) sendDatagram(packets []*packet) error {
+	return conn.sendDatagramTracked(packets, 0, nil)
+}
+
+func (conn *Conn) sendDatagramTracked(packets []*packet, retainedBytes int, previous *resendRecord) error {
 	flags := byte(bitFlagDatagram | bitFlagNeedsBAndAS)
 	if len(conn.sendQueue) > 0 {
 		flags |= bitFlagContinuousSend
@@ -935,18 +1041,33 @@ func (conn *Conn) sendDatagram(packets []*packet) error {
 	if reliable {
 		// We then re-add the datagram to the recovery queue in case the new one
 		// gets lost too, in which case we need to resend it again.
-		conn.retransmission.add(seq, packets, length)
+		conn.retransmission.add(seq, packets, length, retainedBytes, time.Now(), conn.congestion.rto(), previous)
 	}
 	return nil
 }
 
 func (conn *Conn) writeImmediateLocked(b []byte, rel reliability) error {
 	packets, _ := conn.packetsForWrite(b, rel)
-	for i, pk := range packets {
-		if err := conn.sendDatagram([]*packet{pk}); err != nil {
-			conn.putPackets(packets[i:]...)
+	defer conn.putPackets(packets...)
+	for _, pk := range packets {
+		if err := conn.sendDatagramImmediate([]*packet{pk}); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func (conn *Conn) sendDatagramImmediate(packets []*packet) error {
+	flags := byte(bitFlagDatagram | bitFlagNeedsBAndAS)
+	conn.buf.WriteByte(flags)
+	seq := conn.seq.Inc()
+	writeUint24(conn.buf, seq)
+	for _, pk := range packets {
+		pk.write(conn.buf)
+	}
+	defer conn.buf.Reset()
+	if err := conn.writeTo(conn.buf.Bytes(), conn.raddr); err != nil {
+		return fmt.Errorf("send datagram: %w", err)
 	}
 	return nil
 }

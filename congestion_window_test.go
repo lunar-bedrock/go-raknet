@@ -28,7 +28,7 @@ func TestCongestionWindowTransmissionBandwidth(t *testing.T) {
 
 func TestCongestionWindowAckNakAndResend(t *testing.T) {
 	win := newCongestionWindow(1000)
-	if got, want := win.rto(), 300*time.Millisecond; got != want {
+	if got, want := win.rto(), initialRTO; got != want {
 		t.Fatalf("initial rto = %v, want %v", got, want)
 	}
 	win.onAck(100*time.Millisecond, 0, 1)
@@ -108,11 +108,12 @@ func TestConnQueuesReliableDatagramsUntilAck(t *testing.T) {
 
 func TestConnPacesTimeoutResendsWithCongestionWindow(t *testing.T) {
 	conn := newTestConn(428)
+	sent := time.Now().Add(-time.Second)
 	for seq := uint24(0); seq < 3; seq++ {
 		pk := testReliablePacket(360)
-		conn.retransmission.add(seq, []*packet{pk}, 1+3+pk.size())
+		conn.retransmission.add(seq, []*packet{pk}, 1+3+pk.size(), pk.accountedSize(), sent, conn.congestion.rto(), nil)
 		conn.resendSet[seq] = struct{}{}
-		conn.resendQueue = append(conn.resendQueue, seq)
+		conn.resendQueue = append(conn.resendQueue, resendQueueItem{sequenceNumber: seq})
 	}
 
 	if err := conn.flushResendQueueLocked(); err != nil {
@@ -126,15 +127,141 @@ func TestConnPacesTimeoutResendsWithCongestionWindow(t *testing.T) {
 	}
 }
 
+func TestConnRestoresRetransmissionRecordWhenResendWriteFails(t *testing.T) {
+	conn := newTestConn(428)
+	conn.conn = &failingPacketConn{recordingPacketConn: recordingPacketConn{laddr: conn.conn.LocalAddr()}}
+	pk := testReliablePacket(1)
+	length := 1 + 3 + pk.size()
+	retained := pk.accountedSize()
+	conn.retransmission.add(0, []*packet{pk}, length, retained, time.Now().Add(-time.Second), conn.congestion.rto(), nil)
+	conn.resendSet[0] = struct{}{}
+	conn.resendQueue = append(conn.resendQueue, resendQueueItem{sequenceNumber: 0})
+
+	if err := conn.flushResendQueueLocked(); err == nil {
+		t.Fatal("flush resend queue succeeded, want write error")
+	}
+	record, ok := conn.retransmission.record(0)
+	if !ok {
+		t.Fatal("retransmission record was not restored after failed resend")
+	}
+	if got := record.retainedBytes; got != retained {
+		t.Fatalf("restored retained bytes = %v, want %v", got, retained)
+	}
+	if got := conn.retransmission.inFlight(); got != length {
+		t.Fatalf("in-flight bytes after failed resend = %v, want %v", got, length)
+	}
+	if got := conn.retransmission.retained(); got != retained {
+		t.Fatalf("retained bytes after failed resend = %v, want %v", got, retained)
+	}
+}
+
+func TestConnQueuesNACKResendsUntilTickBudget(t *testing.T) {
+	conn := newTestConn(428)
+	sent := time.Now().Add(-time.Second)
+	for seq := uint24(0); seq < 3; seq++ {
+		pk := testReliablePacket(360)
+		conn.retransmission.add(seq, []*packet{pk}, 1+3+pk.size(), pk.accountedSize(), sent, conn.congestion.rto(), nil)
+	}
+	nack := acknowledgementBytes(t, []uint24{0, 1, 2}, conn.effectiveMTU())
+	for range 3 {
+		if err := conn.handleNACK(nack); err != nil {
+			t.Fatalf("handle NACK: %v", err)
+		}
+	}
+	if got := conn.conn.(*recordingPacketConn).writes(); got != 0 {
+		t.Fatalf("writes before resend tick = %v, want 0", got)
+	}
+	if got := len(conn.resendQueue); got != 3 {
+		t.Fatalf("queued resends before tick = %v, want 3", got)
+	}
+	if err := conn.flushResendQueueLocked(); err != nil {
+		t.Fatalf("flush resend queue: %v", err)
+	}
+	if got := conn.conn.(*recordingPacketConn).writes(); got != 1 {
+		t.Fatalf("resend writes after one tick = %v, want 1", got)
+	}
+	if got := len(conn.resendQueue); got != 2 {
+		t.Fatalf("queued resends after one tick = %v, want 2", got)
+	}
+}
+
+func TestConnDelaysNACKForRecentlySentDatagram(t *testing.T) {
+	conn := newTestConn(428)
+	pk := testReliablePacket(1)
+	sent := time.Now()
+	conn.retransmission.add(0, []*packet{pk}, 1+3+pk.size(), pk.accountedSize(), sent, conn.congestion.rto(), nil)
+
+	if err := conn.handleNACK(acknowledgementBytes(t, []uint24{0}, conn.effectiveMTU())); err != nil {
+		t.Fatalf("handle NACK: %v", err)
+	}
+	if got := len(conn.resendQueue); got != 1 {
+		t.Fatalf("queued recent NACK resends = %v, want 1 delayed resend", got)
+	}
+	if got, want := conn.resendQueue[0].due.Sub(sent), conn.congestion.nackResendDelay(); got != want {
+		t.Fatalf("recent NACK resend delay = %v, want %v", got, want)
+	}
+	if err := conn.flushResendQueueLocked(); err != nil {
+		t.Fatalf("flush delayed resend queue before due: %v", err)
+	}
+	if got := conn.conn.(*recordingPacketConn).writes(); got != 0 {
+		t.Fatalf("writes before delayed NACK resend is due = %v, want 0", got)
+	}
+	conn.resendQueue[0].due = time.Now().Add(-time.Millisecond)
+	if err := conn.flushResendQueueLocked(); err != nil {
+		t.Fatalf("flush delayed resend queue after due: %v", err)
+	}
+	if got := conn.conn.(*recordingPacketConn).writes(); got != 1 {
+		t.Fatalf("writes after delayed NACK resend is due = %v, want 1", got)
+	}
+}
+
+func TestConnCheckResendUsesInitialRTOAndBackoff(t *testing.T) {
+	conn := newTestConn(428)
+	pk := testReliablePacket(1)
+	sent := time.Now()
+	conn.retransmission.add(0, []*packet{pk}, 1+3+pk.size(), pk.accountedSize(), sent, conn.congestion.rto(), nil)
+
+	conn.checkResend(sent.Add(initialRTO - time.Millisecond))
+	if got := len(conn.resendQueue); got != 0 {
+		t.Fatalf("resends before initial RTO = %v, want 0", got)
+	}
+
+	firstTimeout := sent.Add(initialRTO)
+	conn.checkResend(firstTimeout)
+	if got := len(conn.resendQueue); got != 1 {
+		t.Fatalf("resends at initial RTO = %v, want 1", got)
+	}
+	record := conn.retransmission.unacknowledged[0]
+	if got, want := record.nextSend.Sub(firstTimeout), 2*initialRTO; got != want {
+		t.Fatalf("next resend after first timeout = %v, want %v", got, want)
+	}
+	if err := conn.flushResendQueueLocked(); err != nil {
+		t.Fatalf("flush resend queue: %v", err)
+	}
+	record = conn.retransmission.unacknowledged[0]
+	if got, want := record.nextSend.Sub(record.lastSent), 2*initialRTO; got != want {
+		t.Fatalf("next resend after first retransmit = %v, want %v", got, want)
+	}
+
+	secondTimeout := record.nextSend
+	conn.checkResend(secondTimeout)
+	record = conn.retransmission.unacknowledged[0]
+	if got, want := record.nextSend.Sub(secondTimeout), 4*initialRTO; got != want {
+		t.Fatalf("next resend after second timeout = %v, want %v", got, want)
+	}
+}
+
 func TestConnCheckResendDoesNotBackoffAlreadyQueuedTimeout(t *testing.T) {
 	conn := newTestConn(428)
 	pk := testReliablePacket(1)
-	conn.retransmission.add(0, []*packet{pk}, 5000)
+	conn.retransmission.add(0, []*packet{pk}, 5000, pk.accountedSize(), time.Now().Add(-time.Second), conn.congestion.rto(), nil)
 	record := conn.retransmission.unacknowledged[0]
 	record.timestamp = time.Now().Add(-time.Second)
+	record.lastSent = record.timestamp
+	record.nextSend = time.Now().Add(-time.Millisecond)
 	conn.retransmission.unacknowledged[0] = record
 	conn.resendSet[0] = struct{}{}
-	conn.resendQueue = append(conn.resendQueue, 0)
+	conn.resendQueue = append(conn.resendQueue, resendQueueItem{sequenceNumber: 0})
 	conn.congestion.cwnd = 3000
 
 	conn.checkResend(time.Now())
@@ -199,7 +326,7 @@ func TestConnRejectsFullWriteWithoutConsumingIndexes(t *testing.T) {
 
 func TestConnRejectsWriteWhenInFlightAtLimit(t *testing.T) {
 	conn := newTestConn(428)
-	conn.retransmission.inFlightBytes = maxSendQueueBytes
+	conn.retransmission.retainedBytes = maxSendQueueBytes
 
 	if n, err := conn.write([]byte{1}, reliabilityReliableOrdered); !errors.Is(err, ErrSendQueueFull) {
 		t.Fatalf("write error = %v, want %v", err, ErrSendQueueFull)
@@ -256,7 +383,7 @@ func TestConnectedPongRefreshesRTT(t *testing.T) {
 	if got := conn.congestion.estimatedRTT; got == unsetRTT {
 		t.Fatalf("estimated RTT after connected pong = %v, want observed RTT", got)
 	}
-	if got, initial := conn.congestion.rto(), 300*time.Millisecond; got == initial {
+	if got, initial := conn.congestion.rto(), initialRTO; got == initial {
 		t.Fatalf("rto after connected pong = %v, want refreshed estimate", got)
 	}
 }
@@ -295,6 +422,13 @@ func testReliablePacket(size int) *packet {
 	}
 }
 
+func acknowledgementBytes(tb testing.TB, packets []uint24, mtu uint16) []byte {
+	tb.Helper()
+	buf := bytes.NewBuffer(nil)
+	(&acknowledgement{packets: packets}).write(buf, mtu)
+	return buf.Bytes()
+}
+
 func newTestConn(mtu uint16) *Conn {
 	raddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 19132}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -308,6 +442,7 @@ func newTestConn(mtu uint16) *Conn {
 		buf:            bytes.NewBuffer(make([]byte, 0, mtu-28)),
 		ackBuf:         bytes.NewBuffer(make([]byte, 0, 128)),
 		nackBuf:        bytes.NewBuffer(make([]byte, 0, 64)),
+		packetQueues:   make(map[byte]*packetQueue),
 		retransmission: newRecoveryQueue(),
 		congestion:     newCongestionWindow(mtu - 28),
 		resendSet:      make(map[uint24]struct{}),
@@ -358,6 +493,14 @@ func (c *recordingPacketConn) lastWrite() []byte {
 		return nil
 	}
 	return c.bufs[len(c.bufs)-1]
+}
+
+type failingPacketConn struct {
+	recordingPacketConn
+}
+
+func (c *failingPacketConn) WriteTo([]byte, net.Addr) (int, error) {
+	return 0, net.ErrClosed
 }
 
 func countDatagramPackets(t *testing.T, datagram []byte) int {
