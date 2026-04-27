@@ -245,7 +245,7 @@ func TestInboundSplitBytesDoNotConsumeSendQueueBudget(t *testing.T) {
 	conn := newSecurityTestConn(t)
 	conn.splitBytes = maxSplitBytes
 
-	if n, err := conn.write([]byte{1}, reliabilityReliableOrdered, PacketPriorityNormal); err != nil {
+	if n, err := conn.write([]byte{1}, reliabilityReliableOrdered); err != nil {
 		t.Fatalf("write with full inbound split budget: %v", err)
 	} else if n != 1 {
 		t.Fatalf("write with full inbound split budget n = %v, want 1", n)
@@ -335,6 +335,8 @@ func newSecurityTestConn(t *testing.T) *Conn {
 		win:            newDatagramWindow(),
 		packetQueues:   make(map[byte]*packetQueue),
 		retransmission: newRecoveryQueue(),
+		congestion:     newCongestionWindow(400),
+		resendSet:      make(map[uint24]struct{}),
 	}
 	conn.lastActivity.Store(&now)
 	return conn

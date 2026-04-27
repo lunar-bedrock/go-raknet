@@ -114,6 +114,7 @@ type Conn struct {
 	// datagram sequence number.
 	retransmission *resendMap
 	congestion     *congestionWindow
+	pendingPings   map[int64]time.Time
 	sendQueue      []*packet
 	sendQueueBytes int
 	resendQueue    []resendQueueItem
@@ -224,7 +225,7 @@ func (conn *Conn) startTicking() {
 			}
 			if t.Sub(lastPing) >= time.Millisecond*500 {
 				// Ping the other end periodically to prevent timeouts.
-				_ = conn.sendUnreliable(&message.ConnectedPing{PingTime: timestamp()})
+				_ = conn.sendConnectedPing()
 				lastPing = t
 
 				conn.mu.Lock()
@@ -495,6 +496,82 @@ func (conn *Conn) sendUnreliable(pk encoding.BinaryMarshaler) error {
 	b, _ := pk.MarshalBinary()
 	_, err := conn.writeWithReliability(b, reliabilityUnreliable)
 	return err
+}
+
+const (
+	maxPendingConnectedPing = 32
+	connectedPingTTL        = 5 * time.Second
+)
+
+func (conn *Conn) sendConnectedPing() error {
+	pingTime := timestamp()
+	conn.recordConnectedPing(pingTime, time.Now())
+	if err := conn.sendUnreliable(&message.ConnectedPing{PingTime: pingTime}); err != nil {
+		conn.forgetConnectedPing(pingTime)
+		return err
+	}
+	return nil
+}
+
+func (conn *Conn) recordConnectedPing(pingTime int64, sentAt time.Time) {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+
+	if conn.pendingPings == nil {
+		conn.pendingPings = make(map[int64]time.Time)
+	}
+	conn.pruneConnectedPingsLocked(sentAt)
+	for len(conn.pendingPings) >= maxPendingConnectedPing {
+		conn.deleteOldestConnectedPingLocked()
+	}
+	conn.pendingPings[pingTime] = sentAt
+}
+
+func (conn *Conn) forgetConnectedPing(pingTime int64) {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	delete(conn.pendingPings, pingTime)
+}
+
+func (conn *Conn) observeConnectedPong(pingTime int64, now time.Time) bool {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+
+	sentAt, ok := conn.pendingPings[pingTime]
+	if !ok {
+		return false
+	}
+	delete(conn.pendingPings, pingTime)
+
+	rtt := now.Sub(sentAt)
+	if rtt <= 0 {
+		return false
+	}
+	conn.rtt.Store(int64(rtt))
+	conn.congestion.observeRTT(rtt)
+	return true
+}
+
+func (conn *Conn) pruneConnectedPingsLocked(now time.Time) {
+	for pingTime, sentAt := range conn.pendingPings {
+		if now.Sub(sentAt) > connectedPingTTL {
+			delete(conn.pendingPings, pingTime)
+		}
+	}
+}
+
+func (conn *Conn) deleteOldestConnectedPingLocked() {
+	var (
+		oldestPing int64
+		oldestSent time.Time
+	)
+	for pingTime, sentAt := range conn.pendingPings {
+		if oldestSent.IsZero() || sentAt.Before(oldestSent) {
+			oldestPing = pingTime
+			oldestSent = sentAt
+		}
+	}
+	delete(conn.pendingPings, oldestPing)
 }
 
 // packetPool is used to pool packets that encapsulate their content.
@@ -843,7 +920,7 @@ func (conn *Conn) handleNACK(b []byte) error {
 		return fmt.Errorf("read NACK: %w", err)
 	}
 	if conn.queueResendsLocked(nack.packets, time.Now(), resendReasonNACK) > 0 {
-		conn.congestion.onNAK(conn.seq)
+		conn.congestion.onNAK()
 	}
 	return nil
 }
@@ -890,9 +967,9 @@ func (conn *Conn) flushResendQueue() {
 }
 
 func (conn *Conn) flushResendQueueLocked() error {
-	budget := conn.congestion.retransmissionBandwidth()
+	budget := conn.congestion.retransmissionBandwidth(conn.retransmission.inFlight())
 	now := time.Now()
-	for budget > 0 && len(conn.resendQueue) > 0 {
+	for len(conn.resendQueue) > 0 {
 		index := conn.nextDueResend(now)
 		if index < 0 {
 			return nil
@@ -906,7 +983,7 @@ func (conn *Conn) flushResendQueueLocked() error {
 			delete(conn.resendSet, sequenceNumber)
 			continue
 		}
-		if record.length > budget {
+		if budget <= 0 || record.length > budget {
 			return nil
 		}
 		conn.removeResendQueueIndex(index)

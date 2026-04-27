@@ -26,7 +26,6 @@ type congestionWindow struct {
 	deviationRTT time.Duration
 
 	nextCongestionControlBlock uint24
-	nakBackoffThisBlock        bool
 	resendBackoffThisBlock     bool
 }
 
@@ -54,7 +53,6 @@ func (w *congestionWindow) onAck(rtt time.Duration, sequenceNumber, nextSequence
 
 	newBlock := sequenceGreaterThan(sequenceNumber, w.nextCongestionControlBlock)
 	if newBlock {
-		w.nakBackoffThisBlock = false
 		w.resendBackoffThisBlock = false
 		w.nextCongestionControlBlock = nextSequenceNumber
 	}
@@ -87,8 +85,8 @@ func (w *congestionWindow) observeRTT(rtt time.Duration) bool {
 	return true
 }
 
-func (w *congestionWindow) onNAK(nextSequenceNumber uint24) {
-	if w.nakBackoffThisBlock {
+func (w *congestionWindow) onNAK() {
+	if w.resendBackoffThisBlock {
 		return
 	}
 	mtu := float64(w.mtu)
@@ -96,9 +94,6 @@ func (w *congestionWindow) onNAK(nextSequenceNumber uint24) {
 	if w.ssThresh < mtu {
 		w.ssThresh = mtu
 	}
-	w.cwnd = w.ssThresh
-	w.nextCongestionControlBlock = nextSequenceNumber
-	w.nakBackoffThisBlock = true
 }
 
 func (w *congestionWindow) onResend(nextSequenceNumber uint24) {
@@ -148,11 +143,8 @@ func (w *congestionWindow) nackResendDelay() time.Duration {
 	return delay
 }
 
-func (w *congestionWindow) retransmissionBandwidth() int {
-	if int(w.cwnd) < w.mtu {
-		return w.mtu
-	}
-	return int(w.cwnd)
+func (w *congestionWindow) retransmissionBandwidth(inFlightBytes int) int {
+	return inFlightBytes
 }
 
 func (w *congestionWindow) inSlowStart() bool {
