@@ -1067,7 +1067,7 @@ func (conn *Conn) releaseReliableBytes(n int) {
 }
 
 func (conn *Conn) queuedReliableBytes() int {
-	return conn.sendQueueBytes + conn.retransmission.retained() + conn.splitBytes
+	return conn.sendQueueBytes + conn.retransmission.retained()
 }
 
 func (conn *Conn) flushSendQueue() {

@@ -241,6 +241,17 @@ func TestReceiveSplitPacketRejectsSplitByteCap(t *testing.T) {
 	}
 }
 
+func TestInboundSplitBytesDoNotConsumeSendQueueBudget(t *testing.T) {
+	conn := newSecurityTestConn(t)
+	conn.splitBytes = maxSplitBytes
+
+	if n, err := conn.write([]byte{1}, reliabilityReliableOrdered, PacketPriorityNormal); err != nil {
+		t.Fatalf("write with full inbound split budget: %v", err)
+	} else if n != 1 {
+		t.Fatalf("write with full inbound split budget n = %v, want 1", n)
+	}
+}
+
 func TestReceiveSplitPacketPolicyCapsFollowHandlerLimits(t *testing.T) {
 	conn := newNoLimitSecurityTestConn(t)
 	if err := conn.receiveSplitPacket(splitPart(1, maxSplitCount+1, 0, []byte{1})); err != nil {
