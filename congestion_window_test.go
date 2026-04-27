@@ -126,6 +126,39 @@ func TestConnPacesTimeoutResendsWithCongestionWindow(t *testing.T) {
 	}
 }
 
+func TestConnCheckResendDoesNotBackoffAlreadyQueuedTimeout(t *testing.T) {
+	conn := newTestConn(428)
+	pk := testReliablePacket(1)
+	conn.retransmission.add(0, []*packet{pk}, 5000)
+	record := conn.retransmission.unacknowledged[0]
+	record.timestamp = time.Now().Add(-time.Second)
+	conn.retransmission.unacknowledged[0] = record
+	conn.resendSet[0] = struct{}{}
+	conn.resendQueue = append(conn.resendQueue, 0)
+	conn.congestion.cwnd = 3000
+
+	conn.checkResend(time.Now())
+	if got, want := conn.congestion.cwnd, 3000.0; got != want {
+		t.Fatalf("cwnd after already queued timeout = %v, want %v", got, want)
+	}
+	if conn.congestion.backoffThisBlock {
+		t.Fatal("already queued timeout triggered congestion backoff")
+	}
+	if got := conn.conn.(*recordingPacketConn).writes(); got != 0 {
+		t.Fatalf("writes after already queued timeout = %v, want 0", got)
+	}
+
+	conn.resendQueue = nil
+	delete(conn.resendSet, 0)
+	conn.checkResend(time.Now())
+	if got, want := conn.congestion.cwnd, 400.0; got != want {
+		t.Fatalf("cwnd after newly queued timeout = %v, want %v", got, want)
+	}
+	if !conn.congestion.backoffThisBlock {
+		t.Fatal("newly queued timeout did not trigger congestion backoff")
+	}
+}
+
 func TestConnRejectsFullSendQueue(t *testing.T) {
 	conn := newTestConn(428)
 	conn.sendQueueBytes = maxSendQueueBytes
@@ -201,6 +234,30 @@ func TestDetectLostConnectionsBypassesFullReliableQueue(t *testing.T) {
 	}
 	if conn.orderIndex != 0 || conn.messageIndex != 0 {
 		t.Fatalf("indexes after unreliable keepalive = order %v message %v, want zero", conn.orderIndex, conn.messageIndex)
+	}
+}
+
+func TestConnectedPongRefreshesRTT(t *testing.T) {
+	conn := newTestConn(428)
+	pingTime := timestamp()
+	time.Sleep(20 * time.Millisecond)
+	data, _ := (&message.ConnectedPong{PingTime: pingTime, PongTime: timestamp()}).MarshalBinary()
+
+	handled, err := (listenerConnectionHandler{}).handle(conn, data)
+	if err != nil {
+		t.Fatalf("handle connected pong: %v", err)
+	}
+	if !handled {
+		t.Fatal("connected pong was not handled")
+	}
+	if got := time.Duration(conn.rtt.Load()); got <= 0 {
+		t.Fatalf("rtt after connected pong = %v, want positive", got)
+	}
+	if got := conn.congestion.estimatedRTT; got == unsetRTT {
+		t.Fatalf("estimated RTT after connected pong = %v, want observed RTT", got)
+	}
+	if got, initial := conn.congestion.rto(), 300*time.Millisecond; got == initial {
+		t.Fatalf("rto after connected pong = %v, want refreshed estimate", got)
 	}
 }
 

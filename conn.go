@@ -215,10 +215,8 @@ func (conn *Conn) checkResend(now time.Time) {
 
 	var (
 		resend []uint24
-		rtt    = conn.retransmission.rtt(now)
 		delay  = conn.congestion.rto()
 	)
-	conn.rtt.Store(int64(rtt))
 
 	for seq, t := range conn.retransmission.unacknowledged {
 		// These packets have not been acknowledged for too long: We resend them
@@ -227,10 +225,9 @@ func (conn *Conn) checkResend(now time.Time) {
 			resend = append(resend, seq)
 		}
 	}
-	if len(resend) > 0 {
+	if conn.queueResendsLocked(resend) > 0 {
 		conn.congestion.onResend(conn.seq)
 	}
-	conn.queueResendsLocked(resend)
 	_ = conn.flushResendQueueLocked()
 }
 
@@ -695,17 +692,13 @@ func (conn *Conn) handleNACK(b []byte) error {
 	if err := nack.read(b); err != nil {
 		return fmt.Errorf("read NACK: %w", err)
 	}
-	for _, sequenceNumber := range nack.packets {
-		if _, ok := conn.retransmission.unacknowledged[sequenceNumber]; ok {
-			conn.congestion.onNAK(conn.seq)
-			break
-		}
+	if conn.queueResendsLocked(nack.packets) > 0 {
+		conn.congestion.onNAK(conn.seq)
 	}
-	conn.queueResendsLocked(nack.packets)
 	return conn.flushResendQueueLocked()
 }
 
-func (conn *Conn) queueResendsLocked(sequenceNumbers []uint24) {
+func (conn *Conn) queueResendsLocked(sequenceNumbers []uint24) (queued int) {
 	for _, sequenceNumber := range sequenceNumbers {
 		if _, ok := conn.resendSet[sequenceNumber]; ok {
 			continue
@@ -715,7 +708,9 @@ func (conn *Conn) queueResendsLocked(sequenceNumbers []uint24) {
 		}
 		conn.resendSet[sequenceNumber] = struct{}{}
 		conn.resendQueue = append(conn.resendQueue, sequenceNumber)
+		queued++
 	}
+	return queued
 }
 
 func (conn *Conn) flushResendQueue() {
