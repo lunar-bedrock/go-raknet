@@ -151,7 +151,7 @@ func (dialer Dialer) PingContext(ctx context.Context, address string) (response 
 		return nil, dialer.error("ping", err)
 	}
 
-	data = make([]byte, 1492)
+	data = make([]byte, maxMTUSize)
 	n, err := conn.Read(data)
 	if err != nil {
 		return nil, dialer.error("ping", err)
@@ -313,12 +313,9 @@ type connState struct {
 	maxTransientErrors  int
 }
 
-const (
-	maxSupportedMTU = 1492
-	minSupportedMTU = 576
-)
+const minSupportedMTU = 576
 
-var mtuSizes = []uint16{maxSupportedMTU, 1200, minSupportedMTU}
+var mtuSizes = []uint16{maxMTUSize, 1200, minSupportedMTU}
 
 // discoverMTU starts discovering an MTU size, the maximum packet size we
 // can send, by sending multiple open connection request 1 packets to the
@@ -329,7 +326,7 @@ func (state *connState) discoverMTU(ctx context.Context) error {
 
 	go state.request1(ctx, mtuSizes)
 
-	b := make([]byte, 1492)
+	b := make([]byte, maxMTUSize)
 	for {
 		// Start reading in a loop so that we can find an open connection reply
 		// 1 packet.
@@ -397,7 +394,7 @@ func (state *connState) openConnection(ctx context.Context) error {
 
 	go state.request2(ctx, state.mtu)
 
-	b := make([]byte, 1492)
+	b := make([]byte, maxMTUSize)
 	for {
 		// Start reading in a loop so that we can find open connection reply 2
 		// packets.

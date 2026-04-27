@@ -23,6 +23,10 @@ const (
 	// specific.
 	protocolVersion byte = 11
 
+	// minMTUSize and maxMTUSize bound the MTU value negotiated during the
+	// connection handshake. Per the RakNet protocol the value covers the full
+	// IP datagram including the 28-byte IP+UDP header, so usable payload is
+	// MTU-28.
 	minMTUSize    = 400
 	maxMTUSize    = 1492
 	maxWindowSize = 2048
