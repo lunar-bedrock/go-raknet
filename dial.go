@@ -240,6 +240,7 @@ func (dialer Dialer) DialContext(ctx context.Context, address string) (*Conn, er
 		id:                 atomic.AddInt64(&dialerID, 1),
 		ticker:             time.NewTicker(time.Second / 2),
 		maxTransientErrors: dialer.MaxTransientErrors,
+		log:                dialer.ErrorLog,
 	}
 	defer cs.ticker.Stop()
 	if err = cs.discoverMTU(ctx); err != nil {
@@ -311,6 +312,8 @@ type connState struct {
 
 	transientErrorCount int
 	maxTransientErrors  int
+
+	log *slog.Logger
 }
 
 const minSupportedMTU = 576
@@ -358,6 +361,7 @@ func (state *connState) discoverMTU(ctx context.Context) error {
 				continue
 			}
 			state.mtu = response.MTU
+			state.log.Info("mtu discovered", "size", state.mtu)
 			return nil
 		case message.IDIncompatibleProtocolVersion:
 			response := &message.IncompatibleProtocolVersion{}
@@ -374,6 +378,7 @@ func (state *connState) discoverMTU(ctx context.Context) error {
 func (state *connState) request1(ctx context.Context, sizes []uint16) {
 	state.ticker.Reset(time.Second / 2)
 	for _, size := range sizes {
+		state.log.Info("mtu probe", "size", size)
 		for range 4 {
 			state.openConnectionRequest1(size)
 			select {
