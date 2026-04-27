@@ -39,17 +39,17 @@ func TestCongestionWindowAckNakAndResend(t *testing.T) {
 		t.Fatalf("rto after first ACK = %v, want %v", got, want)
 	}
 
-	win.onNAK(2)
+	win.onNAK()
 	if got, want := win.ssThresh, 1500.0; got != want {
 		t.Fatalf("ssThresh after NACK = %v, want %v", got, want)
 	}
-	if got, want := win.cwnd, 1500.0; got != want {
+	if got, want := win.cwnd, 2000.0; got != want {
 		t.Fatalf("cwnd after NACK = %v, want %v", got, want)
 	}
 
 	win.onAck(100*time.Millisecond, 1, 2)
-	if win.cwnd <= 1500 || win.cwnd >= 2000 {
-		t.Fatalf("cwnd after second ACK = %v, want controlled growth from NACK window", win.cwnd)
+	if win.cwnd <= 2000 {
+		t.Fatalf("cwnd after second ACK = %v, want ACK growth after NACK threshold update", win.cwnd)
 	}
 	timeoutWin := newCongestionWindow(1000)
 	timeoutWin.cwnd = 2500
@@ -66,8 +66,8 @@ func TestCongestionWindowTimeoutOverridesPriorNAKBackoff(t *testing.T) {
 	win := newCongestionWindow(1000)
 	win.cwnd = 4000
 
-	win.onNAK(2)
-	if got, want := win.cwnd, 3000.0; got != want {
+	win.onNAK()
+	if got, want := win.cwnd, 4000.0; got != want {
 		t.Fatalf("cwnd after NACK = %v, want %v", got, want)
 	}
 
@@ -75,7 +75,7 @@ func TestCongestionWindowTimeoutOverridesPriorNAKBackoff(t *testing.T) {
 	if got, want := win.cwnd, 1000.0; got != want {
 		t.Fatalf("cwnd after timeout following NACK = %v, want %v", got, want)
 	}
-	if got, want := win.ssThresh, 1500.0; got != want {
+	if got, want := win.ssThresh, 2000.0; got != want {
 		t.Fatalf("ssThresh after timeout following NACK = %v, want %v", got, want)
 	}
 }
@@ -124,7 +124,7 @@ func TestConnQueuesReliableDatagramsUntilAck(t *testing.T) {
 	}
 }
 
-func TestConnPacesTimeoutResendsWithCongestionWindow(t *testing.T) {
+func TestConnFlushesTimeoutResendsWithRetransmissionBandwidth(t *testing.T) {
 	conn := newTestConn(428)
 	for seq := uint24(0); seq < 3; seq++ {
 		pk := testReliablePacket(360)
@@ -136,11 +136,11 @@ func TestConnPacesTimeoutResendsWithCongestionWindow(t *testing.T) {
 	if err := conn.flushResendQueueLocked(); err != nil {
 		t.Fatalf("flush resend queue: %v", err)
 	}
-	if got := conn.conn.(*recordingPacketConn).writes(); got != 1 {
-		t.Fatalf("resend writes = %v, want 1", got)
+	if got := conn.conn.(*recordingPacketConn).writes(); got != 3 {
+		t.Fatalf("resend writes = %v, want 3", got)
 	}
-	if got := len(conn.resendQueue); got != 2 {
-		t.Fatalf("remaining resend queue = %v, want 2", got)
+	if got := len(conn.resendQueue); got != 0 {
+		t.Fatalf("remaining resend queue = %v, want 0", got)
 	}
 }
 
@@ -172,6 +172,22 @@ func TestConnRestoresRetransmissionRecordWhenResendWriteFails(t *testing.T) {
 	}
 }
 
+func TestConnFlushResendQueueDropsAckedEntriesWithoutBudget(t *testing.T) {
+	conn := newTestConn(428)
+	conn.resendSet[0] = struct{}{}
+	conn.resendQueue = append(conn.resendQueue, resendQueueItem{sequenceNumber: 0})
+
+	if err := conn.flushResendQueueLocked(); err != nil {
+		t.Fatalf("flush resend queue: %v", err)
+	}
+	if got := len(conn.resendQueue); got != 0 {
+		t.Fatalf("stale resend queue entries = %v, want 0", got)
+	}
+	if _, ok := conn.resendSet[0]; ok {
+		t.Fatal("stale resend set entry was not removed")
+	}
+}
+
 func TestConnQueuesNACKResendsUntilTickBudget(t *testing.T) {
 	conn := newTestConn(428)
 	sent := time.Now().Add(-time.Second)
@@ -194,11 +210,11 @@ func TestConnQueuesNACKResendsUntilTickBudget(t *testing.T) {
 	if err := conn.flushResendQueueLocked(); err != nil {
 		t.Fatalf("flush resend queue: %v", err)
 	}
-	if got := conn.conn.(*recordingPacketConn).writes(); got != 1 {
-		t.Fatalf("resend writes after one tick = %v, want 1", got)
+	if got := conn.conn.(*recordingPacketConn).writes(); got != 3 {
+		t.Fatalf("resend writes after one tick = %v, want 3", got)
 	}
-	if got := len(conn.resendQueue); got != 2 {
-		t.Fatalf("queued resends after one tick = %v, want 2", got)
+	if got := len(conn.resendQueue); got != 0 {
+		t.Fatalf("queued resends after one tick = %v, want 0", got)
 	}
 }
 
@@ -448,7 +464,7 @@ func TestDetectLostConnectionsBypassesFullReliableQueue(t *testing.T) {
 func TestConnectedPongRefreshesRTT(t *testing.T) {
 	conn := newTestConn(428)
 	pingTime := timestamp()
-	time.Sleep(20 * time.Millisecond)
+	conn.recordConnectedPing(pingTime, time.Now().Add(-20*time.Millisecond))
 	data, _ := (&message.ConnectedPong{PingTime: pingTime, PongTime: timestamp()}).MarshalBinary()
 
 	handled, err := (listenerConnectionHandler{}).handle(conn, data)
@@ -466,6 +482,26 @@ func TestConnectedPongRefreshesRTT(t *testing.T) {
 	}
 	if got, initial := conn.congestion.rto(), initialRTO; got == initial {
 		t.Fatalf("rto after connected pong = %v, want refreshed estimate", got)
+	}
+}
+
+func TestConnectedPongIgnoresUntrackedPingTime(t *testing.T) {
+	conn := newTestConn(428)
+	pingTime := timestamp() - 1
+	data, _ := (&message.ConnectedPong{PingTime: pingTime, PongTime: timestamp()}).MarshalBinary()
+
+	handled, err := (listenerConnectionHandler{}).handle(conn, data)
+	if err != nil {
+		t.Fatalf("handle untracked connected pong: %v", err)
+	}
+	if !handled {
+		t.Fatal("connected pong was not handled")
+	}
+	if got := time.Duration(conn.rtt.Load()); got != 0 {
+		t.Fatalf("rtt after untracked connected pong = %v, want 0", got)
+	}
+	if got := conn.congestion.estimatedRTT; got != unsetRTT {
+		t.Fatalf("estimated RTT after untracked connected pong = %v, want unset", got)
 	}
 }
 

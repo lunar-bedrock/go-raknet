@@ -189,7 +189,7 @@ func (h listenerConnectionHandler) handle(conn *Conn, b []byte) (handled bool, e
 		return true, nil
 	case message.IDDetectLostConnections:
 		// Let the other end know the connection is still alive.
-		return true, conn.sendUnreliable(&message.ConnectedPing{PingTime: timestamp()})
+		return true, conn.sendConnectedPing()
 	default:
 		return false, nil
 	}
@@ -264,7 +264,7 @@ func (h dialerConnectionHandler) handle(conn *Conn, b []byte) (handled bool, err
 		return true, nil
 	case message.IDDetectLostConnections:
 		// Let the other end know the connection is still alive.
-		return true, conn.sendUnreliable(&message.ConnectedPing{PingTime: timestamp()})
+		return true, conn.sendConnectedPing()
 	default:
 		return false, nil
 	}
@@ -307,14 +307,6 @@ func handleConnectedPong(conn *Conn, b []byte) error {
 	if err := pk.UnmarshalBinary(b); err != nil {
 		return fmt.Errorf("read CONNECTED_PONG: %w", err)
 	}
-	now := timestamp()
-	if pk.PingTime > now {
-		return fmt.Errorf("handle CONNECTED_PONG: timestamp is in the future")
-	}
-	rtt := time.Duration(now-pk.PingTime) * time.Millisecond
-	conn.mu.Lock()
-	conn.rtt.Store(int64(rtt))
-	conn.congestion.observeRTT(rtt)
-	conn.mu.Unlock()
+	conn.observeConnectedPong(pk.PingTime, time.Now())
 	return nil
 }
