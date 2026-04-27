@@ -50,6 +50,47 @@ const (
 	splitFlag = 0x10
 )
 
+const reliablePacketAccountingOverhead = 96
+
+// PacketPriority selects which congestion-control lane is used for a reliable
+// write. Higher-priority lanes are drained before bulk lanes when bandwidth is
+// available.
+type PacketPriority byte
+
+const (
+	// PacketPriorityNormal is the default priority used by Conn.Write.
+	PacketPriorityNormal PacketPriority = iota
+	// PacketPriorityHigh is intended for control and gameplay packets that
+	// should not sit behind bulk chunk or resource-pack traffic.
+	PacketPriorityHigh
+	// PacketPriorityBulk is intended for large chunk or resource-pack streams.
+	// Bulk packets use a separate RakNet order channel so later normal traffic
+	// is not delivery-blocked by earlier bulk writes.
+	PacketPriorityBulk
+
+	packetPriorityCount
+)
+
+var sendPriorityOrder = [...]PacketPriority{
+	PacketPriorityHigh,
+	PacketPriorityNormal,
+	PacketPriorityBulk,
+}
+
+func (p PacketPriority) normalised() PacketPriority {
+	if p >= packetPriorityCount {
+		return PacketPriorityNormal
+	}
+	return p
+}
+
+func (p PacketPriority) orderChannel() byte {
+	if p.normalised() == PacketPriorityBulk {
+		return 1
+	}
+	return 0
+}
+
 type reliability byte
 
 // reliable checks packets with this reliability require a message index,
@@ -78,10 +119,12 @@ func (r reliability) sequencedOrOrdered() bool {
 // established.
 type packet struct {
 	reliability reliability
+	priority    PacketPriority
 
 	messageIndex  uint24
 	sequenceIndex uint24
 	orderIndex    uint24
+	orderChannel  byte
 
 	content []byte
 
@@ -108,8 +151,7 @@ func (pk *packet) write(buf *bytes.Buffer) {
 	}
 	if pk.reliability.sequencedOrOrdered() {
 		writeUint24(buf, pk.orderIndex)
-		// Order channel, we don't care about this.
-		buf.WriteByte(0)
+		buf.WriteByte(pk.orderChannel)
 	}
 	if pk.split {
 		writeUint32(buf, pk.splitCount)
@@ -121,6 +163,10 @@ func (pk *packet) write(buf *bytes.Buffer) {
 
 func (pk *packet) size() int {
 	return packetSize(len(pk.content), pk.reliability, pk.split)
+}
+
+func (pk *packet) accountedSize() int {
+	return pk.size() + reliablePacketAccountingOverhead
 }
 
 func packetSize(contentLength int, rel reliability, split bool) int {
@@ -176,7 +222,7 @@ func (pk *packet) read(b []byte) (int, error) {
 			return 0, io.ErrUnexpectedEOF
 		}
 		pk.orderIndex = loadUint24(b[offset:])
-		// Order channel (byte)
+		pk.orderChannel = b[offset+3]
 		offset += 4
 	}
 

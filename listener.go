@@ -41,6 +41,16 @@ type ListenConfig struct {
 	// BlockDuration defaults to 10s. If set to a negative value, IP addresses
 	// are never blocked on errors.
 	BlockDuration time.Duration
+
+	// MaxSendQueueBytes is the maximum retained reliable-packet memory allowed
+	// per connection, including queued packets and retransmission records. A
+	// zero value uses the default. A negative value disables the per-connection
+	// reliable-packet budget.
+	MaxSendQueueBytes int
+	// MaxGlobalSendQueueBytes is the maximum retained reliable-packet memory
+	// allowed across all connections accepted by this listener. A zero value
+	// uses the default. A negative value disables the listener-wide budget.
+	MaxGlobalSendQueueBytes int
 }
 
 // Listener implements a RakNet connection listener. It follows the same
@@ -70,6 +80,10 @@ type Listener struct {
 	// pongData is a byte slice of data that is sent in an unconnected pong
 	// packet each time the client sends and unconnected ping to the server.
 	pongData atomic.Pointer[[]byte]
+
+	// reliableBytes is the listener-wide retained reliable-packet memory
+	// currently reserved by accepted connections.
+	reliableBytes atomic.Int64
 }
 
 // listenerID holds the next ID to use for a Listener.
@@ -88,6 +102,12 @@ func (conf ListenConfig) Listen(address string) (*Listener, error) {
 
 	if conf.BlockDuration == 0 {
 		conf.BlockDuration = time.Second * 10
+	}
+	if conf.MaxSendQueueBytes == 0 {
+		conf.MaxSendQueueBytes = defaultMaxSendQueueBytes
+	}
+	if conf.MaxGlobalSendQueueBytes == 0 {
+		conf.MaxGlobalSendQueueBytes = defaultMaxGlobalSendQueueBytes
 	}
 	var conn net.PacketConn
 	var err error
@@ -114,6 +134,37 @@ func (conf ListenConfig) Listen(address string) (*Listener, error) {
 	go listener.listen()
 	go listener.sec.tick(listener.closed)
 	return listener, nil
+}
+
+// reserveReliableBytes reserves listener-wide reliable-packet memory. It
+// returns false if doing so would exceed MaxGlobalSendQueueBytes.
+func (listener *Listener) reserveReliableBytes(n int) bool {
+	if n <= 0 || listener.conf.MaxGlobalSendQueueBytes < 0 {
+		return true
+	}
+	limit := int64(listener.conf.MaxGlobalSendQueueBytes)
+	add := int64(n)
+	for {
+		current := listener.reliableBytes.Load()
+		if current+add > limit {
+			return false
+		}
+		if listener.reliableBytes.CompareAndSwap(current, current+add) {
+			return true
+		}
+	}
+}
+
+// releaseReliableBytes releases listener-wide reliable-packet memory reserved
+// by reserveReliableBytes.
+func (listener *Listener) releaseReliableBytes(n int) {
+	if n <= 0 || listener.conf.MaxGlobalSendQueueBytes < 0 {
+		return
+	}
+	remaining := listener.reliableBytes.Add(-int64(n))
+	if remaining < 0 {
+		listener.reliableBytes.Store(0)
+	}
 }
 
 // Listen listens on the address passed and returns a listener that may be used

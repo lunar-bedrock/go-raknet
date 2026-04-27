@@ -16,6 +16,9 @@ import (
 type connectionHandler interface {
 	handle(conn *Conn, b []byte) (handled bool, err error)
 	limitsEnabled() bool
+	maxSendQueueBytes() int
+	reserveReliableBytes(n int) bool
+	releaseReliableBytes(n int)
 	close(conn *Conn)
 	log() *slog.Logger
 }
@@ -37,6 +40,18 @@ func (h listenerConnectionHandler) log() *slog.Logger {
 
 func (h listenerConnectionHandler) limitsEnabled() bool {
 	return true
+}
+
+func (h listenerConnectionHandler) maxSendQueueBytes() int {
+	return h.l.conf.MaxSendQueueBytes
+}
+
+func (h listenerConnectionHandler) reserveReliableBytes(n int) bool {
+	return h.l.reserveReliableBytes(n)
+}
+
+func (h listenerConnectionHandler) releaseReliableBytes(n int) {
+	h.l.releaseReliableBytes(n)
 }
 
 func (h listenerConnectionHandler) close(conn *Conn) {
@@ -221,6 +236,16 @@ func (h dialerConnectionHandler) close(conn *Conn) {
 func (h dialerConnectionHandler) limitsEnabled() bool {
 	return false
 }
+
+func (h dialerConnectionHandler) maxSendQueueBytes() int {
+	return defaultMaxSendQueueBytes
+}
+
+func (h dialerConnectionHandler) reserveReliableBytes(int) bool {
+	return true
+}
+
+func (h dialerConnectionHandler) releaseReliableBytes(int) {}
 
 func (h dialerConnectionHandler) handle(conn *Conn, b []byte) (handled bool, err error) {
 	switch b[0] {

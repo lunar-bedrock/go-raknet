@@ -27,7 +27,25 @@ const (
 	maxMTUSize    = 1492
 	maxWindowSize = 2048
 
-	maxSendQueueBytes = 64 * 1024 * 1024
+	// defaultMaxSendQueueBytes is the default per-connection budget for
+	// retained reliable packets waiting in send queues or retransmission state.
+	defaultMaxSendQueueBytes = 8 * 1024 * 1024
+	// defaultMaxGlobalSendQueueBytes is the default listener-wide budget for
+	// retained reliable packets across all connections accepted by a listener.
+	defaultMaxGlobalSendQueueBytes = 256 * 1024 * 1024
+
+	// maxSplitCount is the maximum number of fragments accepted for one split
+	// packet when connection limits are enabled.
+	maxSplitCount = 512
+	// maxConcurrentSplits is the maximum number of incomplete split-packet
+	// assemblies retained per connection when connection limits are enabled.
+	maxConcurrentSplits = 16
+	// maxSplitBytes is the maximum total split-fragment payload retained per
+	// connection when connection limits are enabled.
+	maxSplitBytes = 8 * 1024 * 1024
+	// splitPacketTTL is how long an incomplete split-packet assembly may remain
+	// in memory before it is discarded.
+	splitPacketTTL = 30 * time.Second
 )
 
 // Conn represents a connection to a specific client. It is not a real
@@ -50,6 +68,7 @@ type Conn struct {
 
 	once      sync.Once
 	connected chan struct{}
+	wake      chan struct{}
 
 	mu  sync.Mutex
 	buf *bytes.Buffer
@@ -60,16 +79,18 @@ type Conn struct {
 
 	seq, orderIndex, messageIndex uint24
 	splitID                       uint32
+	orderIndices                  map[byte]uint24
 
 	// mtu is the MTU size of the connection. Packets longer than this size
 	// must be split into fragments for them to arrive at the client without
 	// losing bytes.
 	mtu uint16
 
-	// splits is a map of slices indexed by split IDs. The length of each of the
-	// slices is equal to the split count, and packets are positioned in that
-	// slice indexed by the split index.
-	splits map[uint16][][]byte
+	// splits is a map of partial split-packet assemblies indexed by split ID.
+	splits map[uint16]*splitAssembly
+	// splitBytes is the total payload bytes currently retained by all partial
+	// split-packet assemblies.
+	splitBytes int
 
 	// win is an ordered queue used to track which datagrams were received and
 	// which datagrams were missing, so that we can send NACKs to request
@@ -82,9 +103,9 @@ type Conn struct {
 	// in an ACK and the slice is cleared.
 	ackSlice []uint24
 
-	// packetQueue is an ordered queue containing packets indexed by their order
-	// index.
-	packetQueue *packetQueue
+	// packetQueues are ordered queues containing reliable ordered packets per
+	// RakNet order channel.
+	packetQueues map[byte]*packetQueue
 	// packets is a channel containing content of packets that were fully
 	// processed. Calling Conn.Read() consumes a value from this channel.
 	packets *internal.ElasticChan[[]byte]
@@ -93,12 +114,27 @@ type Conn struct {
 	// datagram sequence number.
 	retransmission *resendMap
 	congestion     *congestionWindow
-	sendQueue      []*packet
+	sendQueues     [packetPriorityCount][]*packet
 	sendQueueBytes int
 	resendQueue    []uint24
 	resendSet      map[uint24]struct{}
 
 	lastActivity atomic.Pointer[time.Time]
+}
+
+// splitAssembly tracks the fragments received for a single split packet until
+// the complete payload can be reassembled or the assembly expires.
+type splitAssembly struct {
+	// packets stores fragments by their split index. nil entries are still
+	// missing.
+	packets [][]byte
+	// created records when this split assembly was allocated.
+	created time.Time
+	// lastSeen is refreshed whenever a new fragment is accepted for this
+	// assembly.
+	lastSeen time.Time
+	// bytes is the sum of fragment payload sizes retained by this assembly.
+	bytes int
 }
 
 // newConn constructs a new connection specifically dedicated to the address
@@ -112,10 +148,11 @@ func newConn(conn net.PacketConn, raddr net.Addr, mtu uint16, h connectionHandle
 		handler:        h,
 		pk:             new(packet),
 		connected:      make(chan struct{}),
+		wake:           make(chan struct{}, 1),
 		packets:        internal.Chan[[]byte](4, 4096),
-		splits:         make(map[uint16][][]byte),
+		splits:         make(map[uint16]*splitAssembly),
 		win:            newDatagramWindow(),
-		packetQueue:    newPacketQueue(),
+		packetQueues:   map[byte]*packetQueue{0: newPacketQueue()},
 		retransmission: newRecoveryQueue(),
 		congestion:     newCongestionWindow(mtu - 28),
 		resendSet:      make(map[uint24]struct{}),
@@ -141,53 +178,105 @@ func (conn *Conn) effectiveMTU() uint16 {
 // out.
 func (conn *Conn) startTicking() {
 	var (
-		interval        = time.Second / 100
-		ticker          = time.NewTicker(interval)
+		timer           = time.NewTimer(activeTickInterval)
 		lastResendCheck = time.Now()
 		lastPing        = time.Now()
 		acksLeft        int
 	)
-	defer ticker.Stop()
+	defer timer.Stop()
 	for {
 		select {
-		case t := <-ticker.C:
-			conn.flushACKs()
-			if t.Sub(lastResendCheck) >= time.Millisecond*300 {
-				conn.checkResend(t)
-				lastResendCheck = t
+		case t := <-timer.C:
+			interval := idleTickInterval
+			if conn.tick(t, &lastResendCheck, &lastPing, &acksLeft) {
+				interval = activeTickInterval
 			}
-			conn.flushResendQueue()
-			conn.flushSendQueue()
-			if unix := conn.closing.Load(); unix != 0 {
-				before := acksLeft
-				conn.mu.Lock()
-				acksLeft = len(conn.retransmission.unacknowledged)
-				conn.mu.Unlock()
-
-				if before != 0 && acksLeft == 0 {
-					conn.closeImmediately()
-				}
-				since := t.Sub(time.Unix(unix, 0))
-				if (acksLeft == 0 && since > time.Second) || since > time.Second*5 {
-					conn.closeImmediately()
-				}
-				continue
-			}
-			if t.Sub(lastPing) >= time.Millisecond*500 {
-				// Ping the other end periodically to prevent timeouts.
-				_ = conn.sendUnreliable(&message.ConnectedPing{PingTime: timestamp()})
-				lastPing = t
-
-				conn.mu.Lock()
-				if t.Sub(*conn.lastActivity.Load()) > time.Second*5+conn.retransmission.rtt(t)*2 {
-					// No activity for too long: Start timeout.
-					_ = conn.Close()
-				}
-				conn.mu.Unlock()
-			}
+			timer.Reset(interval)
+		case <-conn.wake:
+			resetTimer(timer, activeTickInterval)
 		case <-conn.ctx.Done():
 			return
 		}
+	}
+}
+
+const (
+	activeTickInterval = 10 * time.Millisecond
+	idleTickInterval   = 100 * time.Millisecond
+	resendCheckPeriod  = 300 * time.Millisecond
+	pingPeriod         = 500 * time.Millisecond
+)
+
+func resetTimer(timer *time.Timer, delay time.Duration) {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	timer.Reset(delay)
+}
+
+func (conn *Conn) tick(t time.Time, lastResendCheck, lastPing *time.Time, acksLeft *int) bool {
+	conn.flushACKs()
+	if t.Sub(*lastResendCheck) >= resendCheckPeriod {
+		conn.checkResend(t)
+		*lastResendCheck = t
+	}
+	conn.flushResendQueue()
+	conn.flushSendQueue()
+	if unix := conn.closing.Load(); unix != 0 {
+		before := *acksLeft
+		conn.mu.Lock()
+		*acksLeft = len(conn.retransmission.unacknowledged)
+		conn.mu.Unlock()
+
+		if before != 0 && *acksLeft == 0 {
+			conn.closeImmediately()
+		}
+		since := t.Sub(time.Unix(unix, 0))
+		if (*acksLeft == 0 && since > time.Second) || since > time.Second*5 {
+			conn.closeImmediately()
+		}
+		return true
+	}
+	if t.Sub(*lastPing) >= pingPeriod {
+		// Ping the other end periodically to prevent timeouts.
+		_ = conn.sendUnreliable(&message.ConnectedPing{PingTime: timestamp()})
+		*lastPing = t
+
+		conn.mu.Lock()
+		if t.Sub(*conn.lastActivity.Load()) > time.Second*5+conn.congestion.rto()*2 {
+			// No activity for too long: Start timeout.
+			_ = conn.Close()
+		}
+		conn.mu.Unlock()
+	}
+	return conn.hasTickWork()
+}
+
+func (conn *Conn) hasTickWork() bool {
+	if conn.closing.Load() != 0 {
+		return true
+	}
+	conn.ackMu.Lock()
+	hasACKs := len(conn.ackSlice) > 0
+	conn.ackMu.Unlock()
+	if hasACKs {
+		return true
+	}
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	return len(conn.resendQueue) > 0 || conn.queuedPacketCountLocked() > 0
+}
+
+func (conn *Conn) wakeTick() {
+	if conn.wake == nil {
+		return
+	}
+	select {
+	case conn.wake <- struct{}{}:
+	default:
 	}
 }
 
@@ -213,22 +302,17 @@ func (conn *Conn) checkResend(now time.Time) {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
 
-	var (
-		resend []uint24
-		delay  = conn.congestion.rto()
-	)
-
-	for seq, t := range conn.retransmission.unacknowledged {
+	var resend []uint24
+	for seq, record := range conn.retransmission.unacknowledged {
 		// These packets have not been acknowledged for too long: We resend them
 		// by ourselves, even though no NACK has been issued yet.
-		if now.Sub(t.timestamp) > delay {
+		if !now.Before(record.nextSend) {
 			resend = append(resend, seq)
 		}
 	}
-	if conn.queueResendsLocked(resend) > 0 {
+	if conn.queueResendsLocked(resend, now, resendReasonTimeout) > 0 {
 		conn.congestion.onResend(conn.seq)
 	}
-	_ = conn.flushResendQueueLocked()
 }
 
 // Write writes a buffer b over the RakNet connection. The amount of bytes
@@ -236,7 +320,14 @@ func (conn *Conn) checkResend(now time.Time) {
 // successful. If not, an error is returned and n is 0. Write may be called
 // simultaneously from multiple goroutines, but will write one by one.
 func (conn *Conn) Write(b []byte) (n int, err error) {
-	return conn.writeWithReliability(b, reliabilityReliableOrdered)
+	return conn.WritePriority(b, PacketPriorityNormal)
+}
+
+// WritePriority writes a reliable ordered buffer using the priority lane
+// passed. PacketPriorityBulk should be used for large chunk or resource-pack
+// streams so normal gameplay writes can bypass bulk backlog.
+func (conn *Conn) WritePriority(b []byte, priority PacketPriority) (n int, err error) {
+	return conn.writeWithReliabilityPriority(b, reliabilityReliableOrdered, priority)
 }
 
 // writeWithReliability writes a buffer b over the RakNet connection using the
@@ -246,13 +337,19 @@ func (conn *Conn) Write(b []byte) (n int, err error) {
 // multiple goroutines, but will write one by one. Unlike Write, it allows
 // specifying the reliability.
 func (conn *Conn) writeWithReliability(b []byte, rel reliability) (n int, err error) {
+	return conn.writeWithReliabilityPriority(b, rel, PacketPriorityNormal)
+}
+
+// writeWithReliabilityPriority writes a buffer b over the RakNet connection
+// using the reliability and priority passed.
+func (conn *Conn) writeWithReliabilityPriority(b []byte, rel reliability, priority PacketPriority) (n int, err error) {
 	select {
 	case <-conn.ctx.Done():
 		return 0, conn.error(net.ErrClosed, "write")
 	default:
 		conn.mu.Lock()
 		defer conn.mu.Unlock()
-		n, err = conn.write(b, rel)
+		n, err = conn.write(b, rel, priority)
 		return n, conn.error(err, "write")
 	}
 }
@@ -262,20 +359,24 @@ func (conn *Conn) writeWithReliability(b []byte, rel reliability) (n int, err er
 // was successful. If not, an error is returned and n is 0. Write may be called
 // simultaneously from multiple goroutines, but will write one by one. Unlike
 // Write, write will not lock.
-func (conn *Conn) write(b []byte, rel reliability) (n int, err error) {
+func (conn *Conn) write(b []byte, rel reliability, priority PacketPriority) (n int, err error) {
 	fragments := split(b, conn.effectiveMTU())
+	var reservedBytes int
 	if rel.reliable() {
-		queuedBytes := packetsSize(fragments, rel)
-		if conn.queuedReliableBytes()+queuedBytes > maxSendQueueBytes {
+		reservedBytes = packetsSize(fragments, rel)
+		if !conn.canReserveReliableBytes(reservedBytes) {
 			_ = conn.flushSendQueueLocked()
 		}
-		if conn.queuedReliableBytes()+queuedBytes > maxSendQueueBytes {
+		if !conn.reserveReliableBytes(reservedBytes) {
 			return 0, ErrSendQueueFull
 		}
 	}
-	packets, n := conn.packetsForFragments(fragments, rel)
+	packets, n := conn.packetsForFragments(fragments, rel, priority)
 	for i, pk := range packets {
-		if err = conn.queuePacket(pk); err != nil {
+		if err = conn.queueReservedPacket(pk); err != nil {
+			if reservedBytes > 0 {
+				conn.releaseReliableBytes(reservedBytes)
+			}
 			conn.putPackets(packets[i:]...)
 			return 0, err
 		}
@@ -289,13 +390,15 @@ func (conn *Conn) write(b []byte, rel reliability) (n int, err error) {
 }
 
 func (conn *Conn) packetsForWrite(b []byte, rel reliability) ([]*packet, int) {
-	return conn.packetsForFragments(split(b, conn.effectiveMTU()), rel)
+	return conn.packetsForFragments(split(b, conn.effectiveMTU()), rel, PacketPriorityNormal)
 }
 
-func (conn *Conn) packetsForFragments(fragments [][]byte, rel reliability) ([]*packet, int) {
+func (conn *Conn) packetsForFragments(fragments [][]byte, rel reliability, priority PacketPriority) ([]*packet, int) {
+	priority = priority.normalised()
+	orderChannel := priority.orderChannel()
 	var orderIndex uint24
 	if rel.sequencedOrOrdered() {
-		orderIndex = conn.orderIndex.Inc()
+		orderIndex = conn.nextOrderIndex(orderChannel)
 	}
 
 	splitID := uint16(conn.splitID)
@@ -317,6 +420,8 @@ func (conn *Conn) packetsForFragments(fragments [][]byte, rel reliability) ([]*p
 
 		pk.orderIndex = orderIndex
 		pk.reliability = rel
+		pk.priority = priority
+		pk.orderChannel = orderChannel
 		if rel.reliable() {
 			pk.messageIndex = conn.messageIndex.Inc()
 		}
@@ -333,10 +438,22 @@ func (conn *Conn) packetsForFragments(fragments [][]byte, rel reliability) ([]*p
 	return packets, n
 }
 
+func (conn *Conn) nextOrderIndex(channel byte) uint24 {
+	if channel == 0 {
+		return conn.orderIndex.Inc()
+	}
+	if conn.orderIndices == nil {
+		conn.orderIndices = make(map[byte]uint24)
+	}
+	index := conn.orderIndices[channel]
+	conn.orderIndices[channel] = index + 1
+	return index
+}
+
 func packetsSize(fragments [][]byte, rel reliability) (size int) {
 	split := len(fragments) > 1
 	for _, content := range fragments {
-		size += packetSize(len(content), rel, split)
+		size += packetSize(len(content), rel, split) + reliablePacketAccountingOverhead
 	}
 	return size
 }
@@ -398,9 +515,9 @@ func (conn *Conn) closeImmediately() {
 		for _, record := range conn.retransmission.unacknowledged {
 			conn.putPackets(record.packets...)
 		}
-		clear(conn.retransmission.unacknowledged)
-		conn.putPackets(conn.sendQueue...)
-		conn.sendQueue = nil
+		conn.retransmission.clear(conn.releaseReliableBytes)
+		conn.releaseReliableBytes(conn.sendQueueBytes)
+		conn.putQueuedPacketsLocked()
 		conn.sendQueueBytes = 0
 		conn.resendQueue = nil
 		clear(conn.resendSet)
@@ -438,7 +555,7 @@ func (conn *Conn) Latency() time.Duration {
 // send encodes an encoding.BinaryMarshaler and writes it to the Conn.
 func (conn *Conn) send(pk encoding.BinaryMarshaler) error {
 	b, _ := pk.MarshalBinary()
-	_, err := conn.Write(b)
+	_, err := conn.WritePriority(b, PacketPriorityHigh)
 	return err
 }
 
@@ -458,6 +575,8 @@ var packetPool = sync.Pool{New: func() any { return &packet{reliability: reliabi
 func (conn *Conn) receive(b []byte) error {
 	t := time.Now()
 	conn.lastActivity.Store(&t)
+	conn.expireSplits(t)
+	defer conn.wakeTick()
 
 	switch {
 	case b[0]&bitFlagACK != 0:
@@ -470,6 +589,18 @@ func (conn *Conn) receive(b []byte) error {
 	return nil
 }
 
+// validateDatagramWindow rejects datagrams that would grow the receive window
+// past the configured limit before missing ranges are materialised into NACKs.
+func (conn *Conn) validateDatagramWindow(seq uint24) error {
+	if !conn.handler.limitsEnabled() || conn.win.seen(seq) {
+		return nil
+	}
+	if size := conn.win.sizeWith(seq); size > maxWindowSize {
+		return fmt.Errorf("receive datagram: queue window size is too big (%v-%v)", conn.win.lowest, seq+1)
+	}
+	return nil
+}
+
 // receiveDatagram handles the receiving of a datagram found in buffer b. If
 // successful, all packets inside the datagram are handled. if not, an error is
 // returned.
@@ -478,6 +609,9 @@ func (conn *Conn) receiveDatagram(b []byte) error {
 		return fmt.Errorf("read datagram: %w", io.ErrUnexpectedEOF)
 	}
 	seq := loadUint24(b)
+	if err := conn.validateDatagramWindow(seq); err != nil {
+		return err
+	}
 	if !conn.win.add(seq) {
 		// Datagram was already received, this might happen if a packet took a
 		// long time to arrive, and we already sent a NACK for it. This is
@@ -535,19 +669,29 @@ func (conn *Conn) receivePacket(packet *packet) error {
 		// If it isn't a reliable ordered packet, handle it immediately.
 		return conn.handlePacket(packet.content)
 	}
-	if !conn.packetQueue.put(packet.orderIndex, packet.content) {
+	queue := conn.packetQueue(packet.orderChannel)
+	if !queue.put(packet.orderIndex, packet.content) {
 		// An ordered packet arrived twice.
 		return nil
 	}
-	if conn.packetQueue.WindowSize() > maxWindowSize && conn.handler.limitsEnabled() {
-		return fmt.Errorf("packet queue window size is too big (%v-%v)", conn.packetQueue.lowest, conn.packetQueue.highest)
+	if queue.WindowSize() > maxWindowSize && conn.handler.limitsEnabled() {
+		return fmt.Errorf("packet queue window size is too big (%v-%v)", queue.lowest, queue.highest)
 	}
-	for _, content := range conn.packetQueue.fetch() {
+	for _, content := range queue.fetch() {
 		if err := conn.handlePacket(content); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func (conn *Conn) packetQueue(channel byte) *packetQueue {
+	queue := conn.packetQueues[channel]
+	if queue == nil {
+		queue = newPacketQueue()
+		conn.packetQueues[channel] = queue
+	}
+	return queue
 }
 
 var errZeroPacket = errors.New("handle packet: zero packet length")
@@ -585,39 +729,75 @@ func resolve(addr net.Addr) netip.AddrPort {
 	return netip.AddrPort{}
 }
 
+// expireSplits removes split-packet assemblies that have not completed within
+// splitPacketTTL and releases their retained byte accounting.
+func (conn *Conn) expireSplits(now time.Time) {
+	if !conn.handler.limitsEnabled() {
+		return
+	}
+	for id, split := range conn.splits {
+		if now.Sub(split.lastSeen) < splitPacketTTL {
+			continue
+		}
+		conn.splitBytes -= split.bytes
+		delete(conn.splits, id)
+	}
+	if conn.splitBytes < 0 {
+		conn.splitBytes = 0
+	}
+}
+
 // receiveSplitPacket handles a passed split packet. If it is the last split
 // packet of its sequence, it will continue handling the full packet as it
 // otherwise would. An error is returned if the packet was not valid.
 func (conn *Conn) receiveSplitPacket(p *packet) error {
-	const maxSplitCount = 512
-	const maxConcurrentSplits = 16
+	now := time.Now()
+	conn.expireSplits(now)
 
-	if p.splitCount > maxSplitCount && conn.handler.limitsEnabled() {
+	if p.splitCount < 2 {
+		return fmt.Errorf("split packet: split count %v is below the minimum 2", p.splitCount)
+	}
+	limits := conn.handler.limitsEnabled()
+	if p.splitCount > maxSplitCount && limits {
 		return fmt.Errorf("split packet: split count %v exceeds the maximum %v", p.splitCount, maxSplitCount)
 	}
-	if len(conn.splits) > maxConcurrentSplits && conn.handler.limitsEnabled() {
-		return fmt.Errorf("split packet: maximum concurrent splits %v reached", maxConcurrentSplits)
+	if p.splitIndex >= p.splitCount {
+		return fmt.Errorf("split packet: split index %v is out of range (0 - %v)", p.splitIndex, p.splitCount-1)
 	}
-	m, ok := conn.splits[p.splitID]
+	split, ok := conn.splits[p.splitID]
+	if ok && uint32(len(split.packets)) != p.splitCount {
+		return fmt.Errorf("split packet: split count %v conflicts with existing count %v", p.splitCount, len(split.packets))
+	}
+	if ok && split.packets[p.splitIndex] != nil {
+		return nil
+	}
+	if conn.splitBytes+len(p.content) > maxSplitBytes && limits {
+		return fmt.Errorf("split packet: split packet bytes exceed the maximum %v", maxSplitBytes)
+	}
 	if !ok {
-		m = make([][]byte, p.splitCount)
-		conn.splits[p.splitID] = m
+		if len(conn.splits) >= maxConcurrentSplits && limits {
+			return fmt.Errorf("split packet: maximum concurrent splits %v reached", maxConcurrentSplits)
+		}
+		split = &splitAssembly{packets: make([][]byte, p.splitCount), created: now, lastSeen: now}
+		conn.splits[p.splitID] = split
 	}
-	if p.splitIndex > uint32(len(m)-1) {
-		// The split index was either negative or was bigger than the slice
-		// size, meaning the packet is invalid.
-		return fmt.Errorf("split packet: split index %v is out of range (0 - %v)", p.splitIndex, len(m)-1)
-	}
-	m[p.splitIndex] = p.content
+	split.packets[p.splitIndex] = p.content
+	split.lastSeen = now
+	split.bytes += len(p.content)
+	conn.splitBytes += len(p.content)
 
-	if slices.ContainsFunc(m, func(i []byte) bool { return len(i) == 0 }) {
+	if slices.ContainsFunc(split.packets, func(i []byte) bool { return i == nil }) {
 		// We haven't yet received all split fragments, so we cannot add the
 		// packets together yet.
 		return nil
 	}
-	p.content = slices.Concat(m...)
+	p.content = slices.Concat(split.packets...)
 
 	delete(conn.splits, p.splitID)
+	conn.splitBytes -= split.bytes
+	if conn.splitBytes < 0 {
+		conn.splitBytes = 0
+	}
 	return conn.receivePacket(p)
 }
 
@@ -666,17 +846,22 @@ func (conn *Conn) handleACK(b []byte) error {
 	if err := ack.read(b); err != nil {
 		return fmt.Errorf("read ACK: %w", err)
 	}
+	now := time.Now()
+	acked := false
 	for _, sequenceNumber := range ack.packets {
 		// Take out all stored packets from the recovery queue.
-		if record, ok := conn.retransmission.acknowledge(sequenceNumber); ok {
+		if record, ok := conn.retransmission.acknowledge(sequenceNumber, conn.releaseReliableBytes); ok {
 			delete(conn.resendSet, sequenceNumber)
-			rtt := time.Since(record.timestamp)
+			rtt := now.Sub(record.lastSent)
 			conn.congestion.onAck(rtt, sequenceNumber, conn.seq)
-			conn.rtt.Store(int64(conn.retransmission.rtt(time.Now())))
+			acked = true
 			// Clear the packet and return it to the pool so that it may be
 			// re-used.
 			conn.putPackets(record.packets...)
 		}
+	}
+	if acked {
+		conn.rtt.Store(int64(conn.congestion.smoothedRTT()))
 	}
 	_ = conn.flushSendQueueLocked()
 	return nil
@@ -692,19 +877,38 @@ func (conn *Conn) handleNACK(b []byte) error {
 	if err := nack.read(b); err != nil {
 		return fmt.Errorf("read NACK: %w", err)
 	}
-	if conn.queueResendsLocked(nack.packets) > 0 {
+	if conn.queueResendsLocked(nack.packets, time.Now(), resendReasonNACK) > 0 {
 		conn.congestion.onNAK(conn.seq)
+		conn.wakeTick()
 	}
-	return conn.flushResendQueueLocked()
+	return nil
 }
 
-func (conn *Conn) queueResendsLocked(sequenceNumbers []uint24) (queued int) {
+type resendReason byte
+
+const (
+	resendReasonNACK resendReason = iota
+	resendReasonTimeout
+)
+
+func (conn *Conn) queueResendsLocked(sequenceNumbers []uint24, now time.Time, reason resendReason) (queued int) {
 	for _, sequenceNumber := range sequenceNumbers {
 		if _, ok := conn.resendSet[sequenceNumber]; ok {
 			continue
 		}
-		if _, ok := conn.retransmission.unacknowledged[sequenceNumber]; !ok {
+		record, ok := conn.retransmission.unacknowledged[sequenceNumber]
+		if !ok {
 			continue
+		}
+		switch reason {
+		case resendReasonNACK:
+			if now.Sub(record.lastSent) < conn.congestion.nackResendDelay() {
+				continue
+			}
+		case resendReasonTimeout:
+			if !conn.retransmission.markTimeoutQueued(sequenceNumber, now, conn.congestion.rto()) {
+				continue
+			}
 		}
 		conn.resendSet[sequenceNumber] = struct{}{}
 		conn.resendQueue = append(conn.resendQueue, sequenceNumber)
@@ -724,23 +928,23 @@ func (conn *Conn) flushResendQueueLocked() error {
 	budget := conn.congestion.retransmissionBandwidth()
 	for budget > 0 && len(conn.resendQueue) > 0 {
 		sequenceNumber := conn.resendQueue[0]
-		conn.resendQueue = conn.resendQueue[1:]
-		delete(conn.resendSet, sequenceNumber)
 
 		record, ok := conn.retransmission.record(sequenceNumber)
 		if !ok {
+			conn.resendQueue = conn.resendQueue[1:]
+			delete(conn.resendSet, sequenceNumber)
 			continue
 		}
 		if record.length > budget {
-			conn.resendSet[sequenceNumber] = struct{}{}
-			conn.resendQueue = append([]uint24{sequenceNumber}, conn.resendQueue...)
 			return nil
 		}
-		packets, ok := conn.retransmission.retransmit(sequenceNumber)
+		conn.resendQueue = conn.resendQueue[1:]
+		delete(conn.resendSet, sequenceNumber)
+		record, ok = conn.retransmission.retransmit(sequenceNumber)
 		if !ok {
 			continue
 		}
-		if err := conn.sendDatagram(packets); err != nil {
+		if err := conn.sendDatagramTracked(record.packets, record.retainedBytes, &record); err != nil {
 			return err
 		}
 		budget -= record.length
@@ -754,17 +958,49 @@ func (conn *Conn) queuePacket(pk *packet) error {
 		conn.putPackets(pk)
 		return err
 	}
-	size := pk.size()
-	if conn.queuedReliableBytes()+size > maxSendQueueBytes {
+	size := pk.accountedSize()
+	if !conn.reserveReliableBytes(size) {
 		return ErrSendQueueFull
 	}
-	conn.sendQueue = append(conn.sendQueue, pk)
-	conn.sendQueueBytes += size
+	return conn.queueReservedPacket(pk)
+}
+
+func (conn *Conn) queueReservedPacket(pk *packet) error {
+	if !pk.reliability.reliable() {
+		err := conn.sendDatagram([]*packet{pk})
+		conn.putPackets(pk)
+		return err
+	}
+	priority := pk.priority.normalised()
+	conn.sendQueues[priority] = append(conn.sendQueues[priority], pk)
+	conn.sendQueueBytes += pk.accountedSize()
 	return nil
 }
 
+func (conn *Conn) canReserveReliableBytes(n int) bool {
+	limit := conn.handler.maxSendQueueBytes()
+	return limit < 0 || conn.queuedReliableBytes()+n <= limit
+}
+
+func (conn *Conn) reserveReliableBytes(n int) bool {
+	if n <= 0 {
+		return true
+	}
+	if !conn.canReserveReliableBytes(n) {
+		return false
+	}
+	if !conn.handler.reserveReliableBytes(n) {
+		return false
+	}
+	return true
+}
+
+func (conn *Conn) releaseReliableBytes(n int) {
+	conn.handler.releaseReliableBytes(n)
+}
+
 func (conn *Conn) queuedReliableBytes() int {
-	return conn.sendQueueBytes + conn.retransmission.inFlight()
+	return conn.sendQueueBytes + conn.retransmission.retained() + conn.splitBytes
 }
 
 func (conn *Conn) flushSendQueue() {
@@ -775,19 +1011,19 @@ func (conn *Conn) flushSendQueue() {
 }
 
 func (conn *Conn) flushSendQueueLocked() error {
-	for len(conn.sendQueue) > 0 {
+	for conn.queuedPacketCountLocked() > 0 {
 		budget := conn.congestion.transmissionBandwidth(conn.retransmission.inFlight())
-		packets, queuedBytes := conn.nextSendBatch(budget)
+		packets, queuedBytes, counts := conn.nextSendBatch(budget)
 		if len(packets) == 0 {
 			return nil
 		}
-		conn.removeQueuedPackets(len(packets))
+		conn.removeQueuedPackets(counts)
 		conn.sendQueueBytes -= queuedBytes
 		if conn.sendQueueBytes < 0 {
 			conn.sendQueueBytes = 0
 		}
-		if err := conn.sendDatagram(packets); err != nil {
-			conn.sendQueue = append(packets, conn.sendQueue...)
+		if err := conn.sendDatagramTracked(packets, queuedBytes, nil); err != nil {
+			conn.prependQueuedPackets(packets)
 			conn.sendQueueBytes += queuedBytes
 			return err
 		}
@@ -795,38 +1031,72 @@ func (conn *Conn) flushSendQueueLocked() error {
 	return nil
 }
 
-func (conn *Conn) removeQueuedPackets(n int) {
-	for i := range n {
-		conn.sendQueue[i] = nil
+func (conn *Conn) queuedPacketCountLocked() int {
+	var count int
+	for _, queue := range conn.sendQueues {
+		count += len(queue)
 	}
-	conn.sendQueue = conn.sendQueue[n:]
+	return count
 }
 
-func (conn *Conn) nextSendBatch(budget int) (packets []*packet, queuedBytes int) {
+func (conn *Conn) removeQueuedPackets(counts [packetPriorityCount]int) {
+	for priority, n := range counts {
+		queue := conn.sendQueues[priority]
+		for i := range n {
+			queue[i] = nil
+		}
+		conn.sendQueues[priority] = queue[n:]
+	}
+}
+
+func (conn *Conn) prependQueuedPackets(packets []*packet) {
+	for i := len(packets) - 1; i >= 0; i-- {
+		pk := packets[i]
+		priority := pk.priority.normalised()
+		conn.sendQueues[priority] = append([]*packet{pk}, conn.sendQueues[priority]...)
+	}
+}
+
+func (conn *Conn) putQueuedPacketsLocked() {
+	for priority := range conn.sendQueues {
+		conn.putPackets(conn.sendQueues[priority]...)
+		conn.sendQueues[priority] = nil
+	}
+}
+
+func (conn *Conn) nextSendBatch(budget int) (packets []*packet, queuedBytes int, counts [packetPriorityCount]int) {
 	if budget <= 0 {
-		return nil, 0
+		return nil, 0, counts
 	}
 	const datagramHeaderSize = 1 + 3
 	maxDatagramSize := int(conn.effectiveMTU())
 	length := datagramHeaderSize
-	for _, pk := range conn.sendQueue {
-		packetSize := pk.size()
-		nextLength := length + packetSize
-		if nextLength > maxDatagramSize || nextLength > budget {
-			break
+	for _, priority := range sendPriorityOrder {
+		queue := conn.sendQueues[priority]
+		for _, pk := range queue {
+			packetSize := pk.size()
+			nextLength := length + packetSize
+			if nextLength > maxDatagramSize || nextLength > budget {
+				break
+			}
+			packets = append(packets, pk)
+			length = nextLength
+			queuedBytes += pk.accountedSize()
+			counts[priority]++
 		}
-		packets = append(packets, pk)
-		length = nextLength
-		queuedBytes += packetSize
 	}
-	return packets, queuedBytes
+	return packets, queuedBytes, counts
 }
 
 // sendDatagram sends a datagram over the connection that includes the packet
 // passed. It is assigned a new sequence number and added to the retransmission.
 func (conn *Conn) sendDatagram(packets []*packet) error {
+	return conn.sendDatagramTracked(packets, 0, nil)
+}
+
+func (conn *Conn) sendDatagramTracked(packets []*packet, retainedBytes int, previous *resendRecord) error {
 	flags := byte(bitFlagDatagram | bitFlagNeedsBAndAS)
-	if len(conn.sendQueue) > 0 {
+	if conn.queuedPacketCountLocked() > 0 {
 		flags |= bitFlagContinuousSend
 	}
 	conn.buf.WriteByte(flags)
@@ -846,15 +1116,15 @@ func (conn *Conn) sendDatagram(packets []*packet) error {
 	if reliable {
 		// We then re-add the datagram to the recovery queue in case the new one
 		// gets lost too, in which case we need to resend it again.
-		conn.retransmission.add(seq, packets, length)
+		conn.retransmission.add(seq, packets, length, retainedBytes, time.Now(), conn.congestion.rto(), previous)
 	}
 	return nil
 }
 
 func (conn *Conn) writeImmediateLocked(b []byte, rel reliability) error {
-	packets, _ := conn.packetsForWrite(b, rel)
+	packets, _ := conn.packetsForFragments(split(b, conn.effectiveMTU()), rel, PacketPriorityHigh)
 	for i, pk := range packets {
-		if err := conn.sendDatagram([]*packet{pk}); err != nil {
+		if err := conn.sendDatagramImmediate([]*packet{pk}); err != nil {
 			conn.putPackets(packets[i:]...)
 			return err
 		}
@@ -862,9 +1132,26 @@ func (conn *Conn) writeImmediateLocked(b []byte, rel reliability) error {
 	return nil
 }
 
+func (conn *Conn) sendDatagramImmediate(packets []*packet) error {
+	flags := byte(bitFlagDatagram | bitFlagNeedsBAndAS)
+	conn.buf.WriteByte(flags)
+	seq := conn.seq.Inc()
+	writeUint24(conn.buf, seq)
+	for _, pk := range packets {
+		pk.write(conn.buf)
+	}
+	defer conn.buf.Reset()
+	if err := conn.writeTo(conn.buf.Bytes(), conn.raddr); err != nil {
+		return fmt.Errorf("send datagram: %w", err)
+	}
+	return nil
+}
+
 func (conn *Conn) putPackets(packets ...*packet) {
 	for _, pk := range packets {
 		pk.content = pk.content[:0]
+		pk.priority = PacketPriorityNormal
+		pk.orderChannel = 0
 		packetPool.Put(pk)
 	}
 }

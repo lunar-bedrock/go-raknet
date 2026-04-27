@@ -5,7 +5,12 @@ import (
 	"time"
 )
 
-const unsetRTT = time.Duration(-1)
+const (
+	unsetRTT       = time.Duration(-1)
+	initialRTO     = time.Second
+	maxRTO         = 4 * time.Second
+	maxDatagramRTO = 8 * time.Second
+)
 
 // congestionWindow implements RakNet's sliding window congestion controller.
 // It follows the Cloudburst/RakNet variant: ACKs grow cwnd, NACKs move the
@@ -110,18 +115,37 @@ func (w *congestionWindow) onResend(nextSequenceNumber uint24) {
 
 func (w *congestionWindow) rto() time.Duration {
 	const (
-		initialRTO         = 300 * time.Millisecond
-		maxThreshold       = 2 * time.Second
 		additionalVariance = 30 * time.Millisecond
 	)
 	if w.estimatedRTT == unsetRTT {
 		return initialRTO
 	}
 	threshold := 2*w.estimatedRTT + 4*w.deviationRTT + additionalVariance
-	if threshold > maxThreshold {
-		return maxThreshold
+	if threshold > maxRTO {
+		return maxRTO
 	}
 	return threshold
+}
+
+func (w *congestionWindow) smoothedRTT() time.Duration {
+	if w.estimatedRTT != unsetRTT {
+		return w.estimatedRTT
+	}
+	if w.lastRTT != unsetRTT {
+		return w.lastRTT
+	}
+	return 0
+}
+
+func (w *congestionWindow) nackResendDelay() time.Duration {
+	delay := w.rto() / 4
+	if delay < 50*time.Millisecond {
+		return 50 * time.Millisecond
+	}
+	if delay > 250*time.Millisecond {
+		return 250 * time.Millisecond
+	}
+	return delay
 }
 
 func (w *congestionWindow) retransmissionBandwidth() int {
