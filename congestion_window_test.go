@@ -112,7 +112,7 @@ func TestConnPacesTimeoutResendsWithCongestionWindow(t *testing.T) {
 		pk := testReliablePacket(360)
 		conn.retransmission.add(seq, []*packet{pk}, 1+3+pk.size(), pk.accountedSize(), time.Now().Add(-time.Second), conn.congestion.rto(), nil)
 		conn.resendSet[seq] = struct{}{}
-		conn.resendQueue = append(conn.resendQueue, seq)
+		conn.resendQueue = append(conn.resendQueue, resendQueueItem{sequenceNumber: seq})
 	}
 
 	if err := conn.flushResendQueueLocked(); err != nil {
@@ -123,6 +123,34 @@ func TestConnPacesTimeoutResendsWithCongestionWindow(t *testing.T) {
 	}
 	if got := len(conn.resendQueue); got != 2 {
 		t.Fatalf("remaining resend queue = %v, want 2", got)
+	}
+}
+
+func TestConnRestoresRetransmissionRecordWhenResendWriteFails(t *testing.T) {
+	conn := newTestConn(428)
+	conn.conn = &failingPacketConn{recordingPacketConn: recordingPacketConn{laddr: conn.conn.LocalAddr()}}
+	pk := testReliablePacket(1)
+	length := 1 + 3 + pk.size()
+	retained := pk.accountedSize()
+	conn.retransmission.add(0, []*packet{pk}, length, retained, time.Now().Add(-time.Second), conn.congestion.rto(), nil)
+	conn.resendSet[0] = struct{}{}
+	conn.resendQueue = append(conn.resendQueue, resendQueueItem{sequenceNumber: 0})
+
+	if err := conn.flushResendQueueLocked(); err == nil {
+		t.Fatal("flush resend queue succeeded, want write error")
+	}
+	record, ok := conn.retransmission.record(0)
+	if !ok {
+		t.Fatal("retransmission record was not restored after failed resend")
+	}
+	if got := record.retainedBytes; got != retained {
+		t.Fatalf("restored retained bytes = %v, want %v", got, retained)
+	}
+	if got := conn.retransmission.inFlight(); got != length {
+		t.Fatalf("in-flight bytes after failed resend = %v, want %v", got, length)
+	}
+	if got := conn.retransmission.retained(); got != retained {
+		t.Fatalf("retained bytes after failed resend = %v, want %v", got, retained)
 	}
 }
 
@@ -156,19 +184,33 @@ func TestConnQueuesNACKResendsUntilTickBudget(t *testing.T) {
 	}
 }
 
-func TestConnIgnoresNACKForRecentlySentDatagram(t *testing.T) {
+func TestConnDelaysNACKForRecentlySentDatagram(t *testing.T) {
 	conn := newTestConn(428)
 	pk := testReliablePacket(1)
-	conn.retransmission.add(0, []*packet{pk}, 1+3+pk.size(), pk.accountedSize(), time.Now(), conn.congestion.rto(), nil)
+	sent := time.Now()
+	conn.retransmission.add(0, []*packet{pk}, 1+3+pk.size(), pk.accountedSize(), sent, conn.congestion.rto(), nil)
 
 	if err := conn.handleNACK(acknowledgementBytes(t, []uint24{0}, conn.effectiveMTU())); err != nil {
 		t.Fatalf("handle NACK: %v", err)
 	}
-	if got := len(conn.resendQueue); got != 0 {
-		t.Fatalf("queued recent NACK resends = %v, want 0", got)
+	if got := len(conn.resendQueue); got != 1 {
+		t.Fatalf("queued recent NACK resends = %v, want 1 delayed resend", got)
+	}
+	if got, want := conn.resendQueue[0].due.Sub(sent), conn.congestion.nackResendDelay(); got != want {
+		t.Fatalf("recent NACK resend delay = %v, want %v", got, want)
+	}
+	if err := conn.flushResendQueueLocked(); err != nil {
+		t.Fatalf("flush delayed resend queue before due: %v", err)
 	}
 	if got := conn.conn.(*recordingPacketConn).writes(); got != 0 {
-		t.Fatalf("writes after recent NACK = %v, want 0", got)
+		t.Fatalf("writes before delayed NACK resend is due = %v, want 0", got)
+	}
+	conn.resendQueue[0].due = time.Now().Add(-time.Millisecond)
+	if err := conn.flushResendQueueLocked(); err != nil {
+		t.Fatalf("flush delayed resend queue after due: %v", err)
+	}
+	if got := conn.conn.(*recordingPacketConn).writes(); got != 1 {
+		t.Fatalf("writes after delayed NACK resend is due = %v, want 1", got)
 	}
 }
 
@@ -218,7 +260,7 @@ func TestConnCheckResendDoesNotBackoffAlreadyQueuedTimeout(t *testing.T) {
 	record.nextSend = time.Now().Add(-time.Millisecond)
 	conn.retransmission.unacknowledged[0] = record
 	conn.resendSet[0] = struct{}{}
-	conn.resendQueue = append(conn.resendQueue, 0)
+	conn.resendQueue = append(conn.resendQueue, resendQueueItem{sequenceNumber: 0})
 	conn.congestion.cwnd = 3000
 
 	conn.checkResend(time.Now())
@@ -553,6 +595,14 @@ func (c *recordingPacketConn) lastWrite() []byte {
 		return nil
 	}
 	return c.bufs[len(c.bufs)-1]
+}
+
+type failingPacketConn struct {
+	recordingPacketConn
+}
+
+func (c *failingPacketConn) WriteTo([]byte, net.Addr) (int, error) {
+	return 0, net.ErrClosed
 }
 
 func countDatagramPackets(t *testing.T, datagram []byte) int {

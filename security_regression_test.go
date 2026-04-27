@@ -100,6 +100,36 @@ func TestReceiveDatagramAllowsMaximumWindowGapWithBoundedNACK(t *testing.T) {
 	}
 }
 
+func TestReceiveOrderedPacketsAreCappedAcrossChannels(t *testing.T) {
+	conn := newSecurityTestConn(t)
+	for i := range maxWindowSize {
+		pk := &packet{
+			reliability:  reliabilityReliableOrdered,
+			orderChannel: byte(i),
+			orderIndex:   uint24(i/256 + 1),
+			content:      []byte{byte(i)},
+		}
+		if err := conn.receivePacket(pk); err != nil {
+			t.Fatalf("receive ordered packet %v: %v", i, err)
+		}
+	}
+	if got := conn.orderedQueuePackets; got != maxWindowSize {
+		t.Fatalf("ordered queue packets = %v, want %v", got, maxWindowSize)
+	}
+	err := conn.receivePacket(&packet{
+		reliability:  reliabilityReliableOrdered,
+		orderChannel: 0,
+		orderIndex:   uint24(maxWindowSize/256 + 1),
+		content:      []byte{1},
+	})
+	if err == nil {
+		t.Fatal("receive ordered packet above aggregate cap succeeded, want error")
+	}
+	if got := conn.orderedQueuePackets; got != maxWindowSize {
+		t.Fatalf("ordered queue packets after rejected packet = %v, want %v", got, maxWindowSize)
+	}
+}
+
 func TestReceiveSplitPacketRejectsInvalidCount(t *testing.T) {
 	conn := newSecurityTestConn(t)
 	err := conn.receiveSplitPacket(&packet{splitCount: 0, splitIndex: 0, splitID: 1, content: []byte{1}})

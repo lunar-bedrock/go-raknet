@@ -46,6 +46,9 @@ const (
 	// splitPacketTTL is how long an incomplete split-packet assembly may remain
 	// in memory before it is discarded.
 	splitPacketTTL = 30 * time.Second
+	// maxOrderedQueueBytes bounds payload retained by out-of-order reliable
+	// ordered packets across all order channels.
+	maxOrderedQueueBytes = maxWindowSize * maxMTUSize
 )
 
 // Conn represents a connection to a specific client. It is not a real
@@ -106,6 +109,10 @@ type Conn struct {
 	// packetQueues are ordered queues containing reliable ordered packets per
 	// RakNet order channel.
 	packetQueues map[byte]*packetQueue
+	// orderedQueuePackets and orderedQueueBytes track retained reliable ordered
+	// packets across all order channels.
+	orderedQueuePackets int
+	orderedQueueBytes   int
 	// packets is a channel containing content of packets that were fully
 	// processed. Calling Conn.Read() consumes a value from this channel.
 	packets *internal.ElasticChan[[]byte]
@@ -116,7 +123,7 @@ type Conn struct {
 	congestion     *congestionWindow
 	sendQueues     [packetPriorityCount][]*packet
 	sendQueueBytes int
-	resendQueue    []uint24
+	resendQueue    []resendQueueItem
 	resendSet      map[uint24]struct{}
 
 	lastActivity atomic.Pointer[time.Time]
@@ -135,6 +142,11 @@ type splitAssembly struct {
 	lastSeen time.Time
 	// bytes is the sum of fragment payload sizes retained by this assembly.
 	bytes int
+}
+
+type resendQueueItem struct {
+	sequenceNumber uint24
+	due            time.Time
 }
 
 // newConn constructs a new connection specifically dedicated to the address
@@ -387,10 +399,6 @@ func (conn *Conn) write(b []byte, rel reliability, priority PacketPriority) (n i
 		}
 	}
 	return n, nil
-}
-
-func (conn *Conn) packetsForWrite(b []byte, rel reliability) ([]*packet, int) {
-	return conn.packetsForFragments(split(b, conn.effectiveMTU()), rel, PacketPriorityNormal)
 }
 
 func (conn *Conn) packetsForFragments(fragments [][]byte, rel reliability, priority PacketPriority) ([]*packet, int) {
@@ -670,14 +678,19 @@ func (conn *Conn) receivePacket(packet *packet) error {
 		return conn.handlePacket(packet.content)
 	}
 	queue := conn.packetQueue(packet.orderChannel)
-	if !queue.put(packet.orderIndex, packet.content) {
-		// An ordered packet arrived twice.
+	if queue.contains(packet.orderIndex) {
+		// An ordered packet arrived twice or was already delivered.
 		return nil
 	}
-	if queue.WindowSize() > maxWindowSize && conn.handler.limitsEnabled() {
-		return fmt.Errorf("packet queue window size is too big (%v-%v)", queue.lowest, queue.highest)
+	if err := conn.reserveOrderedPacket(queue, packet); err != nil {
+		return err
+	}
+	if !queue.put(packet.orderIndex, packet.content) {
+		conn.releaseOrderedPacket(packet.content)
+		return nil
 	}
 	for _, content := range queue.fetch() {
+		conn.releaseOrderedPacket(content)
 		if err := conn.handlePacket(content); err != nil {
 			return err
 		}
@@ -692,6 +705,37 @@ func (conn *Conn) packetQueue(channel byte) *packetQueue {
 		conn.packetQueues[channel] = queue
 	}
 	return queue
+}
+
+func (conn *Conn) reserveOrderedPacket(queue *packetQueue, packet *packet) error {
+	if !conn.handler.limitsEnabled() {
+		return nil
+	}
+	if queue.WindowSizeWith(packet.orderIndex) > maxWindowSize {
+		return fmt.Errorf("packet queue window size is too big (%v-%v)", queue.lowest, packet.orderIndex+1)
+	}
+	if conn.orderedQueuePackets+1 > maxWindowSize {
+		return fmt.Errorf("ordered packet queue is too big (%v packets)", conn.orderedQueuePackets+1)
+	}
+	if conn.orderedQueueBytes+len(packet.content) > maxOrderedQueueBytes {
+		return fmt.Errorf("ordered packet queue is too big (%v bytes)", conn.orderedQueueBytes+len(packet.content))
+	}
+	conn.orderedQueuePackets++
+	conn.orderedQueueBytes += len(packet.content)
+	return nil
+}
+
+func (conn *Conn) releaseOrderedPacket(content []byte) {
+	if !conn.handler.limitsEnabled() {
+		return
+	}
+	if conn.orderedQueuePackets > 0 {
+		conn.orderedQueuePackets--
+	}
+	conn.orderedQueueBytes -= len(content)
+	if conn.orderedQueueBytes < 0 {
+		conn.orderedQueueBytes = 0
+	}
 }
 
 var errZeroPacket = errors.New("handle packet: zero packet length")
@@ -900,10 +944,11 @@ func (conn *Conn) queueResendsLocked(sequenceNumbers []uint24, now time.Time, re
 		if !ok {
 			continue
 		}
+		due := time.Time{}
 		switch reason {
 		case resendReasonNACK:
-			if now.Sub(record.lastSent) < conn.congestion.nackResendDelay() {
-				continue
+			if nackDue := record.lastSent.Add(conn.congestion.nackResendDelay()); now.Before(nackDue) {
+				due = nackDue
 			}
 		case resendReasonTimeout:
 			if !conn.retransmission.markTimeoutQueued(sequenceNumber, now, conn.congestion.rto()) {
@@ -911,7 +956,7 @@ func (conn *Conn) queueResendsLocked(sequenceNumbers []uint24, now time.Time, re
 			}
 		}
 		conn.resendSet[sequenceNumber] = struct{}{}
-		conn.resendQueue = append(conn.resendQueue, sequenceNumber)
+		conn.resendQueue = append(conn.resendQueue, resendQueueItem{sequenceNumber: sequenceNumber, due: due})
 		queued++
 	}
 	return queued
@@ -926,30 +971,52 @@ func (conn *Conn) flushResendQueue() {
 
 func (conn *Conn) flushResendQueueLocked() error {
 	budget := conn.congestion.retransmissionBandwidth()
+	now := time.Now()
 	for budget > 0 && len(conn.resendQueue) > 0 {
-		sequenceNumber := conn.resendQueue[0]
+		index := conn.nextDueResend(now)
+		if index < 0 {
+			return nil
+		}
+		item := conn.resendQueue[index]
+		sequenceNumber := item.sequenceNumber
 
 		record, ok := conn.retransmission.record(sequenceNumber)
 		if !ok {
-			conn.resendQueue = conn.resendQueue[1:]
+			conn.removeResendQueueIndex(index)
 			delete(conn.resendSet, sequenceNumber)
 			continue
 		}
 		if record.length > budget {
 			return nil
 		}
-		conn.resendQueue = conn.resendQueue[1:]
+		conn.removeResendQueueIndex(index)
 		delete(conn.resendSet, sequenceNumber)
 		record, ok = conn.retransmission.retransmit(sequenceNumber)
 		if !ok {
 			continue
 		}
 		if err := conn.sendDatagramTracked(record.packets, record.retainedBytes, &record); err != nil {
+			conn.retransmission.restore(sequenceNumber, record)
 			return err
 		}
 		budget -= record.length
 	}
 	return nil
+}
+
+func (conn *Conn) nextDueResend(now time.Time) int {
+	for i, item := range conn.resendQueue {
+		if !now.Before(item.due) {
+			return i
+		}
+	}
+	return -1
+}
+
+func (conn *Conn) removeResendQueueIndex(index int) {
+	copy(conn.resendQueue[index:], conn.resendQueue[index+1:])
+	conn.resendQueue[len(conn.resendQueue)-1] = resendQueueItem{}
+	conn.resendQueue = conn.resendQueue[:len(conn.resendQueue)-1]
 }
 
 func (conn *Conn) queuePacket(pk *packet) error {
@@ -1123,9 +1190,9 @@ func (conn *Conn) sendDatagramTracked(packets []*packet, retainedBytes int, prev
 
 func (conn *Conn) writeImmediateLocked(b []byte, rel reliability) error {
 	packets, _ := conn.packetsForFragments(split(b, conn.effectiveMTU()), rel, PacketPriorityHigh)
-	for i, pk := range packets {
+	defer conn.putPackets(packets...)
+	for _, pk := range packets {
 		if err := conn.sendDatagramImmediate([]*packet{pk}); err != nil {
-			conn.putPackets(packets[i:]...)
 			return err
 		}
 	}

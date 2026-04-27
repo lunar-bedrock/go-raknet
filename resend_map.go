@@ -71,6 +71,16 @@ func (m *resendMap) record(index uint24) (resendRecord, bool) {
 	return record, ok
 }
 
+func (m *resendMap) restore(index uint24, record resendRecord) {
+	if old, ok := m.unacknowledged[index]; ok {
+		m.inFlightBytes -= old.length
+		m.retainedBytes -= old.retainedBytes
+	}
+	m.unacknowledged[index] = record
+	m.inFlightBytes += record.length
+	m.retainedBytes += record.retainedBytes
+}
+
 // remove deletes an index from the resendMap. When releaseRetained is true, it
 // releases the retained reliable-packet memory associated with the record.
 func (m *resendMap) remove(index uint24, releaseRetained bool, release func(int)) (resendRecord, bool) {
