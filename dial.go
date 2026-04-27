@@ -315,7 +315,7 @@ type connState struct {
 
 const minSupportedMTU = 576
 
-var mtuSizes = []uint16{maxMTUSize, 1200, minSupportedMTU}
+var mtuSizes = []uint16{maxMTUSize, minSupportedMTU}
 
 // discoverMTU starts discovering an MTU size, the maximum packet size we
 // can send, by sending multiple open connection request 1 packets to the

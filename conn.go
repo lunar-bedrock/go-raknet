@@ -24,11 +24,15 @@ const (
 	protocolVersion byte = 11
 
 	// minMTUSize and maxMTUSize bound the MTU value negotiated during the
-	// connection handshake. Per the RakNet protocol the value covers the full
-	// IP datagram including the 28-byte IP+UDP header, so usable payload is
-	// MTU-28.
+	// connection handshake. The value covers the full IP datagram including
+	// the 28-byte IP+UDP header, so usable payload is MTU-28. The cap is set
+	// to the QUIC initial-packet size (RFC 9000 §14) — empirically safe on
+	// >99% of paths globally, including cellular carriers with asymmetric
+	// downstream MTU (T-Mobile GTP tunnels etc.) where larger sizes are
+	// silently dropped on the server→client path even after a successful
+	// upstream MTU probe.
 	minMTUSize    = 400
-	maxMTUSize    = 1492
+	maxMTUSize    = 1200
 	maxWindowSize = 2048
 )
 

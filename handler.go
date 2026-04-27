@@ -98,7 +98,6 @@ func (h listenerConnectionHandler) handleOpenConnectionRequest1(b []byte, addr n
 		return fmt.Errorf("read OPEN_CONNECTION_REQUEST_1: %w", err)
 	}
 	mtuSize := min(pk.MTU, maxMTUSize)
-	h.log().Info("OPEN_CONNECTION_REQUEST_1", "raddr", addr.String(), "client_mtu", pk.MTU, "negotiated_mtu", mtuSize)
 
 	if pk.ClientProtocol != protocolVersion {
 		data, _ := (&message.IncompatibleProtocolVersion{ServerGUID: h.l.id, ServerProtocol: protocolVersion}).MarshalBinary()
@@ -129,7 +128,6 @@ func (h listenerConnectionHandler) handleOpenConnectionRequest2(b []byte, addr n
 	}
 
 	mtuSize := min(pk.MTU, maxMTUSize)
-	h.log().Info("OPEN_CONNECTION_REQUEST_2", "raddr", addr.String(), "client_mtu", pk.MTU, "negotiated_mtu", mtuSize)
 
 	data, _ := (&message.OpenConnectionReply2{ServerGUID: h.l.id, ClientAddress: resolve(addr), MTU: mtuSize}).MarshalBinary()
 	if _, err := h.l.conn.WriteTo(data, addr); err != nil {
