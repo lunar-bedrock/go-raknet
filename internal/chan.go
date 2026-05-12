@@ -41,18 +41,36 @@ func (c *ElasticChan[T]) Recv(ctx context.Context) (val T, ok bool) {
 	}
 }
 
-// Send sends a value to the channel. Send never blocks, because if the maximum
-// capacity of the underlying channel is reached, a larger one is created.
+// Send sends a value to the channel if the configured limit has not been
+// reached. Send never blocks.
 func (c *ElasticChan[T]) Send(val T) {
-	if ccap := int64(cap(c.ch)); c.len.Add(1) >= ccap && ccap < c.lim {
+	c.TrySend(val)
+}
+
+// TrySend sends a value to the channel if the configured limit has not been
+// reached. TrySend returns false if the value could not be queued. TrySend never
+// blocks.
+func (c *ElasticChan[T]) TrySend(val T) bool {
+	nextLen := c.len.Add(1)
+	if nextLen > c.lim {
+		c.len.Add(-1)
+		return false
+	}
+	if ccap := int64(cap(c.ch)); nextLen > ccap && ccap < c.lim {
 		// This check happens outside a lock, meaning in the meantime, a call to
 		// Recv could cause the length to decrease, technically meaning growing
 		// is then unnecessary. That isn't a major issue though, as in most
 		// cases growing would still be necessary later.
 		c.growSend(val)
-		return
+		return true
 	}
-	c.ch <- val
+	select {
+	case c.ch <- val:
+		return true
+	default:
+		c.len.Add(-1)
+		return false
+	}
 }
 
 // growSend grows the channel to double the capacity, copying all values
@@ -61,7 +79,7 @@ func (c *ElasticChan[T]) growSend(val T) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.grow(max(cap(c.ch)*2, int(c.lim)))
+	c.grow(min(max(cap(c.ch)*2, 1), int(c.lim)))
 	c.ch <- val
 }
 
