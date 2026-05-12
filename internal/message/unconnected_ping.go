@@ -1,9 +1,13 @@
 package message
 
 import (
+	"bytes"
 	"encoding/binary"
+	"errors"
 	"io"
 )
+
+var errInvalidUnconnectedMagic = errors.New("invalid unconnected message magic")
 
 type UnconnectedPing struct {
 	PingTime   int64
@@ -24,7 +28,9 @@ func (pk *UnconnectedPing) UnmarshalBinary(data []byte) error {
 		return io.ErrUnexpectedEOF
 	}
 	pk.PingTime = int64(binary.BigEndian.Uint64(data))
-	// Magic: 16 bytes.
+	if !bytes.Equal(data[8:24], unconnectedMessageSequence[:]) {
+		return errInvalidUnconnectedMagic
+	}
 	pk.ClientGUID = int64(binary.BigEndian.Uint64(data[24:]))
 	return nil
 }
