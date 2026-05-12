@@ -41,6 +41,16 @@ type ListenConfig struct {
 	// BlockDuration defaults to 10s. If set to a negative value, IP addresses
 	// are never blocked on errors.
 	BlockDuration time.Duration
+
+	// MaxPongDataSize specifies the maximum number of bytes sent in the data
+	// field of an unconnected pong. It defaults to an MTU-safe value. If set to
+	// a negative value, pong data is capped only by the RakNet int16 length.
+	MaxPongDataSize int
+
+	// UnconnectedResponseRateLimit specifies how many spoofable unconnected
+	// responses may be sent to a source address per second. It defaults to 20.
+	// If set to a negative value, unconnected responses are not rate limited.
+	UnconnectedResponseRateLimit int
 }
 
 // Listener implements a RakNet connection listener. It follows the same
@@ -75,6 +85,8 @@ type Listener struct {
 // listenerID holds the next ID to use for a Listener.
 var listenerID = rand.Int64()
 
+const maxUnconnectedPongDataSize = maxMTUSize - 28 - 35
+
 // Listen listens on the address passed and returns a listener that may be used
 // to accept connections. If not successful, an error is returned. The address
 // follows the same rules as those defined in the net.TCPListen() function.
@@ -88,6 +100,12 @@ func (conf ListenConfig) Listen(address string) (*Listener, error) {
 
 	if conf.BlockDuration == 0 {
 		conf.BlockDuration = time.Second * 10
+	}
+	if conf.MaxPongDataSize == 0 {
+		conf.MaxPongDataSize = maxUnconnectedPongDataSize
+	}
+	if conf.UnconnectedResponseRateLimit == 0 {
+		conf.UnconnectedResponseRateLimit = 20
 	}
 	var conn net.PacketConn
 	var err error
@@ -162,11 +180,15 @@ func (listener *Listener) Close() error {
 
 // PongData sets the pong data that is used to respond with when a client sends
 // a ping. It usually holds game specific data that is used to display in a
-// server list. If a data slice is set with a size bigger than math.MaxInt16,
-// the function panics.
+// server list. Data larger than the listener's configured MaxPongDataSize is
+// truncated before being sent. If a data slice is set with a size bigger than
+// math.MaxInt16, the function panics.
 func (listener *Listener) PongData(data []byte) {
 	if len(data) > math.MaxInt16 {
 		panic(fmt.Sprintf("pong data: must be no longer than %v bytes, got %v", math.MaxInt16, len(data)))
+	}
+	if limit := listener.conf.MaxPongDataSize; limit >= 0 && len(data) > limit {
+		data = data[:limit]
 	}
 	listener.pongData.Store(&data)
 }
@@ -241,13 +263,24 @@ type security struct {
 
 	mu     sync.Mutex
 	blocks map[[16]byte]time.Time
+	rates  map[[16]byte]unconnectedResponseRate
+}
+
+type unconnectedResponseRate struct {
+	window time.Time
+	count  int
 }
 
 // newSecurity uses settings from a ListenConfig to create a security.
 func newSecurity(conf ListenConfig, h *listenerConnectionHandler) *security {
 	h.cookieSalt.Store(rand.Uint64())
 	h.previousSalt.Store(rand.Uint64())
-	return &security{h: h, conf: conf, blocks: make(map[[16]byte]time.Time)}
+	return &security{
+		h:      h,
+		conf:   conf,
+		blocks: make(map[[16]byte]time.Time),
+		rates:  make(map[[16]byte]unconnectedResponseRate),
+	}
 }
 
 // tick clears garbage from the security layer every second until the stop
@@ -299,19 +332,58 @@ func (s *security) blocked(addr net.Addr) bool {
 	return blocked
 }
 
+// allowUnconnectedResponse reports if a spoofable unconnected packet may be
+// answered without exceeding the per-source response rate.
+func (s *security) allowUnconnectedResponse(addr net.Addr) bool {
+	limit := s.conf.UnconnectedResponseRateLimit
+	if limit < 0 {
+		return true
+	}
+	udp, ok := addr.(*net.UDPAddr)
+	if !ok || udp.IP == nil {
+		return false
+	}
+	ip16 := udp.IP.To16()
+	if ip16 == nil {
+		return false
+	}
+	ip := [16]byte(ip16)
+	now := time.Now()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rate := s.rates[ip]
+	if now.Sub(rate.window) >= time.Second {
+		s.rates[ip] = unconnectedResponseRate{window: now, count: 1}
+		return true
+	}
+	if rate.count >= limit {
+		return false
+	}
+	rate.count++
+	s.rates[ip] = rate
+	return true
+}
+
 // gcBlocks removes blocks from the map that are no longer active. gcBlocks only
 // attempts to clear outdated blocks if there are two times more blocks active
 // than there were after the previous call to gcBlocks.
 func (s *security) gcBlocks() {
-	if s.blockCount.Load() == 0 {
-		return
-	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.blockCount.Load() == 0 && len(s.rates) == 0 {
+		return
+	}
 
 	now := time.Now()
-	maps.DeleteFunc(s.blocks, func(ip [16]byte, t time.Time) bool {
-		return now.Sub(t) > s.conf.BlockDuration
+	if s.blockCount.Load() != 0 {
+		maps.DeleteFunc(s.blocks, func(ip [16]byte, t time.Time) bool {
+			return now.Sub(t) > s.conf.BlockDuration
+		})
+	}
+	maps.DeleteFunc(s.rates, func(ip [16]byte, rate unconnectedResponseRate) bool {
+		return now.Sub(rate.window) > time.Second
 	})
 	s.blockCount.Store(uint32(len(s.blocks)))
 }

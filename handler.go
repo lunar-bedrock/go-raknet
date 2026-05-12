@@ -76,7 +76,8 @@ func (h listenerConnectionHandler) handleUnconnected(b []byte, addr net.Addr) er
 		h.log().Debug("unexpected datagram", "raddr", addr.String())
 		return nil
 	}
-	return fmt.Errorf("unknown unconnected packet (id=%x, len=%v)", b[0], len(b))
+	h.log().Debug("drop unknown unconnected packet", "raddr", addr.String(), "id", b[0], "len", len(b))
+	return nil
 }
 
 // handleUnconnectedPing handles an unconnected ping packet stored in buffer b,
@@ -84,11 +85,18 @@ func (h listenerConnectionHandler) handleUnconnected(b []byte, addr net.Addr) er
 func (h listenerConnectionHandler) handleUnconnectedPing(b []byte, addr net.Addr) error {
 	pk := &message.UnconnectedPing{}
 	if err := pk.UnmarshalBinary(b); err != nil {
-		return fmt.Errorf("read UNCONNECTED_PING: %w", err)
+		h.log().Debug("drop malformed UNCONNECTED_PING", "raddr", addr.String(), "error", err)
+		return nil
+	}
+	if !h.l.sec.allowUnconnectedResponse(addr) {
+		h.log().Debug("rate limited UNCONNECTED_PING response", "raddr", addr.String())
+		return nil
 	}
 	data, _ := (&message.UnconnectedPong{ServerGUID: h.l.id, PingTime: pk.PingTime, Data: *h.l.pongData.Load()}).MarshalBinary()
-	_, err := h.l.conn.WriteTo(data, addr)
-	return err
+	if _, err := h.l.conn.WriteTo(data, addr); err != nil {
+		h.log().Error("send UNCONNECTED_PONG: "+err.Error(), "raddr", addr.String())
+	}
+	return nil
 }
 
 // handleOpenConnectionRequest1 handles an open connection request 1 packet
@@ -96,19 +104,26 @@ func (h listenerConnectionHandler) handleUnconnectedPing(b []byte, addr net.Addr
 func (h listenerConnectionHandler) handleOpenConnectionRequest1(b []byte, addr net.Addr) error {
 	pk := &message.OpenConnectionRequest1{}
 	if err := pk.UnmarshalBinary(b); err != nil {
-		return fmt.Errorf("read OPEN_CONNECTION_REQUEST_1: %w", err)
+		h.log().Debug("drop malformed OPEN_CONNECTION_REQUEST_1", "raddr", addr.String(), "error", err)
+		return nil
+	}
+	if !h.l.sec.allowUnconnectedResponse(addr) {
+		h.log().Debug("rate limited OPEN_CONNECTION_REQUEST_1 response", "raddr", addr.String())
+		return nil
 	}
 	mtuSize := min(pk.MTU, maxMTUSize)
 
 	if pk.ClientProtocol != protocolVersion {
 		data, _ := (&message.IncompatibleProtocolVersion{ServerGUID: h.l.id, ServerProtocol: protocolVersion}).MarshalBinary()
-		_, _ = h.l.conn.WriteTo(data, addr)
-		return fmt.Errorf("handle OPEN_CONNECTION_REQUEST_1: incompatible protocol version %v (listener protocol = %v)", pk.ClientProtocol, protocolVersion)
+		_, err := h.l.conn.WriteTo(data, addr)
+		return err
 	}
 
 	data, _ := (&message.OpenConnectionReply1{ServerGUID: h.l.id, Cookie: h.cookie(addr, h.cookieSalt.Load()), ServerHasSecurity: !h.l.conf.DisableCookies, MTU: mtuSize}).MarshalBinary()
-	_, err := h.l.conn.WriteTo(data, addr)
-	return err
+	if _, err := h.l.conn.WriteTo(data, addr); err != nil {
+		h.log().Error("send OPEN_CONNECTION_REPLY_1: "+err.Error(), "raddr", addr.String())
+	}
+	return nil
 }
 
 // handleOpenConnectionRequest2 handles an open connection request 2 packet
@@ -116,16 +131,23 @@ func (h listenerConnectionHandler) handleOpenConnectionRequest1(b []byte, addr n
 func (h listenerConnectionHandler) handleOpenConnectionRequest2(b []byte, addr net.Addr) error {
 	pk := &message.OpenConnectionRequest2{ServerHasSecurity: !h.l.conf.DisableCookies}
 	if err := pk.UnmarshalBinary(b); err != nil {
-		return fmt.Errorf("read OPEN_CONNECTION_REQUEST_2: %w", err)
+		h.log().Debug("drop malformed OPEN_CONNECTION_REQUEST_2", "raddr", addr.String(), "error", err)
+		return nil
 	}
 	if expected := h.cookie(addr, h.cookieSalt.Load()); pk.Cookie != expected &&
 		pk.Cookie != h.cookie(addr, h.previousSalt.Load()) {
-		return fmt.Errorf("handle OPEN_CONNECTION_REQUEST_2: invalid cookie '%x', expected '%x'", pk.Cookie, expected)
+		h.log().Debug("drop OPEN_CONNECTION_REQUEST_2 with invalid cookie", "raddr", addr.String())
+		return nil
 	}
 
 	// Vanilla clients always provide a negative ClientGUID.
 	if pk.ClientGUID >= 0 {
-		return fmt.Errorf("handle OPEN_CONNECTION_REQUEST_2: invalid ClientGUID '%d', expected negative", pk.ClientGUID)
+		h.log().Debug("drop OPEN_CONNECTION_REQUEST_2 with invalid ClientGUID", "raddr", addr.String(), "guid", pk.ClientGUID)
+		return nil
+	}
+	if !h.l.sec.allowUnconnectedResponse(addr) {
+		h.log().Debug("rate limited OPEN_CONNECTION_REQUEST_2 response", "raddr", addr.String())
+		return nil
 	}
 
 	mtuSize := min(pk.MTU, maxMTUSize)

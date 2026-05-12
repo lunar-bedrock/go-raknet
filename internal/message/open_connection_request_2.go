@@ -1,6 +1,7 @@
 package message
 
 import (
+	"bytes"
 	"encoding/binary"
 	"io"
 	"net/netip"
@@ -45,7 +46,9 @@ func (pk *OpenConnectionRequest2) UnmarshalBinary(data []byte) error {
 	if len(data) < 16+cookieOffset || len(data) < 26+cookieOffset+addrSize(data[16+cookieOffset:]) {
 		return io.ErrUnexpectedEOF
 	}
-	// Magic: 16 bytes.
+	if !bytes.Equal(data[:16], unconnectedMessageSequence[:]) {
+		return errInvalidUnconnectedMagic
+	}
 	if pk.ServerHasSecurity {
 		pk.Cookie = binary.BigEndian.Uint32(data[16:])
 	}

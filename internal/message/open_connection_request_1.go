@@ -1,6 +1,7 @@
 package message
 
 import (
+	"bytes"
 	"io"
 )
 
@@ -30,7 +31,9 @@ func (pk *OpenConnectionRequest1) UnmarshalBinary(data []byte) error {
 	if len(data) < 17 {
 		return io.ErrUnexpectedEOF
 	}
-	// Magic: 16 bytes.
+	if !bytes.Equal(data[:16], unconnectedMessageSequence[:]) {
+		return errInvalidUnconnectedMagic
+	}
 	pk.ClientProtocol = data[16]
 	pk.MTU = uint16(len(data) + 20 + 8 + 1) // Headers + packet ID.
 	return nil
