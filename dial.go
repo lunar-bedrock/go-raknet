@@ -245,16 +245,16 @@ func (dialer Dialer) DialContext(ctx context.Context, address string) (*Conn, er
 	if err = cs.discoverMTU(ctx); err != nil {
 		return nil, dialer.error("dial", fmt.Errorf("discover mtu: %w", err))
 	}
-	dialer.ErrorLog.Debug("raknet mtu discovered",
-		"mtu", cs.mtu,
-		"server_security", cs.serverSecurity,
-	)
+	// dialer.ErrorLog.Debug("raknet mtu discovered",
+	// 	"mtu", cs.mtu,
+	// 	"server_security", cs.serverSecurity,
+	// )
 	if err = cs.openConnection(ctx); err != nil {
 		return nil, dialer.error("dial", fmt.Errorf("open connection: %w", err))
 	}
-	dialer.ErrorLog.Debug("raknet open connection succeeded",
-		"mtu", cs.mtu,
-	)
+	// dialer.ErrorLog.Debug("raknet open connection succeeded",
+	// 	"mtu", cs.mtu,
+	// )
 	return dialer.connect(ctx, cs)
 }
 
@@ -265,9 +265,9 @@ func (dialer Dialer) connect(ctx context.Context, state *connState) (*Conn, erro
 	if err := conn.send((&message.ConnectionRequest{ClientGUID: state.id, RequestTime: timestamp()})); err != nil {
 		return nil, dialer.error("dial", fmt.Errorf("send connection request: %w", err))
 	}
-	dialer.ErrorLog.Debug("raknet connection request sent",
-		"mtu", state.mtu,
-	)
+	// dialer.ErrorLog.Debug("raknet connection request sent",
+	// 	"mtu", state.mtu,
+	// )
 
 	go dialer.clientListen(conn, state.conn)
 
@@ -275,13 +275,13 @@ func (dialer Dialer) connect(ctx context.Context, state *connState) (*Conn, erro
 	case <-conn.connected:
 		// Remove connection deadline.
 		_ = conn.conn.SetDeadline(time.Time{})
-		dialer.ErrorLog.Debug("raknet connection accepted")
+		// dialer.ErrorLog.Debug("raknet connection accepted")
 		return conn, nil
 	case <-ctx.Done():
 		_ = conn.Close()
-		dialer.ErrorLog.Warn("raknet connection canceled before accept",
-			"error", ctx.Err(),
-		)
+		// dialer.ErrorLog.Warn("raknet connection canceled before accept",
+		// 	"error", ctx.Err(),
+		// )
 		return nil, dialer.error("dial", ctx.Err())
 	}
 }
