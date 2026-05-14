@@ -98,7 +98,7 @@ func (h listenerConnectionHandler) handleOpenConnectionRequest1(b []byte, addr n
 	if err := pk.UnmarshalBinary(b); err != nil {
 		return fmt.Errorf("read OPEN_CONNECTION_REQUEST_1: %w", err)
 	}
-	mtuSize := min(pk.MTU, maxMTUSize)
+	mtuSize := min(pk.MTU, h.l.maxMTU())
 
 	if pk.ClientProtocol != protocolVersion {
 		data, _ := (&message.IncompatibleProtocolVersion{ServerGUID: h.l.id, ServerProtocol: protocolVersion}).MarshalBinary()
@@ -128,7 +128,7 @@ func (h listenerConnectionHandler) handleOpenConnectionRequest2(b []byte, addr n
 		return fmt.Errorf("handle OPEN_CONNECTION_REQUEST_2: invalid ClientGUID '%d', expected negative", pk.ClientGUID)
 	}
 
-	mtuSize := min(pk.MTU, maxMTUSize)
+	mtuSize := min(pk.MTU, h.l.maxMTU())
 
 	data, _ := (&message.OpenConnectionReply2{ServerGUID: h.l.id, ClientAddress: resolve(addr), MTU: mtuSize}).MarshalBinary()
 	if _, err := h.l.conn.WriteTo(data, addr); err != nil {

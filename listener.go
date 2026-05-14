@@ -36,6 +36,9 @@ type ListenConfig struct {
 	// systems that interfere with this. In this case, DisableCookies should be
 	// set to true.
 	DisableCookies bool
+	// MaxMTU caps the largest MTU negotiated with incoming clients. If zero,
+	// the maximum supported MTU is used.
+	MaxMTU uint16
 	// BlockDuration specifies how long IP addresses should be blocked if an
 	// error is encountered during the handling of packets from an address.
 	// BlockDuration defaults to 10s. If set to a negative value, IP addresses
@@ -89,6 +92,7 @@ func (conf ListenConfig) Listen(address string) (*Listener, error) {
 	if conf.BlockDuration == 0 {
 		conf.BlockDuration = time.Second * 10
 	}
+	conf.MaxMTU = clampMTU(conf.MaxMTU, minMTUSize)
 	var conn net.PacketConn
 	var err error
 
@@ -175,6 +179,11 @@ func (listener *Listener) PongData(data []byte) {
 // client to identify a specific server during a single session.
 func (listener *Listener) ID() int64 {
 	return listener.id
+}
+
+// maxMTU returns the listener's effective negotiated MTU cap.
+func (listener *Listener) maxMTU() uint16 {
+	return clampMTU(listener.conf.MaxMTU, minMTUSize)
 }
 
 // listen continuously reads from the listener's UDP connection, until closed

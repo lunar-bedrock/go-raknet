@@ -97,7 +97,7 @@ type Conn struct {
 // newConn constructs a new connection specifically dedicated to the address
 // passed.
 func newConn(conn net.PacketConn, raddr net.Addr, mtu uint16, h connectionHandler) *Conn {
-	mtu = min(max(mtu, minMTUSize), maxMTUSize)
+	mtu = clampMTU(mtu, minMTUSize)
 	c := &Conn{
 		raddr:          raddr,
 		conn:           conn,
@@ -119,6 +119,14 @@ func newConn(conn net.PacketConn, raddr net.Addr, mtu uint16, h connectionHandle
 	c.lastActivity.Store(&t)
 	go c.startTicking()
 	return c
+}
+
+// clampMTU bounds mtu to the supported range.
+func clampMTU(mtu, minMTU uint16) uint16 {
+	if mtu == 0 || mtu > maxMTUSize {
+		return maxMTUSize
+	}
+	return max(mtu, minMTU)
 }
 
 // effectiveMTU returns the mtu size without the space allocated for IP and
