@@ -190,7 +190,12 @@ func (h listenerConnectionHandler) handleConnectionRequest(conn *Conn, b []byte)
 	if err := pk.UnmarshalBinary(b); err != nil {
 		return fmt.Errorf("read CONNECTION_REQUEST: %w", err)
 	}
-	return conn.send(&message.ConnectionRequestAccepted{ClientAddress: resolve(conn.raddr), PingTime: pk.RequestTime, PongTime: timestamp()})
+	return conn.send(&message.ConnectionRequestAccepted{
+		ClientAddress:   resolve(conn.raddr),
+		SystemAddresses: message.NewSystemAddresses(resolve(conn.conn.LocalAddr())),
+		PingTime:        pk.RequestTime,
+		PongTime:        timestamp(),
+	})
 }
 
 // handleNewIncomingConnection handles an incoming connection packet from the
@@ -254,7 +259,12 @@ func (h dialerConnectionHandler) handleConnectionRequestAccepted(conn *Conn, b [
 		return nil
 	default:
 		// Make sure to send NewIncomingConnection before closing conn.connected.
-		err := conn.send(&message.NewIncomingConnection{ServerAddress: resolve(conn.raddr), PingTime: pk.PongTime, PongTime: timestamp()})
+		err := conn.send(&message.NewIncomingConnection{
+			ServerAddress:   resolve(conn.raddr),
+			SystemAddresses: message.NewSystemAddresses(resolve(conn.conn.LocalAddr())),
+			PingTime:        pk.PongTime,
+			PongTime:        timestamp(),
+		})
 		close(conn.connected)
 		return err
 	}

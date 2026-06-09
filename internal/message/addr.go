@@ -7,6 +7,18 @@ import (
 
 type systemAddresses [20]netip.AddrPort
 
+// NewSystemAddresses returns a fixed RakNet system address list filled with the addresses passed.
+func NewSystemAddresses(addrs ...netip.AddrPort) systemAddresses {
+	var addresses systemAddresses
+	for i, addr := range addrs {
+		if i >= len(addresses) {
+			break
+		}
+		addresses[i] = addr
+	}
+	return addresses
+}
+
 // sizeOf returns the size in bytes of the system addresses.
 func (addresses systemAddresses) sizeOf() int {
 	size := 0
