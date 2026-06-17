@@ -73,6 +73,10 @@ type Listener struct {
 	// pongData is a byte slice of data that is sent in an unconnected pong
 	// packet each time the client sends and unconnected ping to the server.
 	pongData atomic.Pointer[[]byte]
+
+	// pongDataFunc is a function that returns the data that is sent in an unconnected pong
+	// it will be called if pongData is nil.
+	pongDataFunc atomic.Pointer[func(addr net.Addr) []byte]
 }
 
 // listenerID holds the next ID to use for a Listener.
@@ -148,9 +152,14 @@ func (listener *Listener) Addr() net.Addr {
 	return listener.conn.LocalAddr()
 }
 
-// Block blocks incoming network packets from being processed by the Listener.
+// Block blocks incoming network packets from being processed by the Listener for the duration provided by the ListenConfig.
 func (listener *Listener) Block(addr net.Addr) {
 	listener.sec.block(addr)
+}
+
+// BlockFor blocks incoming network packets from being processed by the Listener for the provided duration.
+func (listener *Listener) BlockFor(addr net.Addr, duration time.Duration) {
+	listener.sec.blockFor(addr, duration)
 }
 
 // Close closes the listener so that it may be cleaned up. It makes sure the
@@ -173,6 +182,17 @@ func (listener *Listener) PongData(data []byte) {
 		panic(fmt.Sprintf("pong data: must be no longer than %v bytes, got %v", math.MaxInt16, len(data)))
 	}
 	listener.pongData.Store(&data)
+}
+
+// PongDataFunc sets a function to generate pong data dynamically when responding to an unconnected ping.
+// This function will take priority over the static pong data, unless it is set back to nil. The data
+// returned should not be bigger than math.MaxInt16.
+func (listener *Listener) PongDataFunc(f func(addr net.Addr) []byte) {
+	if f == nil {
+		listener.pongDataFunc.Store(nil)
+	} else {
+		listener.pongDataFunc.Store(&f)
+	}
 }
 
 // ID returns the unique ID of the listener. This ID is usually used by a
@@ -282,30 +302,51 @@ func (s *security) tick(stop <-chan struct{}) {
 	}
 }
 
-// block stops the handling of packets originating from the IP of a net.Addr.
+// block stops the handling of packets originating from the IP of a net.Addr for the duration provided by the ListenConfig.
 func (s *security) block(addr net.Addr) {
-	if s.conf.BlockDuration < 0 {
+	s.blockFor(addr, s.conf.BlockDuration)
+}
+
+// blockFor stops the handling of packets originating from the IP of a net.Addr for the provided duration.
+func (s *security) blockFor(addr net.Addr, duration time.Duration) {
+	if duration <= 0 {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.blockCount.Add(1)
-	s.blocks[[16]byte(addr.(*net.UDPAddr).IP.To16())] = time.Now()
+	ip := [16]byte(addr.(*net.UDPAddr).IP.To16())
+	
+	if _, ok := s.blocks[ip]; !ok {
+		s.blockCount.Add(1)
+	}
+
+	s.blocks[ip] = time.Now().Add(duration)
 }
 
 // blocked checks if the IP of a net.Addr is currently blocked from any packet
 // handling.
 func (s *security) blocked(addr net.Addr) bool {
-	if s.conf.BlockDuration < 0 || s.blockCount.Load() == 0 {
+	if s.blockCount.Load() == 0 {
 		// Fast path optimisation: Prevents (relatively costly) map lookups.
 		return false
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	_, blocked := s.blocks[[16]byte(addr.(*net.UDPAddr).IP.To16())]
-	return blocked
+	ip := [16]byte(addr.(*net.UDPAddr).IP.To16())
+
+	expiresAt, blocked := s.blocks[ip]
+	if !blocked {
+		return false
+	}
+	if !time.Now().Before(expiresAt) {
+		delete(s.blocks, ip)
+		s.blockCount.Store(uint32(len(s.blocks)))
+		return false
+	}
+	
+	return true
 }
 
 // gcBlocks removes blocks from the map that are no longer active. gcBlocks only
@@ -320,7 +361,7 @@ func (s *security) gcBlocks() {
 
 	now := time.Now()
 	maps.DeleteFunc(s.blocks, func(ip [16]byte, t time.Time) bool {
-		return now.Sub(t) > s.conf.BlockDuration
+		return !now.Before(t)
 	})
 	s.blockCount.Store(uint32(len(s.blocks)))
 }

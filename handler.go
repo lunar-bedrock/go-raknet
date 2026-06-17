@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"log/slog"
+	"math"
 	"net"
 	"sync/atomic"
 	"time"
@@ -86,7 +87,14 @@ func (h listenerConnectionHandler) handleUnconnectedPing(b []byte, addr net.Addr
 	if err := pk.UnmarshalBinary(b); err != nil {
 		return fmt.Errorf("read UNCONNECTED_PING: %w", err)
 	}
-	data, _ := (&message.UnconnectedPong{ServerGUID: h.l.id, PingTime: pk.PingTime, Data: *h.l.pongData.Load()}).MarshalBinary()
+	pongData := *h.l.pongData.Load()
+	if f := h.l.pongDataFunc.Load(); f != nil {
+		pongData = (*f)(addr)
+		if len(pongData) > math.MaxInt16 {
+			return fmt.Errorf("pong data func: data must be no longer than %d bytes, got %d", math.MaxInt16, len(pongData))
+		}
+	}
+	data, _ := (&message.UnconnectedPong{ServerGUID: h.l.id, PingTime: pk.PingTime, Data: pongData}).MarshalBinary()
 	_, err := h.l.conn.WriteTo(data, addr)
 	return err
 }
