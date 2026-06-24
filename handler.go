@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"log/slog"
+	"math"
 	"net"
 	"sync/atomic"
 	"time"
@@ -85,7 +86,14 @@ func (h listenerConnectionHandler) handleUnconnectedPing(b []byte, addr net.Addr
 	if err := pk.UnmarshalBinary(b); err != nil {
 		return fmt.Errorf("read UNCONNECTED_PING: %w", err)
 	}
-	data, _ := (&message.UnconnectedPong{ServerGUID: h.l.id, PingTime: pk.PingTime, Data: *h.l.pongData.Load()}).MarshalBinary()
+	pongData := *h.l.pongData.Load()
+	if f := h.l.pongDataFunc.Load(); f != nil {
+		pongData = (*f)(addr)
+		if len(pongData) > math.MaxInt16 {
+			return fmt.Errorf("pong data func: data must be no longer than %d bytes, got %d", math.MaxInt16, len(pongData))
+		}
+	}
+	data, _ := (&message.UnconnectedPong{ServerGUID: h.l.id, PingTime: pk.PingTime, Data: pongData}).MarshalBinary()
 	_, err := h.l.conn.WriteTo(data, addr)
 	return err
 }
@@ -97,7 +105,7 @@ func (h listenerConnectionHandler) handleOpenConnectionRequest1(b []byte, addr n
 	if err := pk.UnmarshalBinary(b); err != nil {
 		return fmt.Errorf("read OPEN_CONNECTION_REQUEST_1: %w", err)
 	}
-	mtuSize := min(pk.MTU, maxMTUSize)
+	mtuSize := min(pk.MTU, h.l.maxMTU())
 
 	if pk.ClientProtocol != protocolVersion {
 		data, _ := (&message.IncompatibleProtocolVersion{ServerGUID: h.l.id, ServerProtocol: protocolVersion}).MarshalBinary()
@@ -127,7 +135,7 @@ func (h listenerConnectionHandler) handleOpenConnectionRequest2(b []byte, addr n
 		return fmt.Errorf("handle OPEN_CONNECTION_REQUEST_2: invalid ClientGUID '%d', expected negative", pk.ClientGUID)
 	}
 
-	mtuSize := min(pk.MTU, maxMTUSize)
+	mtuSize := min(pk.MTU, h.l.maxMTU())
 
 	data, _ := (&message.OpenConnectionReply2{ServerGUID: h.l.id, ClientAddress: resolve(addr), MTU: mtuSize}).MarshalBinary()
 	if _, err := h.l.conn.WriteTo(data, addr); err != nil {
