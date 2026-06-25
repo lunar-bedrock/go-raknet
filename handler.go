@@ -200,7 +200,7 @@ func (h listenerConnectionHandler) handleConnectionRequest(conn *Conn, b []byte)
 	}
 	return conn.send(&message.ConnectionRequestAccepted{
 		ClientAddress:   resolve(conn.raddr),
-		SystemAddresses: message.NewSystemAddresses(resolve(conn.conn.LocalAddr())),
+		SystemAddresses: message.NewLocalSystemAddresses(resolve(conn.conn.LocalAddr())),
 		PingTime:        pk.RequestTime,
 		PongTime:        timestamp(),
 	})
