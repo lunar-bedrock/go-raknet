@@ -81,6 +81,31 @@ type Listener struct {
 	// pongDataFunc is a function that returns the data that is sent in an unconnected pong
 	// it will be called if pongData is nil.
 	pongDataFunc atomic.Pointer[func(addr net.Addr) []byte]
+
+	stats listenerStats
+}
+
+// listenerStats holds the cumulative connection-funnel counters of a Listener.
+type listenerStats struct {
+	pings, connectionAttempts, connectionsStarted, connectionsAccepted atomic.Uint64
+}
+
+// ListenerStatistics is a snapshot of the cumulative connection-funnel
+// counters of a Listener, taken with Listener.Stats.
+type ListenerStatistics struct {
+	// Pings is the number of unconnected pings received, from LAN discovery
+	// and server list status checks.
+	Pings uint64
+	// ConnectionAttempts is the number of OpenConnectionRequest1 packets
+	// received. Clients retransmit these during MTU discovery, so a single
+	// connecting client counts several times.
+	ConnectionAttempts uint64
+	// ConnectionsStarted is the number of connection sessions allocated after
+	// a valid OpenConnectionRequest2.
+	ConnectionsStarted uint64
+	// ConnectionsAccepted is the number of connections that completed the
+	// RakNet handshake and were surfaced to Accept.
+	ConnectionsAccepted uint64
 }
 
 // listenerID holds the next ID to use for a Listener.
@@ -208,6 +233,17 @@ func (listener *Listener) PongDataFunc(f func(addr net.Addr) []byte) {
 // client to identify a specific server during a single session.
 func (listener *Listener) ID() int64 {
 	return listener.id
+}
+
+// Stats returns a snapshot of the listener's cumulative connection-funnel
+// counters.
+func (listener *Listener) Stats() ListenerStatistics {
+	return ListenerStatistics{
+		Pings:               listener.stats.pings.Load(),
+		ConnectionAttempts:  listener.stats.connectionAttempts.Load(),
+		ConnectionsStarted:  listener.stats.connectionsStarted.Load(),
+		ConnectionsAccepted: listener.stats.connectionsAccepted.Load(),
+	}
 }
 
 // maxMTU returns the listener's effective negotiated MTU cap.
