@@ -86,6 +86,7 @@ func (h listenerConnectionHandler) handleUnconnectedPing(b []byte, addr net.Addr
 	if err := pk.UnmarshalBinary(b); err != nil {
 		return fmt.Errorf("read UNCONNECTED_PING: %w", err)
 	}
+	h.l.stats.pings.Add(1)
 	pongData := *h.l.pongData.Load()
 	if f := h.l.pongDataFunc.Load(); f != nil {
 		pongData = (*f)(addr)
@@ -105,6 +106,7 @@ func (h listenerConnectionHandler) handleOpenConnectionRequest1(b []byte, addr n
 	if err := pk.UnmarshalBinary(b); err != nil {
 		return fmt.Errorf("read OPEN_CONNECTION_REQUEST_1: %w", err)
 	}
+	h.l.stats.connectionAttempts.Add(1)
 	mtuSize := min(pk.MTU, h.l.maxMTU())
 
 	if pk.ClientProtocol != protocolVersion {
@@ -142,6 +144,7 @@ func (h listenerConnectionHandler) handleOpenConnectionRequest2(b []byte, addr n
 		return fmt.Errorf("send OPEN_CONNECTION_REPLY_2: %w", err)
 	}
 
+	h.l.stats.connectionsStarted.Add(1)
 	go func() {
 		conn := newConn(h.l.conn, addr, mtuSize, h)
 		h.l.connections.Store(resolve(addr), conn)
@@ -154,6 +157,7 @@ func (h listenerConnectionHandler) handleOpenConnectionRequest2(b []byte, addr n
 			// Accept() can receive it.
 			select {
 			case h.l.incoming <- conn:
+				h.l.stats.connectionsAccepted.Add(1)
 			case <-h.l.closed:
 				_ = conn.Close()
 			}
