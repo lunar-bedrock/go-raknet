@@ -6,9 +6,8 @@ import (
 	"testing"
 )
 
-// TestConnectionRequestAcceptedUnmarshalTruncated ensures a packet that ends
-// right after the client address, before the SystemIndex field, returns an
-// error instead of reading past the end of the buffer and panicking.
+// TestConnectionRequestAcceptedUnmarshalTruncated: a packet ending right after
+// the address (before SystemIndex) must error, not panic.
 func TestConnectionRequestAcceptedUnmarshalTruncated(t *testing.T) {
 	tests := map[string][]byte{
 		"ipv4 address only": func() []byte {
@@ -32,8 +31,7 @@ func TestConnectionRequestAcceptedUnmarshalTruncated(t *testing.T) {
 	}
 }
 
-// FuzzConnectionRequestAcceptedUnmarshal asserts that decoding never panics on
-// arbitrary input.
+// FuzzConnectionRequestAcceptedUnmarshal: decoding never panics on any input.
 func FuzzConnectionRequestAcceptedUnmarshal(f *testing.F) {
 	f.Add([]byte{4, 0, 0, 0, 0, 0, 0})
 	f.Add(append([]byte{6}, make([]byte, sizeofAddr6-1)...))
