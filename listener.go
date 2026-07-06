@@ -27,10 +27,6 @@ type ListenConfig struct {
 	// is always disabled. Error messages are thus not logged by default.
 	ErrorLog *slog.Logger
 
-	// ServerID is the RakNet server GUID advertised during unconnected pong and
-	// connection setup. If zero, a unique ID is generated for this listener.
-	ServerID int64
-
 	// UpstreamPacketListener adds an abstraction for net.ListenPacket.
 	UpstreamPacketListener UpstreamPacketListener
 
@@ -137,16 +133,12 @@ func (conf ListenConfig) Listen(address string) (*Listener, error) {
 	if err != nil {
 		return nil, &net.OpError{Op: "listen", Net: "raknet", Source: nil, Addr: nil, Err: err}
 	}
-	id := conf.ServerID
-	if id == 0 {
-		id = atomic.AddInt64(&listenerID, 1)
-	}
 	listener := &Listener{
 		conf:     conf,
 		conn:     conn,
 		incoming: make(chan *Conn),
 		closed:   make(chan struct{}),
-		id:       id,
+		id:       atomic.AddInt64(&listenerID, 1),
 	}
 	listener.handler = &listenerConnectionHandler{l: listener, cookieSalt: &atomic.Uint64{}, previousSalt: &atomic.Uint64{}}
 	listener.sec = newSecurity(conf, listener.handler)
@@ -360,7 +352,7 @@ func (s *security) blockFor(addr net.Addr, duration time.Duration) {
 	defer s.mu.Unlock()
 
 	ip := [16]byte(addr.(*net.UDPAddr).IP.To16())
-
+	
 	if _, ok := s.blocks[ip]; !ok {
 		s.blockCount.Add(1)
 	}
@@ -389,7 +381,7 @@ func (s *security) blocked(addr net.Addr) bool {
 		s.blockCount.Store(uint32(len(s.blocks)))
 		return false
 	}
-
+	
 	return true
 }
 
