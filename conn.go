@@ -34,6 +34,10 @@ const (
 	minMTUSize    = 400
 	maxMTUSize    = 1200
 	maxWindowSize = 2048
+
+	// Caps on peer-controlled split reassembly, bounding memory per connection.
+	maxSplitCount       = 512
+	maxConcurrentSplits = 16
 )
 
 // Conn represents a connection to a specific client. It is not a real
@@ -549,23 +553,20 @@ func resolve(addr net.Addr) netip.AddrPort {
 // packet of its sequence, it will continue handling the full packet as it
 // otherwise would. An error is returned if the packet was not valid.
 func (conn *Conn) receiveSplitPacket(p *packet) error {
-	const maxSplitCount = 512
-	const maxConcurrentSplits = 16
-
-	if p.splitCount > maxSplitCount && conn.handler.limitsEnabled() {
-		return fmt.Errorf("split packet: split count %v exceeds the maximum %v", p.splitCount, maxSplitCount)
-	}
-	if len(conn.splits) > maxConcurrentSplits && conn.handler.limitsEnabled() {
-		return fmt.Errorf("split packet: maximum concurrent splits %v reached", maxConcurrentSplits)
+	// Memory-safety guards on peer-controlled values, enforced even when the
+	// handler disables limits (dialer connections do).
+	if p.splitCount == 0 || p.splitCount > maxSplitCount {
+		return fmt.Errorf("split packet: split count %v is out of range (1 - %v)", p.splitCount, maxSplitCount)
 	}
 	m, ok := conn.splits[p.splitID]
 	if !ok {
+		if len(conn.splits) >= maxConcurrentSplits {
+			return fmt.Errorf("split packet: maximum concurrent splits %v reached", maxConcurrentSplits)
+		}
 		m = make([][]byte, p.splitCount)
 		conn.splits[p.splitID] = m
 	}
 	if p.splitIndex > uint32(len(m)-1) {
-		// The split index was either negative or was bigger than the slice
-		// size, meaning the packet is invalid.
 		return fmt.Errorf("split packet: split index %v is out of range (0 - %v)", p.splitIndex, len(m)-1)
 	}
 	m[p.splitIndex] = p.content
