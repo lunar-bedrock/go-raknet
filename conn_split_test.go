@@ -11,10 +11,10 @@ func newSplitTestConn() *Conn {
 	}
 }
 
-// TestReceiveSplitPacketInvalidCount: count 0 must not panic and an oversized
-// count must not allocate, even with limits disabled.
+// TestReceiveSplitPacketInvalidCount: count 0 must not panic and a count past
+// the unconditional ceiling must not allocate, even with limits disabled.
 func TestReceiveSplitPacketInvalidCount(t *testing.T) {
-	for _, count := range []uint32{0, maxSplitCount + 1, 1 << 20} {
+	for _, count := range []uint32{0, absoluteMaxSplitCount + 1, 1 << 20} {
 		conn := newSplitTestConn()
 		p := &packet{split: true, splitCount: count, content: []byte{0x01}}
 		if err := conn.receiveSplitPacket(p); err == nil {
@@ -23,6 +23,36 @@ func TestReceiveSplitPacketInvalidCount(t *testing.T) {
 		if len(conn.splits) != 0 {
 			t.Fatalf("split count %d: expected no split state retained, got %d", count, len(conn.splits))
 		}
+	}
+}
+
+// TestReceiveSplitPacketDialerAboveStrictCap: a dialer connection (limits
+// disabled) accepts a split count above maxSplitCount but within the
+// unconditional ceiling, so large packets from a chosen server reassemble.
+func TestReceiveSplitPacketDialerAboveStrictCap(t *testing.T) {
+	conn := newSplitTestConn()
+	p := &packet{split: true, splitCount: maxSplitCount + 1, splitIndex: 0, content: []byte{0x01}}
+	if err := conn.receiveSplitPacket(p); err != nil {
+		t.Fatalf("dialer split count %d: unexpected error: %v", maxSplitCount+1, err)
+	}
+	if len(conn.splits) != 1 {
+		t.Fatalf("expected split state retained for pending reassembly, got %d", len(conn.splits))
+	}
+}
+
+// TestReceiveSplitPacketListenerStrictCap: a listener connection (limits
+// enabled) rejects a split count above maxSplitCount without allocating.
+func TestReceiveSplitPacketListenerStrictCap(t *testing.T) {
+	conn := &Conn{
+		splits:  make(map[uint16][][]byte),
+		handler: listenerConnectionHandler{},
+	}
+	p := &packet{split: true, splitCount: maxSplitCount + 1, content: []byte{0x01}}
+	if err := conn.receiveSplitPacket(p); err == nil {
+		t.Fatalf("listener split count %d: expected error, got nil", maxSplitCount+1)
+	}
+	if len(conn.splits) != 0 {
+		t.Fatalf("expected no split state retained, got %d", len(conn.splits))
 	}
 }
 
