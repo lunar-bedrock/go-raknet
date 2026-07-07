@@ -12,9 +12,9 @@ func newSplitTestConn() *Conn {
 }
 
 // TestReceiveSplitPacketInvalidCount: count 0 must not panic and a count past
-// the unconditional ceiling must not allocate, even with limits disabled.
+// the ceiling must not allocate, on any connection.
 func TestReceiveSplitPacketInvalidCount(t *testing.T) {
-	for _, count := range []uint32{0, absoluteMaxSplitCount + 1, 1 << 20} {
+	for _, count := range []uint32{0, maxSplitCount + 1, 1 << 20} {
 		conn := newSplitTestConn()
 		p := &packet{split: true, splitCount: count, content: []byte{0x01}}
 		if err := conn.receiveSplitPacket(p); err == nil {
@@ -26,33 +26,17 @@ func TestReceiveSplitPacketInvalidCount(t *testing.T) {
 	}
 }
 
-// TestReceiveSplitPacketDialerAboveStrictCap: a dialer connection (limits
-// disabled) accepts a split count above maxSplitCount but within the
-// unconditional ceiling, so large packets from a chosen server reassemble.
-func TestReceiveSplitPacketDialerAboveStrictCap(t *testing.T) {
+// TestReceiveSplitPacketLargeCountWithinCap: a split count above the old 512
+// cap but within maxSplitCount reassembles, so large packets from servers that
+// split into many fragments (e.g. windsmp.net's ~1434) are not dropped.
+func TestReceiveSplitPacketLargeCountWithinCap(t *testing.T) {
 	conn := newSplitTestConn()
-	p := &packet{split: true, splitCount: maxSplitCount + 1, splitIndex: 0, content: []byte{0x01}}
+	p := &packet{split: true, splitCount: 1434, splitIndex: 0, content: []byte{0x01}}
 	if err := conn.receiveSplitPacket(p); err != nil {
-		t.Fatalf("dialer split count %d: unexpected error: %v", maxSplitCount+1, err)
+		t.Fatalf("split count 1434: unexpected error: %v", err)
 	}
 	if len(conn.splits) != 1 {
 		t.Fatalf("expected split state retained for pending reassembly, got %d", len(conn.splits))
-	}
-}
-
-// TestReceiveSplitPacketListenerStrictCap: a listener connection (limits
-// enabled) rejects a split count above maxSplitCount without allocating.
-func TestReceiveSplitPacketListenerStrictCap(t *testing.T) {
-	conn := &Conn{
-		splits:  make(map[uint16][][]byte),
-		handler: listenerConnectionHandler{},
-	}
-	p := &packet{split: true, splitCount: maxSplitCount + 1, content: []byte{0x01}}
-	if err := conn.receiveSplitPacket(p); err == nil {
-		t.Fatalf("listener split count %d: expected error, got nil", maxSplitCount+1)
-	}
-	if len(conn.splits) != 0 {
-		t.Fatalf("expected no split state retained, got %d", len(conn.splits))
 	}
 }
 

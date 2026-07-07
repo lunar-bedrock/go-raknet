@@ -36,15 +36,15 @@ const (
 	maxWindowSize = 2048
 
 	// Caps on peer-controlled split reassembly, bounding memory per connection.
-	// maxSplitCount is the strict cap applied only when limits are enabled
-	// (listener connections serving untrusted clients). absoluteMaxSplitCount
-	// is an unconditional ceiling enforced even for dialer connections, which
-	// disable limits; it bounds the up-front make([][]byte, splitCount)
-	// allocation against a malicious peer while still allowing legitimate large
-	// packets from servers that split beyond maxSplitCount.
-	maxSplitCount         = 512
-	absoluteMaxSplitCount = 1 << 16
-	maxConcurrentSplits   = 16
+	// maxSplitCount is an unconditional ceiling on the number of fragments a
+	// single packet may be split into, enforced on every connection. It bounds
+	// the up-front make([][]byte, splitCount) allocation against a malicious
+	// peer while still allowing legitimate large packets from servers that
+	// split into many fragments (windsmp.net sends ~1434). The value matches
+	// CloudburstMC/Network's SplitPacketHelper cap, the reference Bedrock
+	// server RakNet implementation.
+	maxSplitCount       = 8192
+	maxConcurrentSplits = 16
 )
 
 // Conn represents a connection to a specific client. It is not a real
@@ -561,16 +561,10 @@ func resolve(addr net.Addr) netip.AddrPort {
 // otherwise would. An error is returned if the packet was not valid.
 func (conn *Conn) receiveSplitPacket(p *packet) error {
 	// Unconditional memory-safety ceiling on peer-controlled values, enforced
-	// even when the handler disables limits (dialer connections do). This
-	// bounds the make([][]byte, splitCount) allocation below.
-	if p.splitCount == 0 || p.splitCount > absoluteMaxSplitCount {
-		return fmt.Errorf("split packet: split count %v is out of range (1 - %v)", p.splitCount, absoluteMaxSplitCount)
-	}
-	// Stricter cap for untrusted listener clients. Dialer connections reach a
-	// server the user chose to connect to, which may legitimately split large
-	// packets (e.g. big level chunks) beyond maxSplitCount.
-	if p.splitCount > maxSplitCount && conn.handler.limitsEnabled() {
-		return fmt.Errorf("split packet: split count %v exceeds the maximum %v", p.splitCount, maxSplitCount)
+	// on every connection. This bounds the make([][]byte, splitCount)
+	// allocation below.
+	if p.splitCount == 0 || p.splitCount > maxSplitCount {
+		return fmt.Errorf("split packet: split count %v is out of range (1 - %v)", p.splitCount, maxSplitCount)
 	}
 	m, ok := conn.splits[p.splitID]
 	if !ok {
