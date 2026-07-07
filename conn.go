@@ -36,7 +36,14 @@ const (
 	maxWindowSize = 2048
 
 	// Caps on peer-controlled split reassembly, bounding memory per connection.
-	maxSplitCount       = 512
+	// maxSplitCount is an unconditional ceiling on the number of fragments a
+	// single packet may be split into, enforced on every connection. It bounds
+	// the up-front make([][]byte, splitCount) allocation against a malicious
+	// peer while still allowing legitimate large packets from servers that
+	// split into many fragments (windsmp.net sends ~1434). The value matches
+	// CloudburstMC/Network's SplitPacketHelper cap, the reference Bedrock
+	// server RakNet implementation.
+	maxSplitCount       = 8192
 	maxConcurrentSplits = 16
 )
 
@@ -553,8 +560,9 @@ func resolve(addr net.Addr) netip.AddrPort {
 // packet of its sequence, it will continue handling the full packet as it
 // otherwise would. An error is returned if the packet was not valid.
 func (conn *Conn) receiveSplitPacket(p *packet) error {
-	// Memory-safety guards on peer-controlled values, enforced even when the
-	// handler disables limits (dialer connections do).
+	// Unconditional memory-safety ceiling on peer-controlled values, enforced
+	// on every connection. This bounds the make([][]byte, splitCount)
+	// allocation below.
 	if p.splitCount == 0 || p.splitCount > maxSplitCount {
 		return fmt.Errorf("split packet: split count %v is out of range (1 - %v)", p.splitCount, maxSplitCount)
 	}
