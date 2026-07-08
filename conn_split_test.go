@@ -49,16 +49,32 @@ func TestReceiveSplitPacketIndexOutOfRange(t *testing.T) {
 	}
 }
 
-// TestReceiveSplitPacketConcurrentLimit: concurrent split assemblies are capped.
-func TestReceiveSplitPacketConcurrentLimit(t *testing.T) {
+// TestReceiveSplitPacketUsesCloudburstStyleRing: pending split assemblies use a
+// Cloudburst-style ring of split IDs, so legitimate interleaving above the old
+// 16-ID cap is accepted and colliding IDs evict stale partial assemblies.
+func TestReceiveSplitPacketUsesCloudburstStyleRing(t *testing.T) {
 	conn := newSplitTestConn()
-	var err error
-	// Count 2 so none complete; the (maxConcurrentSplits+1)-th ID is rejected.
-	for id := 0; id <= maxConcurrentSplits; id++ {
+	for id := 0; id < maxConcurrentSplits; id++ {
 		p := &packet{split: true, splitCount: 2, splitID: uint16(id), content: []byte{0x01}}
-		err = conn.receiveSplitPacket(p)
+		if err := conn.receiveSplitPacket(p); err != nil {
+			t.Fatalf("split ID %d: unexpected error: %v", id, err)
+		}
 	}
-	if err == nil {
-		t.Fatalf("expected error after exceeding %d concurrent splits, got nil", maxConcurrentSplits)
+	if len(conn.splits) != maxConcurrentSplits {
+		t.Fatalf("expected %d pending split assemblies, got %d", maxConcurrentSplits, len(conn.splits))
+	}
+
+	collidingID := uint16(maxConcurrentSplits)
+	if err := conn.receiveSplitPacket(&packet{split: true, splitCount: 2, splitID: collidingID, content: []byte{0x02}}); err != nil {
+		t.Fatalf("colliding split ID %d: unexpected error: %v", collidingID, err)
+	}
+	if len(conn.splits) != maxConcurrentSplits {
+		t.Fatalf("expected ring to retain %d pending split assemblies, got %d", maxConcurrentSplits, len(conn.splits))
+	}
+	if _, ok := conn.splits[0]; ok {
+		t.Fatal("expected split ID 0 to be evicted by ring-colliding split ID")
+	}
+	if _, ok := conn.splits[collidingID]; !ok {
+		t.Fatalf("expected colliding split ID %d to be retained", collidingID)
 	}
 }

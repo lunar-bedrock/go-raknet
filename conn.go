@@ -44,7 +44,7 @@ const (
 	// CloudburstMC/Network's SplitPacketHelper cap, the reference Bedrock
 	// server RakNet implementation.
 	maxSplitCount       = 8192
-	maxConcurrentSplits = 16
+	maxConcurrentSplits = 256
 )
 
 // Conn represents a connection to a specific client. It is not a real
@@ -568,9 +568,7 @@ func (conn *Conn) receiveSplitPacket(p *packet) error {
 	}
 	m, ok := conn.splits[p.splitID]
 	if !ok {
-		if len(conn.splits) >= maxConcurrentSplits {
-			return fmt.Errorf("split packet: maximum concurrent splits %v reached", maxConcurrentSplits)
-		}
+		conn.evictSplitRingCollision(p.splitID)
 		m = make([][]byte, p.splitCount)
 		conn.splits[p.splitID] = m
 	}
@@ -588,6 +586,18 @@ func (conn *Conn) receiveSplitPacket(p *packet) error {
 
 	delete(conn.splits, p.splitID)
 	return conn.receivePacket(p)
+}
+
+// evictSplitRingCollision keeps pending split reassembly state bounded like
+// Cloudburst's 256-slot RoundRobinArray, keyed by the split ID's low bits.
+func (conn *Conn) evictSplitRingCollision(splitID uint16) {
+	slot := splitID % maxConcurrentSplits
+	for id := range conn.splits {
+		if id%maxConcurrentSplits == slot {
+			delete(conn.splits, id)
+			return
+		}
+	}
 }
 
 // sendACK sends an acknowledgement packet containing the packet sequence
