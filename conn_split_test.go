@@ -40,6 +40,24 @@ func TestReceiveSplitPacketLargeCountWithinCap(t *testing.T) {
 	}
 }
 
+// TestReceiveSplitPacketDuplicateFragmentIgnored: duplicate split fragments
+// keep the original content, matching Cloudburst's duplicate handling.
+func TestReceiveSplitPacketDuplicateFragmentIgnored(t *testing.T) {
+	conn := newSplitTestConn()
+	original := []byte{0x01}
+	duplicate := []byte{0x02}
+
+	if err := conn.receiveSplitPacket(&packet{split: true, splitCount: 2, splitID: 1, splitIndex: 0, content: original}); err != nil {
+		t.Fatalf("first split fragment: unexpected error: %v", err)
+	}
+	if err := conn.receiveSplitPacket(&packet{split: true, splitCount: 2, splitID: 1, splitIndex: 0, content: duplicate}); err != nil {
+		t.Fatalf("duplicate split fragment: unexpected error: %v", err)
+	}
+	if got := conn.splits[1][0]; &got[0] != &original[0] {
+		t.Fatalf("expected duplicate split fragment to be ignored, got %#v", got)
+	}
+}
+
 // TestReceiveSplitPacketIndexOutOfRange: an index beyond the count is rejected.
 func TestReceiveSplitPacketIndexOutOfRange(t *testing.T) {
 	conn := newSplitTestConn()

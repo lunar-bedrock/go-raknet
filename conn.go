@@ -575,6 +575,9 @@ func (conn *Conn) receiveSplitPacket(p *packet) error {
 	if p.splitIndex > uint32(len(m)-1) {
 		return fmt.Errorf("split packet: split index %v is out of range (0 - %v)", p.splitIndex, len(m)-1)
 	}
+	if m[p.splitIndex] != nil {
+		return nil
+	}
 	m[p.splitIndex] = p.content
 
 	if slices.ContainsFunc(m, func(i []byte) bool { return i == nil }) {
