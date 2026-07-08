@@ -45,10 +45,6 @@ const (
 	// server RakNet implementation.
 	maxSplitCount       = 8192
 	maxConcurrentSplits = 256
-
-	// maxSplitReassemblyBytes matches Cloudburst's default per-session queued
-	// byte budget and bounds retained incoming split fragments.
-	maxSplitReassemblyBytes = 64 * 1024 * 1024
 )
 
 // Conn represents a connection to a specific client. It is not a real
@@ -90,8 +86,7 @@ type Conn struct {
 	// splits is a map of slices indexed by split IDs. The length of each of the
 	// slices is equal to the split count, and packets are positioned in that
 	// slice indexed by the split index.
-	splits     map[uint16][][]byte
-	splitBytes int
+	splits map[uint16][][]byte
 
 	// win is an ordered queue used to track which datagrams were received and
 	// which datagrams were missing, so that we can send NACKs to request
@@ -572,12 +567,10 @@ func (conn *Conn) receiveSplitPacket(p *packet) error {
 		return fmt.Errorf("split packet: split count %v is out of range (1 - %v)", p.splitCount, maxSplitCount)
 	}
 	m, ok := conn.splits[p.splitID]
-	created := false
 	if !ok {
 		conn.evictSplitRingCollision(p.splitID)
 		m = make([][]byte, p.splitCount)
 		conn.splits[p.splitID] = m
-		created = true
 	}
 	if p.splitIndex > uint32(len(m)-1) {
 		return fmt.Errorf("split packet: split index %v is out of range (0 - %v)", p.splitIndex, len(m)-1)
@@ -585,14 +578,7 @@ func (conn *Conn) receiveSplitPacket(p *packet) error {
 	if m[p.splitIndex] != nil {
 		return nil
 	}
-	if conn.splitBytes+len(p.content) > maxSplitReassemblyBytes {
-		if created {
-			delete(conn.splits, p.splitID)
-		}
-		return fmt.Errorf("split packet: retained split data exceeds maximum %v bytes", maxSplitReassemblyBytes)
-	}
 	m[p.splitIndex] = p.content
-	conn.splitBytes += len(p.content)
 
 	if slices.ContainsFunc(m, func(i []byte) bool { return i == nil }) {
 		// We haven't yet received all split fragments, so we cannot add the
@@ -601,7 +587,7 @@ func (conn *Conn) receiveSplitPacket(p *packet) error {
 	}
 	p.content = slices.Concat(m...)
 
-	conn.deleteSplit(p.splitID)
+	delete(conn.splits, p.splitID)
 	return conn.receivePacket(p)
 }
 
@@ -611,21 +597,10 @@ func (conn *Conn) evictSplitRingCollision(splitID uint16) {
 	slot := splitID % maxConcurrentSplits
 	for id := range conn.splits {
 		if id%maxConcurrentSplits == slot {
-			conn.deleteSplit(id)
+			delete(conn.splits, id)
 			return
 		}
 	}
-}
-
-func (conn *Conn) deleteSplit(splitID uint16) {
-	m, ok := conn.splits[splitID]
-	if !ok {
-		return
-	}
-	for _, fragment := range m {
-		conn.splitBytes -= len(fragment)
-	}
-	delete(conn.splits, splitID)
 }
 
 // sendACK sends an acknowledgement packet containing the packet sequence

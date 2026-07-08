@@ -58,21 +58,6 @@ func TestReceiveSplitPacketDuplicateFragmentIgnored(t *testing.T) {
 	}
 }
 
-// TestReceiveSplitPacketRetainedBytesLimit: retained incoming split fragments
-// are bounded to Cloudburst's default per-session queued-byte budget.
-func TestReceiveSplitPacketRetainedBytesLimit(t *testing.T) {
-	conn := newSplitTestConn()
-	oversized := make([]byte, 64*1024*1024+1)
-	p := &packet{split: true, splitCount: 2, splitID: 1, splitIndex: 0, content: oversized}
-
-	if err := conn.receiveSplitPacket(p); err == nil {
-		t.Fatal("expected error for retained split fragments exceeding byte limit, got nil")
-	}
-	if len(conn.splits) != 0 {
-		t.Fatalf("expected no split state retained after byte-limit error, got %d", len(conn.splits))
-	}
-}
-
 // TestReceiveSplitPacketIndexOutOfRange: an index beyond the count is rejected.
 func TestReceiveSplitPacketIndexOutOfRange(t *testing.T) {
 	conn := newSplitTestConn()
