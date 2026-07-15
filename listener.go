@@ -44,6 +44,9 @@ type ListenConfig struct {
 	// BlockDuration defaults to 10s. If set to a negative value, IP addresses
 	// are never blocked on errors.
 	BlockDuration time.Duration
+	// ReusePort enables SO_REUSEPORT for the built-in Linux UDP listener. It is
+	// disabled by default and is ignored when UpstreamPacketListener is set.
+	ReusePort bool
 }
 
 // Listener implements a RakNet connection listener. It follows the same
@@ -57,7 +60,7 @@ type Listener struct {
 	once   sync.Once
 	closed chan struct{}
 
-	conn net.PacketConn
+	conn packetConn
 	// incoming is a channel of incoming connections. Connections that end up in
 	// here will also end up in the connections map.
 	incoming chan *Conn
@@ -83,7 +86,8 @@ type Listener struct {
 
 // listenerStats holds the cumulative connection-funnel counters of a Listener.
 type listenerStats struct {
-	pings, connectionAttempts, connectionsStarted, connectionsAccepted atomic.Uint64
+	pings, connectionAttempts, connectionsStarted, connectionsAccepted     atomic.Uint64
+	socketReadCalls, datagramsReceived, batchedReadCalls, largestReadBatch atomic.Uint64
 }
 
 // ListenerStatistics is a snapshot of the cumulative connection-funnel
@@ -102,6 +106,15 @@ type ListenerStatistics struct {
 	// ConnectionsAccepted is the number of connections that completed the
 	// RakNet handshake and were surfaced to Accept.
 	ConnectionsAccepted uint64
+	// SocketReadCalls is the number of receive syscalls completed by the
+	// listener. Comparing it with DatagramsReceived shows syscall amortisation.
+	SocketReadCalls uint64
+	// DatagramsReceived is the number of UDP datagrams returned by socket reads.
+	DatagramsReceived uint64
+	// BatchedReadCalls is the number of reads that returned multiple datagrams.
+	BatchedReadCalls uint64
+	// LargestReadBatch is the largest number of datagrams returned by one read.
+	LargestReadBatch uint64
 }
 
 // listenerID holds the next ID to use for a Listener.
@@ -122,17 +135,18 @@ func (conf ListenConfig) Listen(address string) (*Listener, error) {
 		conf.BlockDuration = time.Second * 10
 	}
 	conf.MaxMTU = clampMTU(conf.MaxMTU, minMTUSize)
-	var conn net.PacketConn
+	var rawConn net.PacketConn
 	var err error
 
 	if conf.UpstreamPacketListener == nil {
-		conn, err = net.ListenPacket("udp", address)
+		rawConn, err = listenPacket(address, conf.ReusePort)
 	} else {
-		conn, err = conf.UpstreamPacketListener.ListenPacket("udp", address)
+		rawConn, err = conf.UpstreamPacketListener.ListenPacket("udp", address)
 	}
 	if err != nil {
 		return nil, &net.OpError{Op: "listen", Net: "raknet", Source: nil, Addr: nil, Err: err}
 	}
+	conn, _ := newPacketConn(rawConn)
 	listener := &Listener{
 		conf:     conf,
 		conn:     conn,
@@ -235,6 +249,24 @@ func (listener *Listener) Stats() ListenerStatistics {
 		ConnectionAttempts:  listener.stats.connectionAttempts.Load(),
 		ConnectionsStarted:  listener.stats.connectionsStarted.Load(),
 		ConnectionsAccepted: listener.stats.connectionsAccepted.Load(),
+		SocketReadCalls:     listener.stats.socketReadCalls.Load(),
+		DatagramsReceived:   listener.stats.datagramsReceived.Load(),
+		BatchedReadCalls:    listener.stats.batchedReadCalls.Load(),
+		LargestReadBatch:    listener.stats.largestReadBatch.Load(),
+	}
+}
+
+func (listener *Listener) recordSocketRead(datagrams int) {
+	listener.stats.socketReadCalls.Add(1)
+	listener.stats.datagramsReceived.Add(uint64(datagrams))
+	if datagrams > 1 {
+		listener.stats.batchedReadCalls.Add(1)
+	}
+	want := uint64(datagrams)
+	for current := listener.stats.largestReadBatch.Load(); want > current; current = listener.stats.largestReadBatch.Load() {
+		if listener.stats.largestReadBatch.CompareAndSwap(current, want) {
+			break
+		}
 	}
 }
 
@@ -246,24 +278,25 @@ func (listener *Listener) maxMTU() uint16 {
 // listen continuously reads from the listener's UDP connection, until closed
 // has a value in it.
 func (listener *Listener) listen() {
-	// Create a buffer with the maximum size a UDP packet sent over RakNet is
-	// allowed to have. We can re-use this buffer for each packet.
-	b := make([]byte, 1500)
 	for {
-		n, addr, err := listener.conn.ReadFrom(b)
+		messages, err := listener.conn.ReadBatch()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return
 			}
-			listener.conf.ErrorLog.Error("read from: "+err.Error(), "raddr", addrToStr(addr))
-			continue
-		} else if n == 0 || listener.sec.blocked(addr) {
+			listener.conf.ErrorLog.Error("read from: " + err.Error())
 			continue
 		}
-		if err = listener.handle(b[:n], addr); err != nil && !errors.Is(err, net.ErrClosed) {
-			listener.conf.ErrorLog.Error("handle packet: "+err.Error(), "raddr", addrToStr(addr), "block-duration", max(0, listener.conf.BlockDuration))
-			listener.sec.block(addr)
-		}
+		listener.recordSocketRead(len(messages))
+		dispatchReceiveMessages(messages, func(message receiveMessage) {
+			if len(message.data) == 0 || listener.sec.blocked(message.addr) {
+				return
+			}
+			if err := listener.handle(message.data, message.addr, message.control); err != nil && !errors.Is(err, net.ErrClosed) {
+				listener.conf.ErrorLog.Error("handle packet: "+err.Error(), "raddr", addrToStr(message.addr), "block-duration", max(0, listener.conf.BlockDuration))
+				listener.sec.block(message.addr)
+			}
+		})
 	}
 }
 
@@ -277,10 +310,10 @@ func addrToStr(addr net.Addr) string {
 
 // handle handles an incoming packet in buffer b from the address passed. If
 // not successful, an error is returned describing the issue.
-func (listener *Listener) handle(b []byte, addr net.Addr) error {
+func (listener *Listener) handle(b []byte, addr net.Addr, control packetControl) error {
 	value, found := listener.connections.Load(resolve(addr))
 	if !found {
-		return listener.handler.handleUnconnected(b, addr)
+		return listener.handler.handleUnconnected(b, addr, control)
 	}
 	conn := value.(*Conn)
 	select {
@@ -288,6 +321,9 @@ func (listener *Listener) handle(b []byte, addr net.Addr) error {
 		// Connection was closed already.
 		return nil
 	default:
+		if old := conn.control.Load(); control.ifIndex != 0 && (old == nil || !old.samePin(control)) {
+			conn.control.Store(&control)
+		}
 		if err := conn.receive(b); err != nil {
 			conn.closeImmediately()
 			return err
