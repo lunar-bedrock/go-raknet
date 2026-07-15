@@ -61,10 +61,9 @@ type Conn struct {
 	ctx        context.Context
 	cancelFunc context.CancelFunc
 
-	conn    packetConn
+	conn    net.PacketConn
 	raddr   net.Addr
 	handler connectionHandler
-	control atomic.Pointer[packetControl]
 
 	once      sync.Once
 	connected chan struct{}
@@ -117,14 +116,10 @@ type Conn struct {
 // newConn constructs a new connection specifically dedicated to the address
 // passed.
 func newConn(conn net.PacketConn, raddr net.Addr, mtu uint16, h connectionHandler) *Conn {
-	transport, ok := conn.(packetConn)
-	if !ok {
-		transport = newBasicPacketConn(conn, 1, receiveBufferSize)
-	}
 	mtu = clampMTU(mtu, minMTUSize)
 	c := &Conn{
 		raddr:          raddr,
-		conn:           transport,
+		conn:           conn,
 		mtu:            mtu,
 		handler:        h,
 		pk:             new(packet),
@@ -719,11 +714,7 @@ func (conn *Conn) sendDatagram(pk *packet) error {
 // is logged but not returned. This is done because at this stage, packets
 // being lost to an error can be recovered through resending.
 func (conn *Conn) writeTo(p []byte, raddr net.Addr) error {
-	var control packetControl
-	if current := conn.control.Load(); current != nil {
-		control = *current
-	}
-	if _, err := conn.conn.WriteToPacket(p, control, raddr); errors.Is(err, net.ErrClosed) {
+	if _, err := conn.conn.WriteTo(p, raddr); errors.Is(err, net.ErrClosed) {
 		return fmt.Errorf("write to: %w", err)
 	} else if err != nil {
 		conn.handler.log().Error("write to: "+err.Error(), "raddr", raddr.String())

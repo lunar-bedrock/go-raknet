@@ -111,7 +111,7 @@ func TestOpenConnectionRequest2RegistersConnectionBeforeReturning(t *testing.T) 
 	if err != nil {
 		t.Fatalf("marshal request: %v", err)
 	}
-	if err := listener.handler.handleOpenConnectionRequest2(request[1:], remote, packetControl{}); err != nil {
+	if err := listener.handler.handleOpenConnectionRequest2(request[1:], remote); err != nil {
 		t.Fatalf("handle request: %v", err)
 	}
 	value, ok := listener.connections.Load(resolve(remote))

@@ -2,20 +2,19 @@
 
 ## PR 1: Linux batched socket I/O
 
-1. Add failing tests for stable packet-control values, portable single-packet fallback, sequential batch dispatch, and transport counters.
+1. Add failing tests for portable single-packet fallback, sequential batch dispatch, and transport counters.
 2. Introduce an internal receive-message/transport interface without changing the public custom-listener contract.
-3. Add Linux UDP batching with reusable buffers and ancillary-data parsing; retain portable fallback files for other platforms and custom packet connections.
-4. Add failing dual-stack/interface-pinning tests, then route unconnected and established replies through the captured ingress control.
-5. Add an opt-in reuse-port configuration with focused socket-option and fallback tests.
-6. Add benchmarks for one-packet and queued-batch receive paths.
-7. Run formatting, unit tests, race tests, cross-platform build tests, static analysis, and benchmarks.
-8. Commit, push, open the ready-for-review PR against `lunar`, and resolve all current CI/review-bot findings.
+3. Add Linux UDP batching with reusable buffers; retain portable fallback files for other platforms and custom packet connections.
+4. Add an opt-in reuse-port configuration with focused socket-option and fallback tests.
+5. Add benchmarks for one-packet and queued-batch receive paths.
+6. Run formatting, unit tests, race tests, cross-platform build tests, static analysis, and benchmarks.
+7. Commit, push, open the ready-for-review PR against `lunar`, and resolve all current CI/review-bot findings.
 
 ## PR 2: Ordered receive isolation and flood controls
 
 1. Create a stacked branch from PR 1.
-2. Add failing tests proving per-connection order, non-blocking cross-connection progress, bounded overflow, and pooled-buffer ownership.
-3. Implement one bounded single-consumer queue per connection and return owned receive buffers after handling.
+2. Add failing tests proving per-connection order, non-blocking cross-connection progress, and bounded overflow.
+3. Implement one bounded single-consumer queue per connection using copied datagrams for unambiguous channel ownership.
 4. Add failing tests for bounded unconnected work and global/per-source pong limiting.
 5. Implement the bounded worker pool and token-bucket limits with atomic queue/drop statistics.
 6. Add stress and allocation benchmarks covering slow consumers and discovery floods.

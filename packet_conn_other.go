@@ -4,6 +4,6 @@ package raknet
 
 import "net"
 
-func newPlatformPacketConn(*net.UDPConn) (packetConn, bool) {
-	return nil, false
+func newPlatformPacketConn(*net.UDPConn) packetConn {
+	return nil
 }

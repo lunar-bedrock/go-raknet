@@ -10,7 +10,6 @@ Improve Linux packet throughput and flood resilience without adding batching del
 - On Linux UDP sockets, drain the datagrams already queued by the kernel with `recvmmsg`. The call does not wait to fill a batch and introduces no timer or flush interval.
 - Process returned messages sequentially in kernel receive order. Use a bounded batch (initially 64 datagrams) to avoid monopolising the listener.
 - Reuse receive buffers. Buffer ownership remains synchronous in this PR, so a datagram is not reused until its handler returns.
-- Preserve destination/interface packet information for every datagram and use it for replies, including dual-stack and wildcard-bound listeners. Store only stable copied control values, never references into reused ancillary buffers.
 - Make `SO_REUSEPORT` opt-in. Do not silently change listener topology or custom `UpstreamPacketListener` behavior.
 - Keep outbound writes as individual datagrams. `sendmmsg` is out of scope until profiling shows outbound syscall pressure.
 - Add transport counters and benchmarks that expose datagrams per receive syscall and batch utilisation with negligible disabled-path cost.
@@ -18,7 +17,7 @@ Improve Linux packet throughput and flood resilience without adding batching del
 ## PR 2: Ordered receive isolation and flood controls
 
 - Give each established connection a bounded single-consumer receive queue. This preserves packet order within that connection while preventing one connection's processing from blocking every other connection.
-- Transfer pooled buffer ownership to the connection queue and return buffers only after processing. On queue overflow, drop according to an explicit policy and increment a counter; never reorder queued packets.
+- Copy datagrams before transferring them to a connection queue, matching Oomph's simple channel-ownership model. Pooling and ownership API changes are out of scope. On queue overflow, drop according to an explicit policy and increment a counter; never reorder queued packets.
 - Move unconnected handshake work to a bounded worker pool so connection attempts cannot block established traffic.
 - Add conservative global and per-source pong rate limits. Valid discovery remains functional; excess discovery traffic is dropped and counted.
 - Expose queue depth/high-water, overflow drops, unconnected queue drops, and pong-limit drops through cheap atomic statistics.
@@ -41,8 +40,8 @@ Improve Linux packet throughput and flood resilience without adding batching del
 
 ## Verification
 
-- Unit tests for fallback transport behavior, ordering, queue overflow, ownership, rate limits, counters, and packet-control copying.
-- Linux tests for batched receive, dual-stack wildcard binds, interface-pinned replies, and opt-in reuse-port setup; build checks for Windows and unsupported platforms.
+- Unit tests for fallback transport behavior, ordering, queue overflow, ownership, rate limits, and counters.
+- Linux tests for batched receive order and opt-in reuse-port setup; build checks for Windows and unsupported platforms.
 - `go test -race ./...`, targeted fuzz/regression runs, and benchmarks comparing single-datagram and batched receive paths.
 - Each PR is opened ready for review and is not considered complete until checks pass and current review-bot findings are resolved or rebutted.
 

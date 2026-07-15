@@ -1,9 +1,6 @@
 package raknet
 
-import (
-	"net"
-	"net/netip"
-)
+import "net"
 
 const (
 	receiveBatchSize  = 64
@@ -15,27 +12,12 @@ const (
 type packetConn interface {
 	net.PacketConn
 	ReadBatch() ([]receiveMessage, error)
-	WriteToPacket([]byte, packetControl, net.Addr) (int, error)
 }
 
 type receiveMessage struct {
-	buffer  []byte
-	data    []byte
-	control packetControl
-	addr    net.Addr
-}
-
-// packetControl is copied out of a socket's ancillary buffer before that
-// buffer is reused. It therefore contains values only, not pointers into
-// syscall-owned memory.
-type packetControl struct {
-	family  uint8
-	ifIndex int
-	dst     netip.Addr
-}
-
-func (control packetControl) samePin(other packetControl) bool {
-	return control.family == other.family && control.ifIndex == other.ifIndex
+	buffer []byte
+	data   []byte
+	addr   net.Addr
 }
 
 func dispatchReceiveMessages(messages []receiveMessage, handle func(receiveMessage)) {
@@ -68,20 +50,15 @@ func (conn *basicPacketConn) ReadBatch() ([]receiveMessage, error) {
 		return nil, err
 	}
 	message.data = message.buffer[:n]
-	message.control = packetControl{}
 	message.addr = addr
 	return conn.slots[:1], nil
 }
 
-func (conn *basicPacketConn) WriteToPacket(b []byte, _ packetControl, addr net.Addr) (int, error) {
-	return conn.PacketConn.WriteTo(b, addr)
-}
-
-func newPacketConn(conn net.PacketConn) (packetConn, bool) {
+func newPacketConn(conn net.PacketConn) packetConn {
 	if udp, ok := conn.(*net.UDPConn); ok {
-		if platform, pinned := newPlatformPacketConn(udp); platform != nil {
-			return platform, pinned
+		if platform := newPlatformPacketConn(udp); platform != nil {
+			return platform
 		}
 	}
-	return newBasicPacketConn(conn, 1, receiveBufferSize), false
+	return newBasicPacketConn(conn, 1, receiveBufferSize)
 }

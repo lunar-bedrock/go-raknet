@@ -146,7 +146,7 @@ func (conf ListenConfig) Listen(address string) (*Listener, error) {
 	if err != nil {
 		return nil, &net.OpError{Op: "listen", Net: "raknet", Source: nil, Addr: nil, Err: err}
 	}
-	conn, _ := newPacketConn(rawConn)
+	conn := newPacketConn(rawConn)
 	listener := &Listener{
 		conf:     conf,
 		conn:     conn,
@@ -292,7 +292,7 @@ func (listener *Listener) listen() {
 			if len(message.data) == 0 || listener.sec.blocked(message.addr) {
 				return
 			}
-			if err := listener.handle(message.data, message.addr, message.control); err != nil && !errors.Is(err, net.ErrClosed) {
+			if err := listener.handle(message.data, message.addr); err != nil && !errors.Is(err, net.ErrClosed) {
 				listener.conf.ErrorLog.Error("handle packet: "+err.Error(), "raddr", addrToStr(message.addr), "block-duration", max(0, listener.conf.BlockDuration))
 				listener.sec.block(message.addr)
 			}
@@ -310,10 +310,10 @@ func addrToStr(addr net.Addr) string {
 
 // handle handles an incoming packet in buffer b from the address passed. If
 // not successful, an error is returned describing the issue.
-func (listener *Listener) handle(b []byte, addr net.Addr, control packetControl) error {
+func (listener *Listener) handle(b []byte, addr net.Addr) error {
 	value, found := listener.connections.Load(resolve(addr))
 	if !found {
-		return listener.handler.handleUnconnected(b, addr, control)
+		return listener.handler.handleUnconnected(b, addr)
 	}
 	conn := value.(*Conn)
 	select {
@@ -321,9 +321,6 @@ func (listener *Listener) handle(b []byte, addr net.Addr, control packetControl)
 		// Connection was closed already.
 		return nil
 	default:
-		if old := conn.control.Load(); control.ifIndex != 0 && (old == nil || !old.samePin(control)) {
-			conn.control.Store(&control)
-		}
 		if err := conn.receive(b); err != nil {
 			conn.closeImmediately()
 			return err
