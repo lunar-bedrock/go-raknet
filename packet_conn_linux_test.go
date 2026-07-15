@@ -44,17 +44,3 @@ func TestLinuxPacketConnReadsQueuedDatagramsAsBatch(t *testing.T) {
 		}
 	}
 }
-
-func TestLinuxListenPacketReusePortAllowsSharedBind(t *testing.T) {
-	first, err := listenPacket("127.0.0.1:0", true)
-	if err != nil {
-		t.Fatalf("first listen: %v", err)
-	}
-	t.Cleanup(func() { _ = first.Close() })
-
-	second, err := listenPacket(first.LocalAddr().String(), true)
-	if err != nil {
-		t.Fatalf("second listen on %v: %v", first.LocalAddr(), err)
-	}
-	t.Cleanup(func() { _ = second.Close() })
-}

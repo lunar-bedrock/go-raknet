@@ -44,9 +44,6 @@ type ListenConfig struct {
 	// BlockDuration defaults to 10s. If set to a negative value, IP addresses
 	// are never blocked on errors.
 	BlockDuration time.Duration
-	// ReusePort enables SO_REUSEPORT for the built-in Linux UDP listener. It is
-	// disabled by default and is ignored when UpstreamPacketListener is set.
-	ReusePort bool
 }
 
 // Listener implements a RakNet connection listener. It follows the same
@@ -139,7 +136,7 @@ func (conf ListenConfig) Listen(address string) (*Listener, error) {
 	var err error
 
 	if conf.UpstreamPacketListener == nil {
-		rawConn, err = listenPacket(address, conf.ReusePort)
+		rawConn, err = net.ListenPacket("udp", address)
 	} else {
 		rawConn, err = conf.UpstreamPacketListener.ListenPacket("udp", address)
 	}

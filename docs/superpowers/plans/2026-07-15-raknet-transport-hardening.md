@@ -5,10 +5,9 @@
 1. Add failing tests for portable single-packet fallback, sequential batch dispatch, and transport counters.
 2. Introduce an internal receive-message/transport interface without changing the public custom-listener contract.
 3. Add Linux UDP batching with reusable buffers; retain portable fallback files for other platforms and custom packet connections.
-4. Add an opt-in reuse-port configuration with focused socket-option and fallback tests.
-5. Add benchmarks for one-packet and queued-batch receive paths.
-6. Run formatting, unit tests, race tests, cross-platform build tests, static analysis, and benchmarks.
-7. Commit, push, open the ready-for-review PR against `lunar`, and resolve all current CI/review-bot findings.
+4. Add benchmarks for one-packet and queued-batch receive paths.
+5. Run formatting, unit tests, race tests, cross-platform build tests, static analysis, and benchmarks.
+6. Commit, push, open the ready-for-review PR against `lunar`, and resolve all current CI/review-bot findings.
 
 ## PR 2: Ordered receive isolation and flood controls
 
