@@ -310,7 +310,7 @@ func (dialer Dialer) clientListen(rakConn *Conn, conn net.Conn) {
 			err = rakConn.receive(b[:n])
 		}
 		if err != nil {
-			if errors.Is(err, net.ErrClosed) {
+			if errors.Is(err, net.ErrClosed) || errors.Is(err, os.ErrDeadlineExceeded) {
 				return
 			}
 			// Errors reading a packet other than the connection being
@@ -404,7 +404,7 @@ func (state *connState) discoverMTU(ctx context.Context) error {
 				// protection. For some reason they send a broken MTU size
 				// first. Sending a Request2 followed by a Request1 deals with
 				// this.
-				state.openConnectionRequest2(response.MTU)
+				state.openConnectionRequest2(response.MTU, state.serverSecurity, state.cookie)
 				continue
 			}
 			state.mtu = response.MTU
@@ -442,7 +442,8 @@ func (state *connState) openConnection(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	go state.request2(ctx, state.mtu)
+	requestCtx, cancelRequests := context.WithCancel(ctx)
+	go state.request2(requestCtx, state.mtu, state.serverSecurity, state.cookie)
 
 	b := make([]byte, maxMTUSize)
 	for {
@@ -460,25 +461,38 @@ func (state *connState) openConnection(ctx context.Context) error {
 		if n == 0 {
 			continue
 		}
-		if b[0] != message.IDOpenConnectionReply2 {
-			continue
+		switch b[0] {
+		case message.IDOpenConnectionReply1:
+			pk := &message.OpenConnectionReply1{}
+			if err = pk.UnmarshalBinary(b[1:n]); err != nil {
+				return fmt.Errorf("read repeated open connection reply 1: %w", err)
+			}
+			if pk.ServerGUID == 0 || pk.MTU < minMTUSize || pk.MTU > 1500 {
+				continue
+			}
+			state.serverSecurity, state.cookie, state.mtu = pk.ServerHasSecurity, pk.Cookie, pk.MTU
+			cancelRequests()
+			requestCtx, cancelRequests = context.WithCancel(ctx)
+			go state.request2(requestCtx, state.mtu, state.serverSecurity, state.cookie)
+		case message.IDOpenConnectionReply2:
+			pk := &message.OpenConnectionReply2{}
+			if err = pk.UnmarshalBinary(b[1:n]); err != nil {
+				return fmt.Errorf("read open connection reply 2: %w", err)
+			}
+			state.mtu = pk.MTU
+			return nil
 		}
-		pk := &message.OpenConnectionReply2{}
-		if err = pk.UnmarshalBinary(b[1:n]); err != nil {
-			return fmt.Errorf("read open connection reply 2: %w", err)
-		}
-		state.mtu = pk.MTU
-		return nil
 	}
 }
 
 // request2 continuously sends a message.OpenConnectionRequest2 every 500ms.
-func (state *connState) request2(ctx context.Context, mtu uint16) {
-	state.ticker.Reset(time.Second / 2)
+func (state *connState) request2(ctx context.Context, mtu uint16, serverSecurity bool, cookie uint32) {
+	ticker := time.NewTicker(time.Second / 2)
+	defer ticker.Stop()
 	for {
-		state.openConnectionRequest2(mtu)
+		state.openConnectionRequest2(mtu, serverSecurity, cookie)
 		select {
-		case <-state.ticker.C:
+		case <-ticker.C:
 			continue
 		case <-ctx.Done():
 			return
@@ -495,13 +509,13 @@ func (state *connState) openConnectionRequest1(mtu uint16) {
 
 // openConnectionRequest2 sends an open connection request 2 packet to the
 // server. If not successful, an error is returned.
-func (state *connState) openConnectionRequest2(mtu uint16) {
+func (state *connState) openConnectionRequest2(mtu uint16, serverSecurity bool, cookie uint32) {
 	data, _ := (&message.OpenConnectionRequest2{
 		ServerAddress:     resolve(state.raddr),
 		MTU:               mtu,
 		ClientGUID:        state.id,
-		ServerHasSecurity: state.serverSecurity,
-		Cookie:            state.cookie,
+		ServerHasSecurity: serverSecurity,
+		Cookie:            cookie,
 	}).MarshalBinary()
 	_, _ = state.conn.Write(data)
 }
