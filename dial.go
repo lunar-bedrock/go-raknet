@@ -108,7 +108,7 @@ type Dialer struct {
 	MaxTransientErrors int
 
 	// MaxMTU caps the largest MTU value used during the connection
-	// handshake. If zero, the default probe sequence is used.
+	// handshake. If zero, probes start at the maximum supported MTU.
 	//
 	// Set this to your local interface MTU when it is below 1500 (for
 	// example 1400 on hosts behind a tunnel or VPN). With the default,
@@ -346,10 +346,8 @@ type connState struct {
 
 const minSupportedMTU = 576
 
-// mtuSizes is the default probe sequence used for MTU discovery. Prefer 1200
-// for path safety, then try 1492 for servers that only answer standard-sized
-// RakNet probes before falling back to the minimum supported size.
-var mtuSizes = []uint16{preferredMTUSize, maxMTUSize, minSupportedMTU}
+// mtuSizes is the default probe sequence used for MTU discovery.
+var mtuSizes = []uint16{maxMTUSize, minSupportedMTU}
 
 // mtuSizesFor returns the MTU values to probe with when starting a
 // connection. If maxMTU is zero or already at least maxMTUSize, the unmodified
@@ -406,7 +404,7 @@ func (state *connState) discoverMTU(ctx context.Context) error {
 				// protection. For some reason they send a broken MTU size
 				// first. Sending a Request2 followed by a Request1 deals with
 				// this.
-				state.openConnectionRequest2(response.MTU)
+				state.openConnectionRequest2(response.MTU, state.serverSecurity, state.cookie)
 				continue
 			}
 			state.mtu = response.MTU
@@ -444,7 +442,15 @@ func (state *connState) openConnection(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	go state.request2(ctx, state.mtu)
+	requestCancel := func() {}
+	restartRequests := func() {
+		requestCancel()
+		requestCtx, cancelRequests := context.WithCancel(ctx)
+		requestCancel = cancelRequests
+		go state.request2(requestCtx, state.mtu, state.serverSecurity, state.cookie)
+	}
+	defer func() { requestCancel() }()
+	restartRequests()
 
 	b := make([]byte, maxMTUSize)
 	for {
@@ -462,23 +468,33 @@ func (state *connState) openConnection(ctx context.Context) error {
 		if n == 0 {
 			continue
 		}
-		if b[0] != message.IDOpenConnectionReply2 {
-			continue
+		switch b[0] {
+		case message.IDOpenConnectionReply1:
+			pk := &message.OpenConnectionReply1{}
+			if err = pk.UnmarshalBinary(b[1:n]); err != nil {
+				return fmt.Errorf("read repeated open connection reply 1: %w", err)
+			}
+			if pk.ServerGUID == 0 || pk.MTU < minMTUSize || pk.MTU > 1500 {
+				continue
+			}
+			state.serverSecurity, state.cookie, state.mtu = pk.ServerHasSecurity, pk.Cookie, pk.MTU
+			restartRequests()
+		case message.IDOpenConnectionReply2:
+			pk := &message.OpenConnectionReply2{}
+			if err = pk.UnmarshalBinary(b[1:n]); err != nil {
+				return fmt.Errorf("read open connection reply 2: %w", err)
+			}
+			state.mtu = pk.MTU
+			return nil
 		}
-		pk := &message.OpenConnectionReply2{}
-		if err = pk.UnmarshalBinary(b[1:n]); err != nil {
-			return fmt.Errorf("read open connection reply 2: %w", err)
-		}
-		state.mtu = pk.MTU
-		return nil
 	}
 }
 
 // request2 continuously sends a message.OpenConnectionRequest2 every 500ms.
-func (state *connState) request2(ctx context.Context, mtu uint16) {
+func (state *connState) request2(ctx context.Context, mtu uint16, serverSecurity bool, cookie uint32) {
 	state.ticker.Reset(time.Second / 2)
 	for {
-		state.openConnectionRequest2(mtu)
+		state.openConnectionRequest2(mtu, serverSecurity, cookie)
 		select {
 		case <-state.ticker.C:
 			continue
@@ -497,13 +513,13 @@ func (state *connState) openConnectionRequest1(mtu uint16) {
 
 // openConnectionRequest2 sends an open connection request 2 packet to the
 // server. If not successful, an error is returned.
-func (state *connState) openConnectionRequest2(mtu uint16) {
+func (state *connState) openConnectionRequest2(mtu uint16, serverSecurity bool, cookie uint32) {
 	data, _ := (&message.OpenConnectionRequest2{
 		ServerAddress:     resolve(state.raddr),
 		MTU:               mtu,
 		ClientGUID:        state.id,
-		ServerHasSecurity: state.serverSecurity,
-		Cookie:            state.cookie,
+		ServerHasSecurity: serverSecurity,
+		Cookie:            cookie,
 	}).MarshalBinary()
 	_, _ = state.conn.Write(data)
 }
