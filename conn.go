@@ -353,7 +353,8 @@ func (conn *Conn) Close() error {
 	if !conn.closing.CompareAndSwap(0, time.Now().Unix()) {
 		return nil
 	}
-	return conn.sendDisconnect()
+	_ = conn.sendDisconnect()
+	return nil
 }
 
 // Context returns the connection's context. The context is canceled when
