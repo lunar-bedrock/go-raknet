@@ -108,7 +108,7 @@ type Dialer struct {
 	MaxTransientErrors int
 
 	// MaxMTU caps the largest MTU value used during the connection
-	// handshake. If zero, probes start at the maximum supported MTU.
+	// handshake. If zero, the default probe sequence is used.
 	//
 	// Set this to your local interface MTU when it is below 1500 (for
 	// example 1400 on hosts behind a tunnel or VPN). With the default,
@@ -346,8 +346,10 @@ type connState struct {
 
 const minSupportedMTU = 576
 
-// mtuSizes is the default probe sequence used for MTU discovery.
-var mtuSizes = []uint16{maxMTUSize, minSupportedMTU}
+// mtuSizes is the default probe sequence used for MTU discovery. Prefer 1200
+// for path safety, then try 1492 for servers that only answer standard-sized
+// RakNet probes before falling back to the minimum supported size.
+var mtuSizes = []uint16{preferredMTUSize, maxMTUSize, minSupportedMTU}
 
 // mtuSizesFor returns the MTU values to probe with when starting a
 // connection. If maxMTU is zero or already at least maxMTUSize, the unmodified

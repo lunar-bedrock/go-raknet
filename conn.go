@@ -25,15 +25,13 @@ const (
 
 	// minMTUSize and maxMTUSize bound the MTU value negotiated during the
 	// connection handshake. The value covers the full IP datagram including
-	// the 28-byte IP+UDP header, so usable payload is MTU-28. The cap is set
-	// to the QUIC initial-packet size (RFC 9000 §14) — empirically safe on
-	// >99% of paths globally, including cellular carriers with asymmetric
-	// downstream MTU (T-Mobile GTP tunnels etc.) where larger sizes are
-	// silently dropped on the server→client path even after a successful
-	// upstream MTU probe.
-	minMTUSize    = 400
-	maxMTUSize    = 1200
-	maxWindowSize = 2048
+	// the 28-byte IP+UDP header, so usable payload is MTU-28.
+	// preferredMTUSize is tried first because it is safe on cellular paths
+	// where larger server-to-client datagrams may be silently dropped.
+	minMTUSize       = 400
+	preferredMTUSize = 1200
+	maxMTUSize       = 1492
+	maxWindowSize    = 2048
 
 	// Caps on peer-controlled split reassembly, bounding memory per connection.
 	// maxSplitCount is an unconditional ceiling on the number of fragments a
