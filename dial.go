@@ -310,7 +310,7 @@ func (dialer Dialer) clientListen(rakConn *Conn, conn net.Conn) {
 			err = rakConn.receive(b[:n])
 		}
 		if err != nil {
-			if errors.Is(err, net.ErrClosed) {
+			if errors.Is(err, net.ErrClosed) || errors.Is(err, os.ErrDeadlineExceeded) {
 				return
 			}
 			// Errors reading a packet other than the connection being
