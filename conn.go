@@ -56,7 +56,8 @@ type Conn struct {
 	// connection. The rtt is measured in nanoseconds.
 	rtt atomic.Int64
 
-	closing atomic.Int64
+	closing        atomic.Int64
+	disconnectSent atomic.Bool
 
 	ctx        context.Context
 	cancelFunc context.CancelFunc
@@ -349,8 +350,10 @@ func (conn *Conn) ReadPacket() (b []byte, err error) {
 // cancelled and will return an error, as soon as the closing of the connection
 // is acknowledged by the client.
 func (conn *Conn) Close() error {
-	conn.closing.CompareAndSwap(0, time.Now().Unix())
-	return nil
+	if !conn.closing.CompareAndSwap(0, time.Now().Unix()) {
+		return nil
+	}
+	return conn.sendDisconnect()
 }
 
 // Context returns the connection's context. The context is canceled when
@@ -364,7 +367,7 @@ func (conn *Conn) Context() context.Context {
 // connection and closes the underlying UDP connection immediately.
 func (conn *Conn) closeImmediately() {
 	conn.once.Do(func() {
-		_, _ = conn.Write([]byte{message.IDDisconnectNotification})
+		_ = conn.sendDisconnect()
 		conn.handler.close(conn)
 		conn.cancelFunc()
 
@@ -377,6 +380,14 @@ func (conn *Conn) closeImmediately() {
 		}
 		clear(conn.retransmission.unacknowledged)
 	})
+}
+
+func (conn *Conn) sendDisconnect() error {
+	if !conn.disconnectSent.CompareAndSwap(false, true) {
+		return nil
+	}
+	_, err := conn.Write([]byte{message.IDDisconnectNotification})
+	return err
 }
 
 // RemoteAddr returns the remote address of the connection, meaning the address
