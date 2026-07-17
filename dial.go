@@ -442,15 +442,8 @@ func (state *connState) openConnection(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	requestCancel := func() {}
-	restartRequests := func() {
-		requestCancel()
-		requestCtx, cancelRequests := context.WithCancel(ctx)
-		requestCancel = cancelRequests
-		go state.request2(requestCtx, state.mtu, state.serverSecurity, state.cookie)
-	}
-	defer func() { requestCancel() }()
-	restartRequests()
+	requestCtx, cancelRequests := context.WithCancel(ctx)
+	go state.request2(requestCtx, state.mtu, state.serverSecurity, state.cookie)
 
 	b := make([]byte, maxMTUSize)
 	for {
@@ -478,7 +471,9 @@ func (state *connState) openConnection(ctx context.Context) error {
 				continue
 			}
 			state.serverSecurity, state.cookie, state.mtu = pk.ServerHasSecurity, pk.Cookie, pk.MTU
-			restartRequests()
+			cancelRequests()
+			requestCtx, cancelRequests = context.WithCancel(ctx)
+			go state.request2(requestCtx, state.mtu, state.serverSecurity, state.cookie)
 		case message.IDOpenConnectionReply2:
 			pk := &message.OpenConnectionReply2{}
 			if err = pk.UnmarshalBinary(b[1:n]); err != nil {
@@ -492,11 +487,12 @@ func (state *connState) openConnection(ctx context.Context) error {
 
 // request2 continuously sends a message.OpenConnectionRequest2 every 500ms.
 func (state *connState) request2(ctx context.Context, mtu uint16, serverSecurity bool, cookie uint32) {
-	state.ticker.Reset(time.Second / 2)
+	ticker := time.NewTicker(time.Second / 2)
+	defer ticker.Stop()
 	for {
 		state.openConnectionRequest2(mtu, serverSecurity, cookie)
 		select {
-		case <-state.ticker.C:
+		case <-ticker.C:
 			continue
 		case <-ctx.Done():
 			return
