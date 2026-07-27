@@ -9,6 +9,8 @@ import (
 )
 
 const (
+	maxAcknowledgementPackets = 8192
+
 	// packetRange indicates a range of packets, followed by the first and the
 	// last packet in the range.
 	packetRange = iota
@@ -16,7 +18,12 @@ const (
 	packetSingle
 )
 
-var errMaxAcknowledgement = errors.New("maximum amount of packets in acknowledgement exceeded")
+var (
+	errMaxAcknowledgement           = errors.New("maximum amount of packets in acknowledgement exceeded")
+	errUnknownAcknowledgementRecord = errors.New("unknown acknowledgement record type")
+	errInvalidAcknowledgementRange  = errors.New("invalid acknowledgement range")
+	errTrailingAcknowledgementBytes = errors.New("trailing bytes in acknowledgement")
+)
 
 // acknowledgement is an acknowledgement packet that may either be an ACK or a
 // NACK, depending on the purpose that it is sent with.
@@ -93,13 +100,12 @@ func (ack *acknowledgement) writeRecord(buf *bytes.Buffer, first, last uint24, c
 // read decodes an acknowledgement packet and returns an error if not
 // successful.
 func (ack *acknowledgement) read(b []byte) error {
-	const maxAcknowledgementPackets = 8192
 	if len(b) < 2 {
 		return io.ErrUnexpectedEOF
 	}
 	offset := 2
 	for range binary.BigEndian.Uint16(b) {
-		if len(b)-offset < 4 {
+		if len(b)-offset < 1 {
 			return io.ErrUnexpectedEOF
 		}
 		switch b[offset] {
@@ -108,7 +114,11 @@ func (ack *acknowledgement) read(b []byte) error {
 				return io.ErrUnexpectedEOF
 			}
 			start, end := loadUint24(b[offset+1:]), loadUint24(b[offset+4:])
-			if uint24(len(ack.packets))+end-start > maxAcknowledgementPackets {
+			if start > end {
+				return errInvalidAcknowledgementRange
+			}
+			packetCount := uint32(end) - uint32(start) + 1
+			if uint32(len(ack.packets))+packetCount > maxAcknowledgementPackets {
 				return errMaxAcknowledgement
 			}
 			for pk := start; pk <= end; pk++ {
@@ -116,12 +126,20 @@ func (ack *acknowledgement) read(b []byte) error {
 			}
 			offset += 7
 		case packetSingle:
+			if len(b)-offset < 4 {
+				return io.ErrUnexpectedEOF
+			}
 			if len(ack.packets)+1 > maxAcknowledgementPackets {
 				return errMaxAcknowledgement
 			}
 			ack.packets = append(ack.packets, loadUint24(b[offset+1:]))
 			offset += 4
+		default:
+			return errUnknownAcknowledgementRecord
 		}
+	}
+	if offset != len(b) {
+		return errTrailingAcknowledgementBytes
 	}
 	return nil
 }
