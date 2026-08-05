@@ -42,6 +42,7 @@ func newSendTestConn() (*Conn, *recordingPacketConn, context.CancelFunc) {
 		retransmission: newRecoveryQueue(),
 		congestion:     newCongestionWindow(maxMTUSize - 28),
 		sendQueueFreed: make(chan struct{}, 1),
+		sendBudget:     maxMTUSize - 28,
 	}
 	return conn, packetConn, cancel
 }
@@ -57,16 +58,19 @@ func TestSendQueueDrainsOnACK(t *testing.T) {
 	if err != nil || n != len(payload) {
 		t.Fatalf("write: n=%d err=%v", n, err)
 	}
-	if got := len(packetConn.writes); got != 1 {
-		t.Fatalf("initial datagrams: got %d, want 1", got)
+	if got := len(packetConn.writes); got != 2 {
+		t.Fatalf("initial datagrams: got %d, want 2", got)
 	}
-	if len(conn.sendQueue) != 2 {
-		t.Fatalf("queued datagrams: got %d, want 2", len(conn.sendQueue))
+	if len(conn.sendQueue) != 1 {
+		t.Fatalf("queued datagrams: got %d, want 1", len(conn.sendQueue))
 	}
-	if packetConn.writes[0][0]&bitFlagContinuousSend == 0 {
-		t.Fatal("first datagram did not advertise continuous send")
+	if packetConn.writes[0][0]&bitFlagContinuousSend != 0 {
+		t.Fatal("first datagram advertised continuous send")
 	}
-	if got, want := conn.congestion.inFlight, uint32(len(packetConn.writes[0])-4); got != want {
+	if packetConn.writes[1][0]&bitFlagContinuousSend == 0 {
+		t.Fatal("second datagram did not advertise continuous send")
+	}
+	if got, want := conn.congestion.inFlight, uint32(len(packetConn.writes[0])+len(packetConn.writes[1])-8); got != want {
 		t.Fatalf("initial in-flight bytes: got %d, want %d", got, want)
 	}
 
@@ -75,13 +79,12 @@ func TestSendQueueDrainsOnACK(t *testing.T) {
 	if err := conn.handleACK(ackBuffer.Bytes()); err != nil {
 		t.Fatalf("handle ACK: %v", err)
 	}
+	conn.checkResend(time.Now())
 	if got := len(packetConn.writes); got != 3 {
 		t.Fatalf("datagrams after ACK: got %d, want 3", got)
 	}
-	for i, datagram := range packetConn.writes {
-		if datagram[0]&bitFlagContinuousSend == 0 {
-			t.Fatalf("datagram %d did not advertise continuous send", i)
-		}
+	if packetConn.writes[2][0]&bitFlagContinuousSend != 0 {
+		t.Fatal("first datagram of the next tick advertised continuous send")
 	}
 	if len(conn.sendQueue) != 0 {
 		t.Fatalf("send queue not drained: %d datagrams remain", len(conn.sendQueue))
@@ -146,10 +149,11 @@ func TestSendQueueBackpressureUnblocksOnClose(t *testing.T) {
 	}
 }
 
-func TestControlPacketBypassesApplicationWindow(t *testing.T) {
+func TestControlPacketWaitsForApplicationWindow(t *testing.T) {
 	conn, packetConn, cancel := newSendTestConn()
 	defer cancel()
 	conn.congestion.inFlight = uint32(conn.effectiveMTU())
+	conn.sendBudget = 0
 
 	conn.mu.Lock()
 	_, err := conn.write([]byte{1}, reliabilityReliableOrdered, false)
@@ -163,10 +167,61 @@ func TestControlPacketBypassesApplicationWindow(t *testing.T) {
 	if err := conn.writeControl([]byte{2}, reliabilityReliableOrdered); err != nil {
 		t.Fatalf("write control packet: %v", err)
 	}
-	if got := len(packetConn.writes); got != 1 {
-		t.Fatalf("control datagrams: got %d, want 1", got)
+	if got := len(packetConn.writes); got != 0 {
+		t.Fatalf("control datagrams sent outside window: %d", got)
 	}
 	if len(conn.sendQueue) != 1 {
 		t.Fatalf("application queue changed while sending control packet: %d", len(conn.sendQueue))
+	}
+	if len(conn.controlQueue) != 1 {
+		t.Fatalf("control queue: got %d, want 1", len(conn.controlQueue))
+	}
+}
+
+func TestUnreliableDatagramsConsumeSendBudget(t *testing.T) {
+	conn, packetConn, cancel := newSendTestConn()
+	defer cancel()
+
+	payload := make([]byte, int(conn.effectiveMTU())*2)
+	conn.mu.Lock()
+	_, err := conn.write(payload, reliabilityUnreliable, false)
+	conn.mu.Unlock()
+	if err != nil {
+		t.Fatalf("write unreliable: %v", err)
+	}
+	if got := len(packetConn.writes); got != 2 {
+		t.Fatalf("initial datagrams: got %d, want 2", got)
+	}
+	if conn.sendBudget != 0 {
+		t.Fatalf("send budget: got %d, want 0", conn.sendBudget)
+	}
+	if conn.congestion.inFlight != 0 {
+		t.Fatalf("unreliable bytes counted in flight: %d", conn.congestion.inFlight)
+	}
+	if len(conn.sendQueue) == 0 {
+		t.Fatal("unreliable tail was not queued")
+	}
+}
+
+func TestContinuousSendUsesPreviousTick(t *testing.T) {
+	conn, _, cancel := newSendTestConn()
+	defer cancel()
+	conn.congestion.inFlight = uint32(conn.effectiveMTU())
+	conn.sendBudget = 0
+
+	conn.mu.Lock()
+	_, err := conn.write([]byte{1}, reliabilityReliableOrdered, false)
+	conn.mu.Unlock()
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	conn.checkResend(time.Now())
+	if conn.congestion.continuous {
+		t.Fatal("first tick used the current queue sample")
+	}
+	conn.checkResend(time.Now())
+	if !conn.congestion.continuous {
+		t.Fatal("second tick did not use the previous queue sample")
 	}
 }

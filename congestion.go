@@ -18,8 +18,7 @@ func newCongestionWindow(mtu uint16) congestionWindow {
 	return congestionWindow{mtu: uint32(mtu), window: float64(mtu)}
 }
 
-func (c *congestionWindow) transmissionBandwidth(continuous bool) uint32 {
-	c.continuous = continuous
+func (c *congestionWindow) transmissionBandwidth() uint32 {
 	if float64(c.inFlight) >= c.window {
 		return 0
 	}
@@ -40,9 +39,8 @@ func (c *congestionWindow) acknowledged(bytes uint32) {
 	c.inFlight -= bytes
 }
 
-func (c *congestionWindow) ack(sequence, nextSequence uint24, continuous bool) {
-	c.continuous = continuous
-	if !continuous {
+func (c *congestionWindow) ack(sequence, nextSequence uint24) {
+	if !c.continuous {
 		return
 	}
 

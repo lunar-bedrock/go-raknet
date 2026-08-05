@@ -47,3 +47,30 @@ func TestRetransmissionBudgetDefendsAccountingDrift(t *testing.T) {
 		t.Fatal("datagram beyond retransmission budget was removed")
 	}
 }
+
+func TestRetransmissionExhaustsNewDataBudget(t *testing.T) {
+	conn, packetConn, cancel := newSendTestConn()
+	defer cancel()
+	conn.congestion.inFlight = 100
+	conn.sendBudget = 50
+	conn.retransmission.add(10, &packet{
+		reliability: reliabilityReliableOrdered,
+		content:     []byte{1},
+	}, 100)
+	queued := &packet{reliability: reliabilityReliableOrdered, content: []byte{2}}
+	conn.sendQueue = append(conn.sendQueue, queuedDatagram{pk: queued, wireSize: 8, inFlightBytes: 4})
+	conn.sendQueueBytes = 8
+
+	conn.mu.Lock()
+	err := conn.resend([]uint24{10}, false)
+	conn.mu.Unlock()
+	if err != nil {
+		t.Fatalf("resend: %v", err)
+	}
+	if got := len(packetConn.writes); got != 1 {
+		t.Fatalf("datagrams: got %d, want only the retransmission", got)
+	}
+	if len(conn.sendQueue) != 1 {
+		t.Fatal("new data was sent after retransmissions exhausted the budget")
+	}
+}

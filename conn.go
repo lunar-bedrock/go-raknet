@@ -124,12 +124,14 @@ type Conn struct {
 	retransmission *resendMap
 
 	congestion congestionWindow
-	// controlQueue is drained before application data and bypasses the congestion
-	// window, so pings and disconnects do not wait behind a large transfer.
+	// controlQueue is drained before application data.
 	controlQueue   []queuedDatagram
 	sendQueue      []queuedDatagram
 	sendQueueBytes uint32
 	sendQueueFreed chan struct{}
+	sendBudget     uint32
+	continuousSend bool
+	wireContinuous bool
 
 	lastActivity atomic.Pointer[time.Time]
 }
@@ -152,6 +154,7 @@ func newConn(conn net.PacketConn, raddr net.Addr, mtu uint16, h connectionHandle
 		retransmission: newRecoveryQueue(),
 		congestion:     newCongestionWindow(mtu - 28),
 		sendQueueFreed: make(chan struct{}, 1),
+		sendBudget:     uint32(mtu - 28),
 		buf:            bytes.NewBuffer(make([]byte, 0, mtu-28)), // - headers.
 		ackBuf:         bytes.NewBuffer(make([]byte, 0, 128)),
 		nackBuf:        bytes.NewBuffer(make([]byte, 0, 64)),
@@ -247,6 +250,10 @@ func (conn *Conn) checkResend(now time.Time) {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
 
+	conn.congestion.continuous = conn.continuousSend
+	conn.wireContinuous = conn.continuousSend
+	conn.sendBudget = conn.congestion.transmissionBandwidth()
+
 	var resend []uint24
 	rtt := conn.retransmission.rtt()
 	conn.rtt.Store(int64(rtt))
@@ -262,6 +269,7 @@ func (conn *Conn) checkResend(now time.Time) {
 		)
 	})
 	_ = conn.resend(resend, true)
+	conn.continuousSend = len(conn.controlQueue) != 0 || len(conn.sendQueue) != 0
 }
 
 // Write writes a buffer b over the RakNet connection. The amount of bytes
@@ -749,10 +757,11 @@ func (conn *Conn) handleACK(b []byte) error {
 	if err := ack.read(b); err != nil {
 		return fmt.Errorf("read ACK: %w", err)
 	}
+	conn.congestion.continuous = conn.continuousSend
 	for _, sequenceNumber := range ack.packets {
 		if record, ok := conn.retransmission.acknowledge(sequenceNumber); ok {
 			conn.congestion.acknowledged(record.inFlightBytes)
-			conn.congestion.ack(sequenceNumber, conn.seq, len(conn.sendQueue) != 0)
+			conn.congestion.ack(sequenceNumber, conn.seq)
 			record.pk.content = record.pk.content[:0]
 			packetPool.Put(record.pk)
 		}
@@ -770,7 +779,6 @@ func (conn *Conn) handleNACK(b []byte) error {
 	if err := nack.read(b); err != nil {
 		return fmt.Errorf("read NACK: %w", err)
 	}
-	conn.congestion.continuous = len(conn.sendQueue) != 0
 	conn.congestion.nak(conn.seq)
 	return conn.resend(nack.packets, false)
 }
@@ -797,40 +805,55 @@ func (conn *Conn) resend(sequenceNumbers []uint24, timedOut bool) (err error) {
 		if timedOut {
 			conn.congestion.resend(conn.seq)
 		}
-		if err = conn.sendDatagram(record.pk, record.inFlightBytes, true, len(conn.sendQueue) != 0); err != nil {
+		if err = conn.sendDatagram(record.pk, record.inFlightBytes, true); err != nil {
 			return err
 		}
 		sent += record.inFlightBytes
+	}
+	if sent >= conn.sendBudget {
+		conn.sendBudget = 0
 	}
 	return conn.drainSendQueue()
 }
 
 func (conn *Conn) drainSendQueue() error {
 	for len(conn.controlQueue) != 0 {
+		if conn.sendBudget == 0 {
+			return nil
+		}
 		datagram := conn.controlQueue[0]
 		conn.controlQueue[0] = queuedDatagram{}
 		conn.controlQueue = conn.controlQueue[1:]
 		conn.sendQueueBytes -= datagram.wireSize
 		conn.signalSendQueueFreed()
-		if err := conn.sendDatagram(datagram.pk, datagram.inFlightBytes, false, len(conn.sendQueue) != 0); err != nil {
+		conn.consumeSendBudget(datagram.inFlightBytes)
+		if err := conn.sendDatagram(datagram.pk, datagram.inFlightBytes, false); err != nil {
 			return err
 		}
 	}
 	for len(conn.sendQueue) != 0 {
-		datagram := conn.sendQueue[0]
-		if datagram.pk.reliability.reliable() && conn.congestion.transmissionBandwidth(true) < datagram.inFlightBytes {
+		if conn.sendBudget == 0 {
 			return nil
 		}
+		datagram := conn.sendQueue[0]
 		conn.sendQueue[0] = queuedDatagram{}
 		conn.sendQueue = conn.sendQueue[1:]
 		conn.sendQueueBytes -= datagram.wireSize
 		conn.signalSendQueueFreed()
-		if err := conn.sendDatagram(datagram.pk, datagram.inFlightBytes, false, true); err != nil {
+		conn.consumeSendBudget(datagram.inFlightBytes)
+		if err := conn.sendDatagram(datagram.pk, datagram.inFlightBytes, false); err != nil {
 			return err
 		}
 	}
-	conn.congestion.continuous = false
 	return nil
+}
+
+func (conn *Conn) consumeSendBudget(size uint32) {
+	if size >= conn.sendBudget {
+		conn.sendBudget = 0
+		return
+	}
+	conn.sendBudget -= size
 }
 
 func (conn *Conn) signalSendQueueFreed() {
@@ -840,11 +863,12 @@ func (conn *Conn) signalSendQueueFreed() {
 	}
 }
 
-func (conn *Conn) sendDatagram(pk *packet, size uint32, retransmit, continuous bool) error {
+func (conn *Conn) sendDatagram(pk *packet, size uint32, retransmit bool) error {
 	header := byte(bitFlagDatagram | bitFlagNeedsBAndAS)
-	if continuous {
+	if conn.wireContinuous {
 		header |= bitFlagContinuousSend
 	}
+	conn.wireContinuous = true
 	conn.buf.WriteByte(header)
 	seq := conn.seq.Inc()
 	writeUint24(conn.buf, seq)

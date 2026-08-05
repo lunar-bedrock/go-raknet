@@ -4,15 +4,16 @@ import "testing"
 
 func TestCongestionWindowSlowStart(t *testing.T) {
 	c := newCongestionWindow(1200)
-	if got := c.transmissionBandwidth(true); got != 1200 {
+	if got := c.transmissionBandwidth(); got != 1200 {
 		t.Fatalf("initial bandwidth: got %d, want 1200", got)
 	}
 	c.sent(900)
-	if got := c.transmissionBandwidth(true); got != 300 {
+	if got := c.transmissionBandwidth(); got != 300 {
 		t.Fatalf("remaining bandwidth: got %d, want 300", got)
 	}
 	c.acknowledged(900)
-	c.ack(1, 2, true)
+	c.continuous = true
+	c.ack(1, 2)
 	if c.window != 2400 {
 		t.Fatalf("window after ACK: got %f, want 2400", c.window)
 	}
@@ -22,12 +23,13 @@ func TestCongestionWindowAvoidanceAdvancesPerACK(t *testing.T) {
 	c := newCongestionWindow(1200)
 	c.window = 3000
 	c.threshold = 2400
-	c.ack(1, 10, true)
+	c.continuous = true
+	c.ack(1, 10)
 	want := 3480.0
 	if c.window != want {
 		t.Fatalf("window after new block: got %f, want %f", c.window, want)
 	}
-	c.ack(2, 11, true)
+	c.ack(2, 11)
 	want += 1440000 / want
 	if c.window != want {
 		t.Fatalf("window after second ACK: got %f, want %f", c.window, want)
@@ -56,7 +58,8 @@ func TestCongestionWindowCrossesThreshold(t *testing.T) {
 	c := newCongestionWindow(1000)
 	c.window = 2000
 	c.threshold = 2500
-	c.ack(1, 2, true)
+	c.continuous = true
+	c.ack(1, 2)
 	want := 2500.0 + 1000000.0/3000.0
 	if c.window != want {
 		t.Fatalf("window after crossing threshold: got %f, want %f", c.window, want)
@@ -65,7 +68,7 @@ func TestCongestionWindowCrossesThreshold(t *testing.T) {
 
 func TestCongestionWindowDoesNotGrowWhileIdle(t *testing.T) {
 	c := newCongestionWindow(1200)
-	c.ack(1, 2, false)
+	c.ack(1, 2)
 	if c.window != 1200 {
 		t.Fatalf("idle window grew to %f", c.window)
 	}
