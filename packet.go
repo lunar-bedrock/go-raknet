@@ -14,10 +14,30 @@ const (
 	bitFlagACK = 0x40
 	// bitFlagNACK is set for every NACK packet.
 	bitFlagNACK = 0x20
+	// bitFlagContinuousSend indicates that more datagrams are immediately
+	// available to send.
+	bitFlagContinuousSend = 0x08
 	// bitFlagNeedsBAndAS is set for every datagram with packet data, but is not
 	// actually used.
 	bitFlagNeedsBAndAS = 0x04
 )
+
+func encapsulatedPacketSize(contentLength int, reliability reliability, split bool) int {
+	size := 3 + contentLength
+	if reliability.reliable() {
+		size += 3
+	}
+	if reliability.sequenced() {
+		size += 3
+	}
+	if reliability.sequencedOrOrdered() {
+		size += 4
+	}
+	if split {
+		size += splitAdditionalSize
+	}
+	return size
+}
 
 const (
 	// reliabilityUnreliable means that the packet sent could arrive out of

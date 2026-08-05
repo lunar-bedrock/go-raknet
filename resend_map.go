@@ -15,8 +15,9 @@ type resendMap struct {
 // resendRecord represents a single packet with a timestamp from when it was
 // initially sent. It may be either acknowledged or NACKed by the other end.
 type resendRecord struct {
-	pk        *packet
-	timestamp time.Time
+	pk            *packet
+	inFlightBytes uint32
+	timestamp     time.Time
 }
 
 // newRecoveryQueue returns a new initialised recovery queue.
@@ -28,34 +29,34 @@ func newRecoveryQueue() *resendMap {
 }
 
 // add puts a packet at the index passed and records the current time.
-func (m *resendMap) add(index uint24, pk *packet) {
-	m.unacknowledged[index] = resendRecord{pk: pk, timestamp: time.Now()}
+func (m *resendMap) add(index uint24, pk *packet, inFlightBytes uint32) {
+	m.unacknowledged[index] = resendRecord{pk: pk, inFlightBytes: inFlightBytes, timestamp: time.Now()}
 }
 
 // acknowledge marks a packet with the index passed as acknowledged. The packet
 // is removed from the resendMap and returned if found.
-func (m *resendMap) acknowledge(index uint24) (*packet, bool) {
+func (m *resendMap) acknowledge(index uint24) (resendRecord, bool) {
 	return m.remove(index, 1)
 }
 
 // retransmit looks up a packet with an index from the resendMap so that it may
 // be resent.
-func (m *resendMap) retransmit(index uint24) (*packet, bool) {
+func (m *resendMap) retransmit(index uint24) (resendRecord, bool) {
 	return m.remove(index, 2)
 }
 
 // remove deletes an index from the resendMap and adds the time since the
 // packet was originally sent multiplied by mul to the delays slice.
-func (m *resendMap) remove(index uint24, mul int) (*packet, bool) {
+func (m *resendMap) remove(index uint24, mul int) (resendRecord, bool) {
 	record, ok := m.unacknowledged[index]
 	if !ok {
-		return nil, false
+		return resendRecord{}, false
 	}
 	delete(m.unacknowledged, index)
 
 	now := time.Now()
 	m.delays[now] = now.Sub(record.timestamp) * time.Duration(mul)
-	return record.pk, true
+	return record, true
 }
 
 // rtt returns the average round trip time between the putting of the value
