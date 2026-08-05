@@ -1,5 +1,9 @@
 package raknet
 
+// congestionWindow limits reliable bytes in flight. Counts use encapsulated
+// packet sizes and exclude the 4-byte datagram header. ACKs grow the window
+// through slow start and then congestion avoidance. A NAK begins recovery by
+// lowering the threshold; a timeout also resets the window to one MTU.
 type congestionWindow struct {
 	mtu        uint32
 	window     float64
@@ -22,6 +26,8 @@ func (c *congestionWindow) transmissionBandwidth(continuous bool) uint32 {
 	return uint32(c.window - float64(c.inFlight))
 }
 
+// sent and acknowledged maintain the invariant that inFlight equals the sum of
+// the inFlightBytes of every reliable record still waiting for an ACK.
 func (c *congestionWindow) sent(bytes uint32) {
 	c.inFlight += bytes
 }

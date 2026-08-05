@@ -45,8 +45,11 @@ const (
 	// server RakNet implementation.
 	maxSplitCount       = 8192
 	maxConcurrentSplits = 256
-	maxSendQueueBytes   = 16 << 20
-	sendQueueReserve    = 64 << 10
+
+	// Bound queued application data so a stalled path cannot grow memory forever.
+	// Write waits at the limit; the reserve lets control traffic continue.
+	maxSendQueueBytes = 16 << 20
+	sendQueueReserve  = 64 << 10
 )
 
 type queuedDatagram struct {
@@ -120,7 +123,9 @@ type Conn struct {
 	// datagram sequence number.
 	retransmission *resendMap
 
-	congestion     congestionWindow
+	congestion congestionWindow
+	// controlQueue is drained before application data and bypasses the congestion
+	// window, so pings and disconnects do not wait behind a large transfer.
 	controlQueue   []queuedDatagram
 	sendQueue      []queuedDatagram
 	sendQueueBytes uint32
@@ -773,6 +778,8 @@ func (conn *Conn) handleNACK(b []byte) error {
 // resend sends all datagrams currently in the recovery queue with the sequence
 // numbers passed.
 func (conn *Conn) resend(sequenceNumbers []uint24, timedOut bool) (err error) {
+	// Retransmitted bytes already count as in flight. This budget caps one pass at
+	// the outstanding total and protects against accounting drift.
 	budget := conn.congestion.inFlight
 	var sent uint32
 	for _, sequenceNumber := range sequenceNumbers {

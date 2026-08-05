@@ -62,6 +62,7 @@ func (m *resendMap) remove(index uint24) (resendRecord, bool) {
 	return record, true
 }
 
+// observeRTT smooths RTT and deviation so one unusual sample has little effect.
 func (m *resendMap) observeRTT(sample time.Duration) {
 	if !m.hasRTT {
 		m.estimatedRTT = sample
@@ -84,6 +85,8 @@ func (m *resendMap) rtt() time.Duration {
 	return m.estimatedRTT
 }
 
+// rto uses the smoothed RTT and deviation. A record becomes eligible for
+// retransmission when its send time plus this duration has passed.
 func (m *resendMap) rto() time.Duration {
 	if !m.hasRTT {
 		return time.Second * 2
