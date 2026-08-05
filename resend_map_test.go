@@ -24,7 +24,7 @@ func TestResendMapRTO(t *testing.T) {
 	}
 }
 
-func TestRetransmissionBudget(t *testing.T) {
+func TestRetransmissionBudgetDefendsAccountingDrift(t *testing.T) {
 	conn, packetConn, cancel := newSendTestConn()
 	defer cancel()
 	conn.congestion.inFlight = 150
