@@ -3,6 +3,7 @@ package raknet
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net"
 	"sync"
 	"testing"
@@ -117,5 +118,30 @@ func TestSendQueueBackpressure(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("write remained blocked after queue space became available")
+	}
+}
+
+func TestSendQueueBackpressureUnblocksOnClose(t *testing.T) {
+	conn, _, cancel := newSendTestConn()
+	conn.sendQueueBytes = maxSendQueueBytes - sendQueueReserve
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := conn.Write([]byte{1})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("write returned before cancellation: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("write after cancellation: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("write remained blocked after cancellation")
 	}
 }
