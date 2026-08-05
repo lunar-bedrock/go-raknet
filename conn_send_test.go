@@ -52,7 +52,7 @@ func TestSendQueueDrainsOnACK(t *testing.T) {
 
 	payload := make([]byte, int(conn.effectiveMTU())*2)
 	conn.mu.Lock()
-	n, err := conn.write(payload, reliabilityReliableOrdered)
+	n, err := conn.write(payload, reliabilityReliableOrdered, false)
 	conn.mu.Unlock()
 	if err != nil || n != len(payload) {
 		t.Fatalf("write: n=%d err=%v", n, err)
@@ -143,5 +143,30 @@ func TestSendQueueBackpressureUnblocksOnClose(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("write remained blocked after cancellation")
+	}
+}
+
+func TestControlPacketBypassesApplicationWindow(t *testing.T) {
+	conn, packetConn, cancel := newSendTestConn()
+	defer cancel()
+	conn.congestion.inFlight = uint32(conn.effectiveMTU())
+
+	conn.mu.Lock()
+	_, err := conn.write([]byte{1}, reliabilityReliableOrdered, false)
+	conn.mu.Unlock()
+	if err != nil {
+		t.Fatalf("queue application packet: %v", err)
+	}
+	if got := len(packetConn.writes); got != 0 {
+		t.Fatalf("application datagrams sent outside window: %d", got)
+	}
+	if err := conn.writeControl([]byte{2}, reliabilityReliableOrdered); err != nil {
+		t.Fatalf("write control packet: %v", err)
+	}
+	if got := len(packetConn.writes); got != 1 {
+		t.Fatalf("control datagrams: got %d, want 1", got)
+	}
+	if len(conn.sendQueue) != 1 {
+		t.Fatalf("application queue changed while sending control packet: %d", len(conn.sendQueue))
 	}
 }

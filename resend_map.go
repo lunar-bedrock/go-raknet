@@ -1,7 +1,6 @@
 package raknet
 
 import (
-	"maps"
 	"time"
 )
 
@@ -9,7 +8,9 @@ import (
 // the connection ended up not having them.
 type resendMap struct {
 	unacknowledged map[uint24]resendRecord
-	delays         map[time.Time]time.Duration
+	estimatedRTT   time.Duration
+	deviationRTT   time.Duration
+	hasRTT         bool
 }
 
 // resendRecord represents a single packet with a timestamp from when it was
@@ -18,64 +19,74 @@ type resendRecord struct {
 	pk            *packet
 	inFlightBytes uint32
 	timestamp     time.Time
+	nextSend      time.Time
 }
 
 // newRecoveryQueue returns a new initialised recovery queue.
 func newRecoveryQueue() *resendMap {
 	return &resendMap{
-		delays:         make(map[time.Time]time.Duration),
 		unacknowledged: make(map[uint24]resendRecord),
 	}
 }
 
 // add puts a packet at the index passed and records the current time.
 func (m *resendMap) add(index uint24, pk *packet, inFlightBytes uint32) {
-	m.unacknowledged[index] = resendRecord{pk: pk, inFlightBytes: inFlightBytes, timestamp: time.Now()}
+	now := time.Now()
+	m.unacknowledged[index] = resendRecord{
+		pk: pk, inFlightBytes: inFlightBytes, timestamp: now, nextSend: now.Add(m.rto()),
+	}
 }
 
 // acknowledge marks a packet with the index passed as acknowledged. The packet
 // is removed from the resendMap and returned if found.
 func (m *resendMap) acknowledge(index uint24) (resendRecord, bool) {
-	return m.remove(index, 1)
+	record, ok := m.remove(index)
+	if ok {
+		m.observeRTT(time.Since(record.timestamp))
+	}
+	return record, ok
 }
 
 // retransmit looks up a packet with an index from the resendMap so that it may
 // be resent.
 func (m *resendMap) retransmit(index uint24) (resendRecord, bool) {
-	return m.remove(index, 2)
+	return m.remove(index)
 }
 
-// remove deletes an index from the resendMap and adds the time since the
-// packet was originally sent multiplied by mul to the delays slice.
-func (m *resendMap) remove(index uint24, mul int) (resendRecord, bool) {
+func (m *resendMap) remove(index uint24) (resendRecord, bool) {
 	record, ok := m.unacknowledged[index]
 	if !ok {
 		return resendRecord{}, false
 	}
 	delete(m.unacknowledged, index)
-
-	now := time.Now()
-	m.delays[now] = now.Sub(record.timestamp) * time.Duration(mul)
 	return record, true
 }
 
-// rtt returns the average round trip time between the putting of the value
-// into the recovery queue and the taking out of it again. It is measured over
-// the last delayRecordCount values add in.
-func (m *resendMap) rtt(now time.Time) time.Duration {
-	const rttCalculationWindow = time.Second * 5
-	maps.DeleteFunc(m.delays, func(t time.Time, duration time.Duration) bool {
-		// Remove records that are older than the max window.
-		return now.Sub(t) > rttCalculationWindow
-	})
-	if len(m.delays) == 0 {
-		// No records yet, generally should not happen. Just return a reasonable
-		// amount of time.
+func (m *resendMap) observeRTT(sample time.Duration) {
+	if !m.hasRTT {
+		m.estimatedRTT = sample
+		m.deviationRTT = sample
+		m.hasRTT = true
+		return
+	}
+	difference := sample - m.estimatedRTT
+	m.estimatedRTT += time.Duration(float64(difference) * 0.05)
+	if difference < 0 {
+		difference = -difference
+	}
+	m.deviationRTT += time.Duration(float64(difference-m.deviationRTT) * 0.05)
+}
+
+func (m *resendMap) rtt() time.Duration {
+	if !m.hasRTT {
 		return time.Millisecond * 50
 	}
-	var total time.Duration
-	for _, rtt := range m.delays {
-		total += rtt
+	return m.estimatedRTT
+}
+
+func (m *resendMap) rto() time.Duration {
+	if !m.hasRTT {
+		return time.Second * 2
 	}
-	return total / time.Duration(len(m.delays))
+	return min(m.estimatedRTT*2+m.deviationRTT*4+time.Millisecond*30, time.Second*2)
 }

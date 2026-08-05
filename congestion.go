@@ -53,6 +53,7 @@ func (c *congestionWindow) ack(sequence, nextSequence uint24, continuous bool) {
 		c.window = c.threshold + float64(c.mtu*c.mtu)/c.window
 		return
 	}
+	// Bedrock uses the block boundary for recovery state, not to gate growth.
 	c.window += float64(c.mtu*c.mtu) / c.window
 }
 
