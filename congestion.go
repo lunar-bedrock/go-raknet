@@ -47,17 +47,20 @@ func (c *congestionWindow) ack(sequence, nextSequence uint24, continuous bool) {
 	}
 	if c.window <= c.threshold || c.threshold == 0 {
 		c.window += float64(c.mtu)
-		if c.threshold != 0 && c.window > c.threshold {
-			c.window = c.threshold + float64(c.mtu*c.mtu)/c.window
+		if c.threshold == 0 || c.window <= c.threshold {
+			return
 		}
-	} else if newBlock {
-		c.window += float64(c.mtu*c.mtu) / c.window
+		c.window = c.threshold + float64(c.mtu*c.mtu)/c.window
+		return
 	}
+	c.window += float64(c.mtu*c.mtu) / c.window
 }
 
-func (c *congestionWindow) nak() {
+func (c *congestionWindow) nak(nextSequence uint24) {
 	if c.continuous && !c.backedOff {
 		c.threshold = c.window / 2
+		c.nextBlock = nextSequence
+		c.backedOff = true
 	}
 }
 

@@ -18,7 +18,7 @@ func TestCongestionWindowSlowStart(t *testing.T) {
 	}
 }
 
-func TestCongestionWindowAvoidanceAdvancesOncePerBlock(t *testing.T) {
+func TestCongestionWindowAvoidanceAdvancesPerACK(t *testing.T) {
 	c := newCongestionWindow(1200)
 	c.window = 3000
 	c.threshold = 2400
@@ -28,8 +28,46 @@ func TestCongestionWindowAvoidanceAdvancesOncePerBlock(t *testing.T) {
 		t.Fatalf("window after new block: got %f, want %f", c.window, want)
 	}
 	c.ack(2, 11, true)
+	want += 1440000 / want
 	if c.window != want {
-		t.Fatalf("window advanced twice in one block: got %f, want %f", c.window, want)
+		t.Fatalf("window after second ACK: got %f, want %f", c.window, want)
+	}
+}
+
+func TestCongestionWindowNAKMarksRecoveryBlock(t *testing.T) {
+	c := newCongestionWindow(1200)
+	c.window = 4800
+	c.continuous = true
+	c.nak(20)
+	if c.window != 4800 || c.threshold != 2400 || !c.backedOff || c.nextBlock != 20 {
+		t.Fatalf("unexpected NAK state: %+v", c)
+	}
+	c.nak(21)
+	if c.threshold != 2400 || c.nextBlock != 20 {
+		t.Fatalf("NAK backed off twice in one block: %+v", c)
+	}
+	c.resend(21)
+	if c.window != 4800 {
+		t.Fatalf("NAK recovery also applied timeout backoff: %+v", c)
+	}
+}
+
+func TestCongestionWindowCrossesThreshold(t *testing.T) {
+	c := newCongestionWindow(1000)
+	c.window = 2000
+	c.threshold = 2500
+	c.ack(1, 2, true)
+	want := 2500.0 + 1000000.0/3000.0
+	if c.window != want {
+		t.Fatalf("window after crossing threshold: got %f, want %f", c.window, want)
+	}
+}
+
+func TestCongestionWindowDoesNotGrowWhileIdle(t *testing.T) {
+	c := newCongestionWindow(1200)
+	c.ack(1, 2, false)
+	if c.window != 1200 {
+		t.Fatalf("idle window grew to %f", c.window)
 	}
 }
 

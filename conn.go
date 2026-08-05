@@ -257,7 +257,7 @@ func (conn *Conn) checkResend(now time.Time) {
 			resend = append(resend, seq)
 		}
 	}
-	_ = conn.resend(resend)
+	_ = conn.resend(resend, true)
 }
 
 // Write writes a buffer b over the RakNet connection. The amount of bytes
@@ -284,6 +284,11 @@ func (conn *Conn) writeWithReliability(b []byte, rel reliability) (n int, err er
 		}
 		conn.writeMu.Lock()
 		defer conn.writeMu.Unlock()
+		select {
+		case <-conn.ctx.Done():
+			return 0, conn.error(net.ErrClosed, "write")
+		default:
+		}
 
 		required := conn.queuedSize(b, rel)
 		if required > maxSendQueueBytes-sendQueueReserve {
@@ -291,9 +296,18 @@ func (conn *Conn) writeWithReliability(b []byte, rel reliability) (n int, err er
 		}
 		for {
 			conn.mu.Lock()
+			select {
+			case <-conn.ctx.Done():
+				conn.mu.Unlock()
+				return 0, conn.error(net.ErrClosed, "write")
+			default:
+			}
 			if conn.sendQueueBytes+required <= maxSendQueueBytes-sendQueueReserve {
 				n, err = conn.write(b, rel)
 				conn.mu.Unlock()
+				if err != nil {
+					n = 0
+				}
 				return n, conn.error(err, "write")
 			}
 			conn.mu.Unlock()
@@ -743,19 +757,21 @@ func (conn *Conn) handleNACK(b []byte) error {
 		return fmt.Errorf("read NACK: %w", err)
 	}
 	conn.congestion.continuous = len(conn.sendQueue) != 0
-	conn.congestion.nak()
-	return conn.resend(nack.packets)
+	conn.congestion.nak(conn.seq)
+	return conn.resend(nack.packets, false)
 }
 
 // resend sends all datagrams currently in the recovery queue with the sequence
 // numbers passed.
-func (conn *Conn) resend(sequenceNumbers []uint24) (err error) {
+func (conn *Conn) resend(sequenceNumbers []uint24, timedOut bool) (err error) {
 	for _, sequenceNumber := range sequenceNumbers {
 		record, ok := conn.retransmission.retransmit(sequenceNumber)
 		if !ok {
 			continue
 		}
-		conn.congestion.resend(conn.seq)
+		if timedOut {
+			conn.congestion.resend(conn.seq)
+		}
 		if err = conn.sendDatagram(record.pk, record.inFlightBytes, true, len(conn.sendQueue) != 0); err != nil {
 			return err
 		}
@@ -766,9 +782,10 @@ func (conn *Conn) resend(sequenceNumbers []uint24) (err error) {
 func (conn *Conn) drainSendQueue() error {
 	for len(conn.sendQueue) != 0 {
 		datagram := conn.sendQueue[0]
-		if datagram.pk.reliability.reliable() && conn.congestion.transmissionBandwidth(true) < datagram.wireSize {
+		if datagram.pk.reliability.reliable() && conn.congestion.transmissionBandwidth(true) < datagram.inFlightBytes {
 			return nil
 		}
+		conn.sendQueue[0] = queuedDatagram{}
 		conn.sendQueue = conn.sendQueue[1:]
 		conn.sendQueueBytes -= datagram.wireSize
 		conn.signalSendQueueFreed()
@@ -808,9 +825,7 @@ func (conn *Conn) sendDatagram(pk *packet, size uint32, retransmit, continuous b
 	if err := conn.writeTo(conn.buf.Bytes(), conn.raddr); err != nil {
 		if pk.reliability.reliable() {
 			delete(conn.retransmission.unacknowledged, seq)
-			if !retransmit {
-				conn.congestion.acknowledged(size)
-			}
+			conn.congestion.acknowledged(size)
 		}
 		pk.content = pk.content[:0]
 		packetPool.Put(pk)
