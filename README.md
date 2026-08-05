@@ -59,6 +59,20 @@ func main() {
 }
 ```
 
+### Sending behaviour
+Data passed to `Write` is placed in a send queue with a fixed size limit. If the queue is already full,
+`Write` blocks until earlier data has been sent out and space becomes available, so a fast writer is slowed
+down by backpressure instead of using unbounded memory. A single packet larger than the queue limit is
+rejected with an error.
+
+Reliable data is not put on the wire as fast as possible. The connection keeps a congestion window that
+limits how many bytes may be in flight without being acknowledged, and grows or shrinks it based on the ACKs
+and NAKs coming back from the other side. Datagrams that are reported lost, or that go unacknowledged for
+too long, are sent again using a timeout derived from the measured RTT.
+
+Protocol control messages, such as connection maintenance, are sent from a separate queue that is served
+first, so a large transfer cannot delay them.
+
 ### Documentation
 [![PkgGoDev](https://pkg.go.dev/badge/github.com/sandertv/go-raknet)](https://pkg.go.dev/github.com/sandertv/go-raknet)
 
