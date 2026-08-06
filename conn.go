@@ -194,11 +194,13 @@ func (conn *Conn) startTicking() {
 				_ = conn.send(&message.ConnectedPing{PingTime: timestamp()})
 
 				conn.mu.Lock()
-				if t.Sub(*conn.lastActivity.Load()) > time.Second*5+conn.retransmission.rtt(t)*2 {
-					// No activity for too long: Start timeout.
+				timedOut := t.Sub(*conn.lastActivity.Load()) > time.Second*5+conn.retransmission.rtt(t)*2
+				conn.mu.Unlock()
+				if timedOut {
+					// Close sends a disconnect through Write, which takes conn.mu.
+					// Do not call it while holding the same non-reentrant mutex.
 					_ = conn.Close()
 				}
-				conn.mu.Unlock()
 			}
 		case <-conn.ctx.Done():
 			return
