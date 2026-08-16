@@ -156,11 +156,13 @@ func TestReceiveSplitPacketReclaimsStalledSlots(t *testing.T) {
 		t.Fatal("a new split ID was accepted while every slot was in use")
 	}
 
-	// Age every pending reassembly past the timeout.
+	// Age every pending reassembly past the timeout, and the sweep itself past
+	// the interval that rate limits it.
 	for id, entry := range conn.splits {
 		entry.lastUpdate = entry.lastUpdate.Add(-splitTimeout)
 		conn.splits[id] = entry
 	}
+	conn.lastSplitSweep = conn.lastSplitSweep.Add(-splitSweepInterval)
 	if err := conn.receiveSplitPacket(&packet{split: true, splitCount: 2, splitID: fresh, content: []byte{0x02}}); err != nil {
 		t.Fatalf("split ID %d after the timeout: unexpected error: %v", fresh, err)
 	}
@@ -194,6 +196,36 @@ func TestReceiveSplitPacketKeepsAdvancingReassemblies(t *testing.T) {
 	}
 	if _, ok := conn.splits[0]; !ok {
 		t.Fatal("an advancing reassembly was reclaimed by the sweep")
+	}
+}
+
+// TestReceiveSplitPacketSweepRateLimited: a peer holding every slot must not be
+// able to make each fragment it sends scan the whole reassembly map.
+func TestReceiveSplitPacketSweepRateLimited(t *testing.T) {
+	conn := newSplitTestConn()
+	for id := range maxConcurrentSplits {
+		p := &packet{split: true, splitCount: 2, splitID: uint16(id), content: []byte{0x01}}
+		if err := conn.receiveSplitPacket(p); err != nil {
+			t.Fatalf("split ID %d: unexpected error: %v", id, err)
+		}
+	}
+	// The first fragment arriving at the cap sweeps; every later one within the
+	// interval must leave lastSplitSweep alone, having skipped the scan.
+	fresh := uint16(maxConcurrentSplits)
+	if err := conn.receiveSplitPacket(&packet{split: true, splitCount: 2, splitID: fresh, content: []byte{0x02}}); err != nil {
+		t.Fatalf("split ID %d: unexpected error: %v", fresh, err)
+	}
+	swept := conn.lastSplitSweep
+	if swept.IsZero() {
+		t.Fatal("the first fragment at the cap did not sweep")
+	}
+	for i := range uint16(64) {
+		if err := conn.receiveSplitPacket(&packet{split: true, splitCount: 2, splitID: fresh + 1 + i, content: []byte{0x02}}); err != nil {
+			t.Fatalf("split ID %d: unexpected error: %v", fresh+1+i, err)
+		}
+	}
+	if !conn.lastSplitSweep.Equal(swept) {
+		t.Fatal("a fragment swept again within the rate limit interval")
 	}
 }
 
