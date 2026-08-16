@@ -3,6 +3,7 @@ package raknet
 import (
 	"bytes"
 	"testing"
+	"time"
 
 	"github.com/sandertv/go-raknet/internal"
 )
@@ -11,7 +12,7 @@ import (
 // disabled), so these tests also cover dialer/client connections.
 func newSplitTestConn() *Conn {
 	return &Conn{
-		splits:  make(map[uint16][][]byte),
+		splits:  make(map[uint16]splitEntry),
 		handler: dialerConnectionHandler{},
 		packets: internal.Chan[[]byte](4, 4096),
 	}
@@ -59,7 +60,7 @@ func TestReceiveSplitPacketDuplicateFragmentIgnored(t *testing.T) {
 	if err := conn.receiveSplitPacket(&packet{split: true, splitCount: 2, splitID: 1, splitIndex: 0, content: duplicate}); err != nil {
 		t.Fatalf("duplicate split fragment: unexpected error: %v", err)
 	}
-	if got := conn.splits[1][0]; &got[0] != &original[0] {
+	if got := conn.splits[1].fragments[0]; &got[0] != &original[0] {
 		t.Fatalf("expected duplicate split fragment to be ignored, got %#v", got)
 	}
 }
@@ -133,5 +134,146 @@ func TestReceiveSplitPacketKeepsProgressAcrossLaterIDs(t *testing.T) {
 	}
 	if _, ok := conn.splits[1]; ok {
 		t.Fatal("completed reassembly was not removed")
+	}
+}
+
+// TestReceiveSplitPacketReclaimsStalledSlots: a peer that abandons reassemblies
+// must not hold every slot for the rest of the session.
+func TestReceiveSplitPacketReclaimsStalledSlots(t *testing.T) {
+	conn := newSplitTestConn()
+	for id := range maxConcurrentSplits {
+		p := &packet{split: true, splitCount: 2, splitID: uint16(id), content: []byte{0x01}}
+		if err := conn.receiveSplitPacket(p); err != nil {
+			t.Fatalf("split ID %d: unexpected error: %v", id, err)
+		}
+	}
+
+	fresh := uint16(maxConcurrentSplits)
+	if err := conn.receiveSplitPacket(&packet{split: true, splitCount: 2, splitID: fresh, content: []byte{0x02}}); err != nil {
+		t.Fatalf("split ID %d: unexpected error: %v", fresh, err)
+	}
+	if _, ok := conn.splits[fresh]; ok {
+		t.Fatal("a new split ID was accepted while every slot was in use")
+	}
+
+	// Age every pending reassembly past the timeout, and the sweep itself past
+	// the interval that rate limits it.
+	for id, entry := range conn.splits {
+		entry.lastUpdate = entry.lastUpdate.Add(-splitTimeout)
+		conn.splits[id] = entry
+	}
+	conn.lastSplitSweep = conn.lastSplitSweep.Add(-splitSweepInterval)
+	if err := conn.receiveSplitPacket(&packet{split: true, splitCount: 2, splitID: fresh, content: []byte{0x02}}); err != nil {
+		t.Fatalf("split ID %d after the timeout: unexpected error: %v", fresh, err)
+	}
+	if _, ok := conn.splits[fresh]; !ok {
+		t.Fatal("stalled reassemblies were not reclaimed after the timeout")
+	}
+}
+
+// TestReceiveSplitPacketKeepsAdvancingReassemblies: the sweep must only reclaim
+// reassemblies that have stopped advancing, not ones still receiving fragments.
+func TestReceiveSplitPacketKeepsAdvancingReassemblies(t *testing.T) {
+	conn := newSplitTestConn()
+	for id := range maxConcurrentSplits {
+		p := &packet{split: true, splitCount: 2, splitID: uint16(id), content: []byte{0x01}}
+		if err := conn.receiveSplitPacket(p); err != nil {
+			t.Fatalf("split ID %d: unexpected error: %v", id, err)
+		}
+	}
+	// Age everything, then let one reassembly advance again.
+	for id, entry := range conn.splits {
+		entry.lastUpdate = entry.lastUpdate.Add(-splitTimeout)
+		conn.splits[id] = entry
+	}
+	entry := conn.splits[0]
+	entry.lastUpdate = time.Now()
+	conn.splits[0] = entry
+
+	fresh := uint16(maxConcurrentSplits)
+	if err := conn.receiveSplitPacket(&packet{split: true, splitCount: 2, splitID: fresh, content: []byte{0x02}}); err != nil {
+		t.Fatalf("split ID %d: unexpected error: %v", fresh, err)
+	}
+	if _, ok := conn.splits[0]; !ok {
+		t.Fatal("an advancing reassembly was reclaimed by the sweep")
+	}
+}
+
+// TestReceiveSplitPacketEmptyFragment: an empty fragment must count as arrived
+// exactly once. packet.read produces a non-nil slice for a zero length payload,
+// which is what keeps the arrival count in step with the filled slots.
+func TestReceiveSplitPacketEmptyFragment(t *testing.T) {
+	conn := newSplitTestConn()
+	for _, index := range []uint32{0, 1, 1, 0} {
+		p := &packet{split: true, splitCount: 3, splitID: 7, splitIndex: index, content: make([]byte, 0)}
+		if err := conn.receiveSplitPacket(p); err != nil {
+			t.Fatalf("split index %d: unexpected error: %v", index, err)
+		}
+	}
+	entry := conn.splits[7]
+	if entry.received != 2 {
+		t.Fatalf("received = %d, want 2: a duplicate empty fragment was counted twice", entry.received)
+	}
+	if entry.fragments[0] == nil || entry.fragments[1] == nil {
+		t.Fatal("an empty fragment was counted without filling its slot")
+	}
+}
+
+// TestReceiveSplitPacketSweepRateLimited: a peer holding every slot must not be
+// able to make each fragment it sends scan the whole reassembly map.
+func TestReceiveSplitPacketSweepRateLimited(t *testing.T) {
+	conn := newSplitTestConn()
+	for id := range maxConcurrentSplits {
+		p := &packet{split: true, splitCount: 2, splitID: uint16(id), content: []byte{0x01}}
+		if err := conn.receiveSplitPacket(p); err != nil {
+			t.Fatalf("split ID %d: unexpected error: %v", id, err)
+		}
+	}
+	// The first fragment arriving at the cap sweeps; every later one within the
+	// interval must leave lastSplitSweep alone, having skipped the scan.
+	fresh := uint16(maxConcurrentSplits)
+	if err := conn.receiveSplitPacket(&packet{split: true, splitCount: 2, splitID: fresh, content: []byte{0x02}}); err != nil {
+		t.Fatalf("split ID %d: unexpected error: %v", fresh, err)
+	}
+	swept := conn.lastSplitSweep
+	if swept.IsZero() {
+		t.Fatal("the first fragment at the cap did not sweep")
+	}
+	for i := range uint16(64) {
+		if err := conn.receiveSplitPacket(&packet{split: true, splitCount: 2, splitID: fresh + 1 + i, content: []byte{0x02}}); err != nil {
+			t.Fatalf("split ID %d: unexpected error: %v", fresh+1+i, err)
+		}
+	}
+	if !conn.lastSplitSweep.Equal(swept) {
+		t.Fatal("a fragment swept again within the rate limit interval")
+	}
+}
+
+// TestReceiveSplitPacketCountMismatchDropped: a fragment whose split count
+// disagrees with the reassembly under way for that ID belongs to neither, so it
+// is dropped rather than merged into it.
+func TestReceiveSplitPacketCountMismatchDropped(t *testing.T) {
+	conn := newSplitTestConn()
+	head := []byte{0xfe, 0x01}
+	if err := conn.receiveSplitPacket(&packet{split: true, splitCount: 3, splitID: 1, splitIndex: 0, content: head}); err != nil {
+		t.Fatalf("first fragment: unexpected error: %v", err)
+	}
+
+	// In range for the existing reassembly, but from a differently sized packet.
+	rogue := &packet{split: true, splitCount: 2, splitID: 1, splitIndex: 1, content: []byte{0xff}}
+	if err := conn.receiveSplitPacket(rogue); err != nil {
+		t.Fatalf("mismatched split count: unexpected error: %v", err)
+	}
+	if got := conn.splits[1].fragments[1]; got != nil {
+		t.Fatalf("fragment from a differently sized packet was merged in: %#v", got)
+	}
+
+	// Out of range for the existing reassembly must not kill the connection.
+	rogue = &packet{split: true, splitCount: 9, splitID: 1, splitIndex: 8, content: []byte{0xff}}
+	if err := conn.receiveSplitPacket(rogue); err != nil {
+		t.Fatalf("mismatched split count out of range: unexpected error: %v", err)
+	}
+	if len(conn.splits[1].fragments) != 3 {
+		t.Fatalf("reassembly was resized: got %d fragments", len(conn.splits[1].fragments))
 	}
 }
