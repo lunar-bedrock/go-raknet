@@ -196,3 +196,32 @@ func TestReceiveSplitPacketKeepsAdvancingReassemblies(t *testing.T) {
 		t.Fatal("an advancing reassembly was reclaimed by the sweep")
 	}
 }
+
+// TestReceiveSplitPacketCountMismatchDropped: a fragment whose split count
+// disagrees with the reassembly under way for that ID belongs to neither, so it
+// is dropped rather than merged into it.
+func TestReceiveSplitPacketCountMismatchDropped(t *testing.T) {
+	conn := newSplitTestConn()
+	head := []byte{0xfe, 0x01}
+	if err := conn.receiveSplitPacket(&packet{split: true, splitCount: 3, splitID: 1, splitIndex: 0, content: head}); err != nil {
+		t.Fatalf("first fragment: unexpected error: %v", err)
+	}
+
+	// In range for the existing reassembly, but from a differently sized packet.
+	rogue := &packet{split: true, splitCount: 2, splitID: 1, splitIndex: 1, content: []byte{0xff}}
+	if err := conn.receiveSplitPacket(rogue); err != nil {
+		t.Fatalf("mismatched split count: unexpected error: %v", err)
+	}
+	if got := conn.splits[1].fragments[1]; got != nil {
+		t.Fatalf("fragment from a differently sized packet was merged in: %#v", got)
+	}
+
+	// Out of range for the existing reassembly must not kill the connection.
+	rogue = &packet{split: true, splitCount: 9, splitID: 1, splitIndex: 8, content: []byte{0xff}}
+	if err := conn.receiveSplitPacket(rogue); err != nil {
+		t.Fatalf("mismatched split count out of range: unexpected error: %v", err)
+	}
+	if len(conn.splits[1].fragments) != 3 {
+		t.Fatalf("reassembly was resized: got %d fragments", len(conn.splits[1].fragments))
+	}
+}
