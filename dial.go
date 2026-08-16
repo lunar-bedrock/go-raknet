@@ -310,7 +310,19 @@ func (dialer Dialer) clientListen(rakConn *Conn, conn net.Conn) {
 			err = rakConn.receive(b[:n])
 		}
 		if err != nil {
-			if errors.Is(err, net.ErrClosed) || errors.Is(err, os.ErrDeadlineExceeded) {
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				select {
+				case <-rakConn.connected:
+					// The handshake won the race with its dial deadline. Clear the
+					// expired deadline before resuming the established connection.
+					if err := conn.SetDeadline(time.Time{}); err == nil {
+						continue
+					}
+				default:
+				}
 				return
 			}
 			// Errors reading a packet other than the connection being
