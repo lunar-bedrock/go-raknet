@@ -120,7 +120,15 @@ func (h listenerConnectionHandler) handleOpenConnectionRequest1(b []byte, addr n
 		return fmt.Errorf("handle OPEN_CONNECTION_REQUEST_1: incompatible protocol version %v (listener protocol = %v)", pk.ClientProtocol, protocolVersion)
 	}
 
-	data, _ := (&message.OpenConnectionReply1{ServerGUID: h.l.id, Cookie: h.cookie(addr, h.cookieSalt.Load()), ServerHasSecurity: !h.l.conf.DisableCookies, MTU: mtuSize}).MarshalBinary()
+	// The request only proved the path towards us, so pad the reply to the size
+	// being granted: a peer that cannot receive it hears nothing and steps its
+	// own MTU ladder down. Grants up to safeMTUSize need no proof.
+	padded := mtuSize > safeMTUSize
+	if padded && !h.l.mtuProbes.allow(time.Now()) {
+		mtuSize, padded = safeMTUSize, false
+	}
+
+	data, _ := (&message.OpenConnectionReply1{ServerGUID: h.l.id, Cookie: h.cookie(addr, h.cookieSalt.Load()), ServerHasSecurity: !h.l.conf.DisableCookies, MTU: mtuSize, Padded: padded}).MarshalBinary()
 	_, err := h.l.conn.WriteTo(data, addr)
 	return err
 }

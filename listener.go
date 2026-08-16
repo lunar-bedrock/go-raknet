@@ -78,7 +78,42 @@ type Listener struct {
 	// it will be called if pongData is nil.
 	pongDataFunc atomic.Pointer[func(addr net.Addr) []byte]
 
+	mtuProbes mtuProbeBudget
+
 	stats listenerStats
+}
+
+// maxMTUProbesPerSecond caps how many padded OpenConnectionReply1 datagrams a
+// Listener emits each second. Legitimate joins need a handful each.
+const maxMTUProbesPerSecond = 500
+
+// mtuProbeBudget rate limits padded handshake replies. A reply is never larger
+// than the request that triggered it, so it cannot be used to amplify, but the
+// budget keeps a handshake flood from multiplying the listener's egress.
+type mtuProbeBudget struct {
+	// state packs the current unix second in the high 32 bits and the number
+	// of padded replies already sent during it in the low 32.
+	state atomic.Uint64
+}
+
+// allow reports whether another padded reply fits in this second's budget.
+func (b *mtuProbeBudget) allow(now time.Time) bool {
+	second := uint64(now.Unix())
+	for {
+		state := b.state.Load()
+		if state>>32 != second {
+			if b.state.CompareAndSwap(state, second<<32|1) {
+				return true
+			}
+			continue
+		}
+		if uint32(state) >= maxMTUProbesPerSecond {
+			return false
+		}
+		if b.state.CompareAndSwap(state, state+1) {
+			return true
+		}
+	}
 }
 
 // listenerStats holds the cumulative connection-funnel counters of a Listener.

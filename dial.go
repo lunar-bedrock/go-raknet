@@ -358,8 +358,10 @@ type connState struct {
 
 const minSupportedMTU = 576
 
-// mtuSizes is the default probe sequence used for MTU discovery.
-var mtuSizes = []uint16{maxMTUSize, minSupportedMTU}
+// mtuSizes is the default probe sequence used for MTU discovery. It matches
+// the ladder the vanilla client walks, so a path that drops the largest size
+// falls back to a usable MTU rather than straight to the minimum.
+var mtuSizes = []uint16{maxMTUSize, safeMTUSize, minSupportedMTU}
 
 // mtuSizesFor returns the MTU values to probe with when starting a
 // connection. If maxMTU is zero or already at least maxMTUSize, the unmodified
