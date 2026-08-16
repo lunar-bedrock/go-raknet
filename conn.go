@@ -130,6 +130,9 @@ type Conn struct {
 	// ackedAny records whether any ACK has been received. Until one has, ACKs
 	// are flushed without delay, as the peer's retransmission timer is unknown.
 	ackedAny atomic.Bool
+	// ackTimer wakes the send loop once a batch has been held for ackDelay, so
+	// a batch that no further traffic follows is not left until the next tick.
+	ackTimer *time.Timer
 
 	// packetQueue is an ordered queue containing packets indexed by their order
 	// index.
@@ -642,6 +645,11 @@ func (conn *Conn) receiveDatagram(b []byte) error {
 	// included in an ACK.
 	if len(conn.ackSlice) == 0 {
 		conn.oldestUnsentAck = time.Now()
+		if conn.ackTimer == nil {
+			conn.ackTimer = time.AfterFunc(ackDelay, conn.signalSend)
+		} else {
+			conn.ackTimer.Reset(ackDelay)
+		}
 	}
 	conn.ackSlice = append(conn.ackSlice, seq)
 	conn.ackMu.Unlock()

@@ -218,3 +218,34 @@ func TestQueuedSizeMatchesQueuedBytes(t *testing.T) {
 		}
 	}
 }
+
+// TestPendingACKsWakeSendLoop checks that a batch no further traffic follows is
+// still flushed after ackDelay, rather than waiting for the next tick.
+func TestPendingACKsWakeSendLoop(t *testing.T) {
+	conn, _, cancel := newSendTestConn()
+	defer cancel()
+	conn.win = newDatagramWindow()
+	conn.ackedAny.Store(true)
+
+	if err := conn.receiveDatagram([]byte{0, 0, 0}); err != nil {
+		t.Fatalf("receive datagram: %v", err)
+	}
+	// The datagram itself signals the loop; drain that so only the timer is left.
+	select {
+	case <-conn.sendSignal:
+	default:
+		t.Fatal("receiving a datagram did not signal the send loop")
+	}
+
+	select {
+	case <-conn.sendSignal:
+	case <-time.After(time.Second):
+		t.Fatal("pending ACKs were not woken within a second of being queued")
+	}
+	conn.ackMu.Lock()
+	due := conn.ackDue(time.Now())
+	conn.ackMu.Unlock()
+	if !due {
+		t.Fatal("ACKs were woken before the batching window elapsed")
+	}
+}
