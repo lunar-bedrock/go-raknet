@@ -108,9 +108,8 @@ type Conn struct {
 	once      sync.Once
 	connected chan struct{}
 
-	mu      sync.Mutex
-	writeMu sync.Mutex
-	buf     *bytes.Buffer
+	mu  sync.Mutex
+	buf *bytes.Buffer
 
 	ackBuf, nackBuf *bytes.Buffer
 
@@ -165,6 +164,8 @@ type Conn struct {
 	controlQueue   []queuedDatagram
 	sendQueue      []queuedDatagram
 	sendQueueBytes uint32
+	// sendQueueFreed is closed and replaced when the send queue frees space, so
+	// that every writer waiting on it wakes to re-check its own requirement.
 	sendQueueFreed chan struct{}
 	sendBudget     uint32
 	continuousSend bool
@@ -194,7 +195,7 @@ func newConn(conn net.PacketConn, raddr net.Addr, mtu uint16, h connectionHandle
 		packetQueue:    newPacketQueue(),
 		retransmission: newRecoveryQueue(),
 		congestion:     newCongestionWindow(mtu - 28),
-		sendQueueFreed: make(chan struct{}, 1),
+		sendQueueFreed: make(chan struct{}),
 		sendSignal:     make(chan struct{}, 1),
 		sendBudget:     uint32(mtu - 28),
 		buf:            bytes.NewBuffer(make([]byte, 0, mtu-28)), // - headers.
@@ -372,14 +373,6 @@ func (conn *Conn) writeWithReliability(b []byte, rel reliability) (n int, err er
 		if len(b) == 0 {
 			return 0, nil
 		}
-		conn.writeMu.Lock()
-		defer conn.writeMu.Unlock()
-		select {
-		case <-conn.ctx.Done():
-			return 0, conn.error(net.ErrClosed, "write")
-		default:
-		}
-
 		required := conn.queuedSize(b, rel)
 		if required > maxSendQueueBytes-sendQueueReserve {
 			return 0, conn.error(fmt.Errorf("packet requires %d bytes in the send queue", required), "write")
@@ -400,10 +393,14 @@ func (conn *Conn) writeWithReliability(b []byte, rel reliability) (n int, err er
 				}
 				return n, conn.error(err, "write")
 			}
+			// Captured under the lock that guards the check above, so a drain
+			// between here and the wait closes this channel rather than
+			// signalling into one nobody is listening on yet.
+			freed := conn.sendQueueFreed
 			conn.mu.Unlock()
 
 			select {
-			case <-conn.sendQueueFreed:
+			case <-freed:
 			case <-conn.ctx.Done():
 				return 0, conn.error(net.ErrClosed, "write")
 			}
@@ -962,6 +959,14 @@ func (conn *Conn) sendable(datagram queuedDatagram) bool {
 }
 
 func (conn *Conn) drainSendQueue() error {
+	// Wake blocked writers once for the whole drain rather than per datagram:
+	// they re-check the budget anyway, and each signal costs a channel.
+	freed := false
+	defer func() {
+		if freed {
+			conn.signalSendQueueFreed()
+		}
+	}()
 	for len(conn.controlQueue) != 0 {
 		if !conn.sendable(conn.controlQueue[0]) {
 			return nil
@@ -970,7 +975,7 @@ func (conn *Conn) drainSendQueue() error {
 		conn.controlQueue[0] = queuedDatagram{}
 		conn.controlQueue = conn.controlQueue[1:]
 		conn.sendQueueBytes -= datagram.wireSize
-		conn.signalSendQueueFreed()
+		freed = true
 		conn.consumeSendBudget(datagram.inFlightBytes)
 		if err := conn.sendDatagram(datagram.pk, datagram.inFlightBytes, false); err != nil {
 			return err
@@ -984,7 +989,7 @@ func (conn *Conn) drainSendQueue() error {
 		conn.sendQueue[0] = queuedDatagram{}
 		conn.sendQueue = conn.sendQueue[1:]
 		conn.sendQueueBytes -= datagram.wireSize
-		conn.signalSendQueueFreed()
+		freed = true
 		conn.consumeSendBudget(datagram.inFlightBytes)
 		if err := conn.sendDatagram(datagram.pk, datagram.inFlightBytes, false); err != nil {
 			return err
@@ -1001,11 +1006,12 @@ func (conn *Conn) consumeSendBudget(size uint32) {
 	conn.sendBudget -= size
 }
 
+// signalSendQueueFreed wakes every writer waiting for send queue space. It must
+// be called with conn.mu held, which is what lets a writer capture the channel
+// and release the lock without racing a drain.
 func (conn *Conn) signalSendQueueFreed() {
-	select {
-	case conn.sendQueueFreed <- struct{}{}:
-	default:
-	}
+	close(conn.sendQueueFreed)
+	conn.sendQueueFreed = make(chan struct{})
 }
 
 // signalSend wakes the connection's send loop. Signals coalesce, so callers may

@@ -146,6 +146,76 @@ func TestSendQueueBackpressure(t *testing.T) {
 	}
 }
 
+// TestSendQueueBackpressureDoesNotBlockFittingWriters: a writer waiting on a
+// packet too big for the remaining space must not hold up one that fits.
+func TestSendQueueBackpressureDoesNotBlockFittingWriters(t *testing.T) {
+	conn, _, cancel := newSendTestConn()
+	defer cancel()
+	conn.sendQueueBytes = maxSendQueueBytes - sendQueueReserve - 1024
+
+	blocked := make(chan error, 1)
+	go func() {
+		_, err := conn.Write(make([]byte, 1<<20))
+		blocked <- err
+	}()
+	select {
+	case err := <-blocked:
+		t.Fatalf("the oversized write was not blocked: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	fits := make(chan error, 1)
+	go func() {
+		_, err := conn.Write([]byte{1})
+		fits <- err
+	}()
+	select {
+	case err := <-fits:
+		if err != nil {
+			t.Fatalf("write that fits the remaining space: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("a write that fits was held up behind a blocked one")
+	}
+}
+
+// TestSendQueueBackpressureWakesEveryWriter: freeing space must wake all the
+// writers waiting on it, not just whichever one the signal happens to reach.
+func TestSendQueueBackpressureWakesEveryWriter(t *testing.T) {
+	conn, _, cancel := newSendTestConn()
+	defer cancel()
+	conn.sendQueueBytes = maxSendQueueBytes - sendQueueReserve
+
+	const writers = 4
+	done := make(chan error, writers)
+	for range writers {
+		go func() {
+			_, err := conn.Write([]byte{1})
+			done <- err
+		}()
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("a write returned before queue space was available: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	conn.mu.Lock()
+	conn.sendQueueBytes = 0
+	conn.signalSendQueueFreed()
+	conn.mu.Unlock()
+	for i := range writers {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("writer %d: %v", i, err)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("only %d of %d writers woke on a single signal", i, writers)
+		}
+	}
+}
+
 func TestSendQueueBackpressureUnblocksOnClose(t *testing.T) {
 	conn, _, cancel := newSendTestConn()
 	conn.sendQueueBytes = maxSendQueueBytes - sendQueueReserve
