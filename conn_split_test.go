@@ -1,6 +1,11 @@
 package raknet
 
-import "testing"
+import (
+	"bytes"
+	"testing"
+
+	"github.com/sandertv/go-raknet/internal"
+)
 
 // newSplitTestConn builds a minimal Conn using the dialer handler (limits
 // disabled), so these tests also cover dialer/client connections.
@@ -8,6 +13,7 @@ func newSplitTestConn() *Conn {
 	return &Conn{
 		splits:  make(map[uint16][][]byte),
 		handler: dialerConnectionHandler{},
+		packets: internal.Chan[[]byte](4, 4096),
 	}
 }
 
@@ -67,12 +73,11 @@ func TestReceiveSplitPacketIndexOutOfRange(t *testing.T) {
 	}
 }
 
-// TestReceiveSplitPacketUsesCloudburstStyleRing: pending split assemblies use a
-// Cloudburst-style ring of split IDs, so legitimate interleaving above the old
-// 16-ID cap is accepted and colliding IDs evict stale partial assemblies.
-func TestReceiveSplitPacketUsesCloudburstStyleRing(t *testing.T) {
+// TestReceiveSplitPacketCapDropsNewIDs: at the cap, a fragment starting a
+// further reassembly is dropped and pending ones are kept.
+func TestReceiveSplitPacketCapDropsNewIDs(t *testing.T) {
 	conn := newSplitTestConn()
-	for id := 0; id < maxConcurrentSplits; id++ {
+	for id := range maxConcurrentSplits {
 		p := &packet{split: true, splitCount: 2, splitID: uint16(id), content: []byte{0x01}}
 		if err := conn.receiveSplitPacket(p); err != nil {
 			t.Fatalf("split ID %d: unexpected error: %v", id, err)
@@ -82,17 +87,51 @@ func TestReceiveSplitPacketUsesCloudburstStyleRing(t *testing.T) {
 		t.Fatalf("expected %d pending split assemblies, got %d", maxConcurrentSplits, len(conn.splits))
 	}
 
-	collidingID := uint16(maxConcurrentSplits)
-	if err := conn.receiveSplitPacket(&packet{split: true, splitCount: 2, splitID: collidingID, content: []byte{0x02}}); err != nil {
-		t.Fatalf("colliding split ID %d: unexpected error: %v", collidingID, err)
+	excess := uint16(maxConcurrentSplits)
+	if err := conn.receiveSplitPacket(&packet{split: true, splitCount: 2, splitID: excess, content: []byte{0x02}}); err != nil {
+		t.Fatalf("split ID %d past the cap: unexpected error: %v", excess, err)
 	}
 	if len(conn.splits) != maxConcurrentSplits {
-		t.Fatalf("expected ring to retain %d pending split assemblies, got %d", maxConcurrentSplits, len(conn.splits))
+		t.Fatalf("expected %d pending split assemblies, got %d", maxConcurrentSplits, len(conn.splits))
 	}
-	if _, ok := conn.splits[0]; ok {
-		t.Fatal("expected split ID 0 to be evicted by ring-colliding split ID")
+	if _, ok := conn.splits[excess]; ok {
+		t.Fatalf("expected split ID %d past the cap to be dropped", excess)
 	}
-	if _, ok := conn.splits[collidingID]; !ok {
-		t.Fatalf("expected colliding split ID %d to be retained", collidingID)
+	for id := range maxConcurrentSplits {
+		if _, ok := conn.splits[uint16(id)]; !ok {
+			t.Fatalf("expected pending split ID %d to be retained", id)
+		}
+	}
+}
+
+// TestReceiveSplitPacketKeepsProgressAcrossLaterIDs: a late fragment still
+// completes its packet, however many split IDs arrived in between.
+func TestReceiveSplitPacketKeepsProgressAcrossLaterIDs(t *testing.T) {
+	conn := newSplitTestConn()
+	head := []byte{0xfe, 0x01}
+	if err := conn.receiveSplitPacket(&packet{split: true, splitCount: 2, splitID: 1, splitIndex: 0, content: head}); err != nil {
+		t.Fatalf("first fragment: unexpected error: %v", err)
+	}
+
+	// Push through more split IDs than the reassembly cap.
+	for id := 2; id < 2+maxConcurrentSplits*3; id++ {
+		p := &packet{split: true, splitCount: 2, splitID: uint16(id), splitIndex: 0, content: []byte{0xfe}}
+		if err := conn.receiveSplitPacket(p); err != nil {
+			t.Fatalf("split ID %d: unexpected error: %v", id, err)
+		}
+	}
+	if _, ok := conn.splits[1]; !ok {
+		t.Fatal("pending reassembly was discarded by later split IDs")
+	}
+
+	tail := &packet{split: true, splitCount: 2, splitID: 1, splitIndex: 1, content: []byte{0x02}}
+	if err := conn.receiveSplitPacket(tail); err != nil {
+		t.Fatalf("last fragment: unexpected error: %v", err)
+	}
+	if want := []byte{0xfe, 0x01, 0x02}; !bytes.Equal(tail.content, want) {
+		t.Fatalf("reassembled content: got %#v, want %#v", tail.content, want)
+	}
+	if _, ok := conn.splits[1]; ok {
+		t.Fatal("completed reassembly was not removed")
 	}
 }
