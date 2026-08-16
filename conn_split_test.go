@@ -199,6 +199,26 @@ func TestReceiveSplitPacketKeepsAdvancingReassemblies(t *testing.T) {
 	}
 }
 
+// TestReceiveSplitPacketEmptyFragment: an empty fragment must count as arrived
+// exactly once. packet.read produces a non-nil slice for a zero length payload,
+// which is what keeps the arrival count in step with the filled slots.
+func TestReceiveSplitPacketEmptyFragment(t *testing.T) {
+	conn := newSplitTestConn()
+	for _, index := range []uint32{0, 1, 1, 0} {
+		p := &packet{split: true, splitCount: 3, splitID: 7, splitIndex: index, content: make([]byte, 0)}
+		if err := conn.receiveSplitPacket(p); err != nil {
+			t.Fatalf("split index %d: unexpected error: %v", index, err)
+		}
+	}
+	entry := conn.splits[7]
+	if entry.received != 2 {
+		t.Fatalf("received = %d, want 2: a duplicate empty fragment was counted twice", entry.received)
+	}
+	if entry.fragments[0] == nil || entry.fragments[1] == nil {
+		t.Fatal("an empty fragment was counted without filling its slot")
+	}
+}
+
 // TestReceiveSplitPacketSweepRateLimited: a peer holding every slot must not be
 // able to make each fragment it sends scan the whole reassembly map.
 func TestReceiveSplitPacketSweepRateLimited(t *testing.T) {
