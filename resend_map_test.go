@@ -35,7 +35,7 @@ func TestRetransmissionBudgetDefendsAccountingDrift(t *testing.T) {
 		}, 100)
 	}
 	conn.mu.Lock()
-	err := conn.resend([]uint24{10, 11}, false)
+	err := conn.resend([]uint24{10, 11})
 	conn.mu.Unlock()
 	if err != nil {
 		t.Fatalf("resend: %v", err)
@@ -62,7 +62,10 @@ func TestRetransmissionExhaustsNewDataBudget(t *testing.T) {
 	conn.sendQueueBytes = 8
 
 	conn.mu.Lock()
-	err := conn.resend([]uint24{10}, false)
+	err := conn.resend([]uint24{10})
+	if err == nil {
+		err = conn.drainSendQueue()
+	}
 	conn.mu.Unlock()
 	if err != nil {
 		t.Fatalf("resend: %v", err)

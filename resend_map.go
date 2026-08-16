@@ -11,6 +11,9 @@ type resendMap struct {
 	estimatedRTT   time.Duration
 	deviationRTT   time.Duration
 	hasRTT         bool
+	// deadline is a lower bound on the earliest nextSend of any record. It lets
+	// a frequently woken send loop skip the scan when nothing is due yet.
+	deadline time.Time
 }
 
 // resendRecord represents a single packet with a timestamp from when it was
@@ -32,9 +35,23 @@ func newRecoveryQueue() *resendMap {
 // add puts a packet at the index passed and records the current time.
 func (m *resendMap) add(index uint24, pk *packet, inFlightBytes uint32) {
 	now := time.Now()
+	nextSend := now.Add(m.rto())
 	m.unacknowledged[index] = resendRecord{
-		pk: pk, inFlightBytes: inFlightBytes, timestamp: now, nextSend: now.Add(m.rto()),
+		pk: pk, inFlightBytes: inFlightBytes, timestamp: now, nextSend: nextSend,
 	}
+	m.lowerDeadline(nextSend)
+}
+
+// lowerDeadline keeps deadline a lower bound on every record's nextSend.
+func (m *resendMap) lowerDeadline(t time.Time) {
+	if m.deadline.IsZero() || t.Before(m.deadline) {
+		m.deadline = t
+	}
+}
+
+// due reports whether any record may have become eligible for retransmission.
+func (m *resendMap) due(now time.Time) bool {
+	return !m.deadline.IsZero() && !now.Before(m.deadline)
 }
 
 // acknowledge marks a packet with the index passed as acknowledged. The packet

@@ -10,16 +10,22 @@ import (
 	"time"
 )
 
+var errClosedForTest = net.ErrClosed
+
 type recordingPacketConn struct {
 	mu     sync.Mutex
 	writes [][]byte
+	err    error
 }
 
 func (c *recordingPacketConn) ReadFrom([]byte) (int, net.Addr, error) { return 0, nil, net.ErrClosed }
 func (c *recordingPacketConn) WriteTo(b []byte, _ net.Addr) (int, error) {
 	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.err != nil {
+		return 0, c.err
+	}
 	c.writes = append(c.writes, bytes.Clone(b))
-	c.mu.Unlock()
 	return len(b), nil
 }
 func (c *recordingPacketConn) Close() error                     { return nil }
@@ -39,12 +45,31 @@ func newSendTestConn() (*Conn, *recordingPacketConn, context.CancelFunc) {
 		handler:        dialerConnectionHandler{},
 		mtu:            maxMTUSize,
 		buf:            bytes.NewBuffer(make([]byte, 0, maxMTUSize-28)),
+		ackBuf:         bytes.NewBuffer(make([]byte, 0, 128)),
+		nackBuf:        bytes.NewBuffer(make([]byte, 0, 64)),
 		retransmission: newRecoveryQueue(),
 		congestion:     newCongestionWindow(maxMTUSize - 28),
 		sendQueueFreed: make(chan struct{}, 1),
+		sendSignal:     make(chan struct{}, 1),
 		sendBudget:     maxMTUSize - 28,
 	}
 	return conn, packetConn, cancel
+}
+
+// writeQueued queues b and then performs the drain that the send loop would do
+// on the signal write leaves behind.
+func writeQueued(t *testing.T, conn *Conn, b []byte, rel reliability) int {
+	t.Helper()
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	n, err := conn.write(b, rel, false)
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := conn.drainSendQueue(); err != nil {
+		t.Fatalf("drain send queue: %v", err)
+	}
+	return n
 }
 
 func TestSendQueueDrainsOnACK(t *testing.T) {
@@ -52,11 +77,8 @@ func TestSendQueueDrainsOnACK(t *testing.T) {
 	defer cancel()
 
 	payload := make([]byte, int(conn.effectiveMTU())*2)
-	conn.mu.Lock()
-	n, err := conn.write(payload, reliabilityReliableOrdered, false)
-	conn.mu.Unlock()
-	if err != nil || n != len(payload) {
-		t.Fatalf("write: n=%d err=%v", n, err)
+	if n := writeQueued(t, conn, payload, reliabilityReliableOrdered); n != len(payload) {
+		t.Fatalf("write: n=%d, want %d", n, len(payload))
 	}
 	if got := len(packetConn.writes); got != 2 {
 		t.Fatalf("initial datagrams: got %d, want 2", got)
@@ -79,7 +101,7 @@ func TestSendQueueDrainsOnACK(t *testing.T) {
 	if err := conn.handleACK(ackBuffer.Bytes()); err != nil {
 		t.Fatalf("handle ACK: %v", err)
 	}
-	conn.checkResend(time.Now())
+	conn.update(time.Now())
 	if got := len(packetConn.writes); got != 3 {
 		t.Fatalf("datagrams after ACK: got %d, want 3", got)
 	}
@@ -183,12 +205,7 @@ func TestUnreliableDatagramsConsumeSendBudget(t *testing.T) {
 	defer cancel()
 
 	payload := make([]byte, int(conn.effectiveMTU())*2)
-	conn.mu.Lock()
-	_, err := conn.write(payload, reliabilityUnreliable, false)
-	conn.mu.Unlock()
-	if err != nil {
-		t.Fatalf("write unreliable: %v", err)
-	}
+	writeQueued(t, conn, payload, reliabilityUnreliable)
 	if got := len(packetConn.writes); got != 2 {
 		t.Fatalf("initial datagrams: got %d, want 2", got)
 	}
@@ -216,11 +233,11 @@ func TestContinuousSendUsesPreviousTick(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	conn.checkResend(time.Now())
+	conn.update(time.Now())
 	if conn.congestion.continuous {
 		t.Fatal("first tick used the current queue sample")
 	}
-	conn.checkResend(time.Now())
+	conn.update(time.Now())
 	if !conn.congestion.continuous {
 		t.Fatal("second tick did not use the previous queue sample")
 	}

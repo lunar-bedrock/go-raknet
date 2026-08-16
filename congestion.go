@@ -1,5 +1,7 @@
 package raknet
 
+import "math"
+
 // congestionWindow limits reliable bytes in flight. Counts use encapsulated
 // packet sizes and exclude the 4-byte datagram header. ACKs grow the window
 // through slow start and then congestion avoidance. A NAK begins recovery by
@@ -22,7 +24,13 @@ func (c *congestionWindow) transmissionBandwidth() uint32 {
 	if float64(c.inFlight) >= c.window {
 		return 0
 	}
-	return uint32(c.window - float64(c.inFlight))
+	// Clamped because converting a float64 above math.MaxUint32 is undefined.
+	return uint32(min(c.window-float64(c.inFlight), math.MaxUint32))
+}
+
+// slowStart reports whether the window is still growing by a full MTU per ACK.
+func (c *congestionWindow) slowStart() bool {
+	return c.window <= c.threshold || c.threshold == 0
 }
 
 // sent and acknowledged maintain the invariant that inFlight equals the sum of
@@ -49,7 +57,7 @@ func (c *congestionWindow) ack(sequence, nextSequence uint24) {
 		c.backedOff = false
 		c.nextBlock = nextSequence
 	}
-	if c.window <= c.threshold || c.threshold == 0 {
+	if c.slowStart() {
 		c.window += float64(c.mtu)
 		if c.threshold == 0 || c.window <= c.threshold {
 			return

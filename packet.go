@@ -204,21 +204,32 @@ const (
 	splitAdditionalSize = 4 + 2 + 4
 )
 
-// split splits a content buffer in smaller buffers so that they do not exceed
-// the MTU size that the connection holds.
-func split(b []byte, mtu uint16) [][]byte {
-	n := len(b)
+// fragmentSize returns the payload each fragment of an n byte packet carries.
+func fragmentSize(n int, mtu uint16) int {
 	maxSize := int(mtu - packetAdditionalSize)
-
 	if n > maxSize {
 		// If the content size is bigger than the maximum size here, it means
 		// the packet will get split. This means that the packet will get even
 		// bigger because a split packet uses 4 + 2 + 4 more bytes.
 		maxSize -= splitAdditionalSize
 	}
+	return maxSize
+}
+
+// splitCount returns how many fragments an n byte packet is split into.
+func splitCount(n int, mtu uint16) int {
+	maxSize := fragmentSize(n, mtu)
 	// If the content length can't be divided by maxSize perfectly, we need
 	// to reserve another fragment for the last bit of the packet.
-	fragmentCount := n/maxSize + min(n%maxSize, 1)
+	return n/maxSize + min(n%maxSize, 1)
+}
+
+// split splits a content buffer in smaller buffers so that they do not exceed
+// the MTU size that the connection holds.
+func split(b []byte, mtu uint16) [][]byte {
+	n := len(b)
+	maxSize := fragmentSize(n, mtu)
+	fragmentCount := splitCount(n, mtu)
 	fragments := make([][]byte, fragmentCount)
 	for i := range fragmentCount - 1 {
 		fragments[i] = b[:maxSize]
