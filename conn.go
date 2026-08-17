@@ -518,25 +518,25 @@ func (conn *Conn) Context() context.Context {
 func (conn *Conn) closeImmediately() {
 	conn.once.Do(func() {
 		_ = conn.sendDisconnect()
-		conn.handler.close(conn)
 
 		conn.mu.Lock()
 		// Sends belong to the send loop, which is about to stop. Flush here so
-		// the disconnect notification still reaches the peer.
+		// the disconnect notification still reaches the peer, before the
+		// handler closes a dialer's socket. Nothing outstanding will be
+		// acknowledged now, so release it first: that opens the resend buffer
+		// for the flush.
+		conn.releaseUnacknowledged()
 		conn.sendBudget = max(conn.sendBudget, uint32(conn.effectiveMTU()))
 		_ = conn.drainSendQueue()
 		conn.mu.Unlock()
 
+		conn.handler.close(conn)
 		conn.cancelFunc()
 
 		conn.mu.Lock()
 		defer conn.mu.Unlock()
-		// Make sure to return all unacknowledged packets to the packet pool.
-		for _, record := range conn.retransmission.unacknowledged {
-			record.pk.content = record.pk.content[:0]
-			packetPool.Put(record.pk)
-		}
-		clear(conn.retransmission.unacknowledged)
+		// The flush re-added whatever it sent.
+		conn.releaseUnacknowledged()
 		for _, datagram := range conn.sendQueue {
 			datagram.pk.content = datagram.pk.content[:0]
 			packetPool.Put(datagram.pk)
@@ -550,6 +550,16 @@ func (conn *Conn) closeImmediately() {
 		conn.sendQueueBytes = 0
 		conn.signalSendQueueFreed()
 	})
+}
+
+// releaseUnacknowledged returns every packet awaiting acknowledgement to the
+// pool and forgets it. Only for a connection that is closing.
+func (conn *Conn) releaseUnacknowledged() {
+	for _, record := range conn.retransmission.unacknowledged {
+		record.pk.content = record.pk.content[:0]
+		packetPool.Put(record.pk)
+	}
+	clear(conn.retransmission.unacknowledged)
 }
 
 func (conn *Conn) sendDisconnect() error {

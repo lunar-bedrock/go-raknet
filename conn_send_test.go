@@ -8,6 +8,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/sandertv/go-raknet/internal/message"
 )
 
 var errClosedForTest = net.ErrClosed
@@ -49,7 +51,7 @@ func newSendTestConn() (*Conn, *recordingPacketConn, context.CancelFunc) {
 		nackBuf:        bytes.NewBuffer(make([]byte, 0, 64)),
 		retransmission: newRecoveryQueue(),
 		congestion:     newCongestionWindow(maxMTUSize - 28),
-		sendQueueFreed: make(chan struct{}, 1),
+		sendQueueFreed: make(chan struct{}),
 		sendSignal:     make(chan struct{}, 1),
 		sendBudget:     maxMTUSize - 28,
 	}
@@ -310,5 +312,45 @@ func TestContinuousSendUsesPreviousTick(t *testing.T) {
 	conn.update(time.Now())
 	if !conn.congestion.continuous {
 		t.Fatal("second tick did not use the previous queue sample")
+	}
+}
+
+// closingPacketConn rejects writes once closed, as a real socket does.
+type closingPacketConn struct{ recordingPacketConn }
+
+func (c *closingPacketConn) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.err = net.ErrClosed
+	return nil
+}
+
+// TestCloseImmediatelyFlushesDisconnect: a dialer's socket is closed by its
+// handler, so the queued disconnect must be flushed first, and neither a shut
+// window nor a full resend buffer may hold it back at that point.
+func TestCloseImmediatelyFlushesDisconnect(t *testing.T) {
+	for _, outstanding := range []int{0, resendBufferSize} {
+		conn, _, cancel := newSendTestConn()
+		packetConn := &closingPacketConn{}
+		conn.conn = packetConn
+		conn.sendBudget = 0
+		for i := range outstanding {
+			conn.retransmission.add(uint24(i), packetPool.Get().(*packet), 1)
+		}
+
+		conn.closeImmediately()
+		cancel()
+
+		packetConn.mu.Lock()
+		sent := false
+		for _, b := range packetConn.writes {
+			if bytes.Contains(b, []byte{message.IDDisconnectNotification}) {
+				sent = true
+			}
+		}
+		packetConn.mu.Unlock()
+		if !sent {
+			t.Fatalf("outstanding=%d: disconnect notification never reached the socket", outstanding)
+		}
 	}
 }
