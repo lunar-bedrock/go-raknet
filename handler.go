@@ -16,7 +16,6 @@ import (
 
 type connectionHandler interface {
 	handle(conn *Conn, b []byte) (handled bool, err error)
-	limitsEnabled() bool
 	close(conn *Conn)
 	log() *slog.Logger
 }
@@ -33,10 +32,6 @@ var (
 
 func (h listenerConnectionHandler) log() *slog.Logger {
 	return h.l.conf.ErrorLog
-}
-
-func (h listenerConnectionHandler) limitsEnabled() bool {
-	return true
 }
 
 func (h listenerConnectionHandler) close(conn *Conn) {
@@ -235,10 +230,6 @@ func (h dialerConnectionHandler) log() *slog.Logger {
 
 func (h dialerConnectionHandler) close(conn *Conn) {
 	_ = conn.conn.Close()
-}
-
-func (h dialerConnectionHandler) limitsEnabled() bool {
-	return false
 }
 
 func (h dialerConnectionHandler) handle(conn *Conn, b []byte) (handled bool, err error) {
