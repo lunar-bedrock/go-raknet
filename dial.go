@@ -356,9 +356,7 @@ type connState struct {
 	maxTransientErrors  int
 }
 
-// minSupportedMTU is the floor rung of the probe ladder, the classic minimum
-// IPv4 MTU. It is always below safeMTUSize, so it is offered unpadded and any
-// path can carry it.
+// minSupportedMTU is the smallest MTU probed, the classic IPv4 minimum.
 const minSupportedMTU = 576
 
 // mtuSizes is the default probe sequence used for MTU discovery. It matches
