@@ -482,13 +482,9 @@ func (conn *Conn) receiveDatagram(b []byte) error {
 	}
 	seq := loadUint24(b)
 	if conn.win.wouldOverflow(seq) {
-		// The datagram sits so far ahead that adding it would grow the receive
-		// window past maxWindowSize. Drop it before add jumps the window and
-		// missing scans and NACKs the whole gap from this one packet. The client
-		// bounds the sequence gap and drops beyond it the same way. Applied to
-		// every connection, including the dialer, which connects to untrusted
-		// servers. The datagram is not acknowledged, so a genuine far-ahead
-		// packet is retransmitted once the window has room.
+		// Too far ahead: adding it would make missing scan and NACK the whole
+		// gap. Drop it, unacknowledged, so it is retransmitted once the window
+		// has room. The client bounds the gap the same way, on every connection.
 		return nil
 	}
 	if !conn.win.add(seq) {
@@ -550,9 +546,8 @@ func (conn *Conn) receivePacket(packet *packet) error {
 		return nil
 	}
 	if conn.packetQueue.WindowSize() > maxWindowSize {
-		// An acknowledged ordered packet cannot be dropped without a gap in the
-		// stream, so an overflowing ordered window closes the connection rather
-		// than being trimmed. Bounded for every connection, the dialer included.
+		// An acknowledged ordered packet can't be dropped without a gap, so an
+		// overflowing ordered window closes the connection instead of trimming.
 		return fmt.Errorf("packet queue window size is too big (%v-%v)", conn.packetQueue.lowest, conn.packetQueue.highest)
 	}
 	for _, content := range conn.packetQueue.fetch() {

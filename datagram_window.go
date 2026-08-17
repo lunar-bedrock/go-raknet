@@ -43,10 +43,8 @@ func (win *datagramWindow) sizeWith(index uint24) uint24 {
 	return highest - win.lowest
 }
 
-// wouldOverflow reports whether adding index would grow the window past
-// maxWindowSize. A datagram that far ahead is dropped rather than added, so a
-// single sequence number cannot make missing scan and NACK the whole range
-// between the window and it.
+// wouldOverflow reports whether adding index would push the window past
+// maxWindowSize, in which case the datagram is dropped rather than added.
 func (win *datagramWindow) wouldOverflow(index uint24) bool {
 	return !win.seen(index) && win.sizeWith(index) > maxWindowSize
 }
