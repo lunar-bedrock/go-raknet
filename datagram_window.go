@@ -34,6 +34,21 @@ func (win *datagramWindow) seen(index uint24) bool {
 	return ok
 }
 
+// sizeWith returns the window size that would result from adding index.
+func (win *datagramWindow) sizeWith(index uint24) uint24 {
+	highest := win.highest
+	if index >= highest {
+		highest = index + 1
+	}
+	return highest - win.lowest
+}
+
+// wouldOverflow reports whether adding index would push the window past
+// maxWindowSize, in which case the datagram is dropped rather than added.
+func (win *datagramWindow) wouldOverflow(index uint24) bool {
+	return !win.seen(index) && win.sizeWith(index) > maxWindowSize
+}
+
 // shift attempts to delete as many indices from the queue as possible,
 // increasing the lowest index if and when possible.
 func (win *datagramWindow) shift() (n int) {
@@ -72,9 +87,4 @@ func (win *datagramWindow) missing(since time.Duration) (indices []uint24) {
 	}
 	win.shift()
 	return indices
-}
-
-// size returns the size of the datagramWindow.
-func (win *datagramWindow) size() uint24 {
-	return win.highest - win.lowest
 }
