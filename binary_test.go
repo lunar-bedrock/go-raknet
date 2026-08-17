@@ -16,3 +16,10 @@ func Test_uint24(t *testing.T) {
 		t.Fatal("read uint24 was not equal to 123456")
 	}
 }
+
+func TestUint24IncrementWraps(t *testing.T) {
+	u := uint24(0xffffff)
+	if old := u.Inc(); old != 0xffffff || u != 0 {
+		t.Fatalf("increment: old=%#x current=%#x", old, u)
+	}
+}

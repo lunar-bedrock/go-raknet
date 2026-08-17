@@ -1,0 +1,356 @@
+package raknet
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"net"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/sandertv/go-raknet/internal/message"
+)
+
+var errClosedForTest = net.ErrClosed
+
+type recordingPacketConn struct {
+	mu     sync.Mutex
+	writes [][]byte
+	err    error
+}
+
+func (c *recordingPacketConn) ReadFrom([]byte) (int, net.Addr, error) { return 0, nil, net.ErrClosed }
+func (c *recordingPacketConn) WriteTo(b []byte, _ net.Addr) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.err != nil {
+		return 0, c.err
+	}
+	c.writes = append(c.writes, bytes.Clone(b))
+	return len(b), nil
+}
+func (c *recordingPacketConn) Close() error                     { return nil }
+func (c *recordingPacketConn) LocalAddr() net.Addr              { return &net.UDPAddr{} }
+func (c *recordingPacketConn) SetDeadline(time.Time) error      { return nil }
+func (c *recordingPacketConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *recordingPacketConn) SetWriteDeadline(time.Time) error { return nil }
+
+func newSendTestConn() (*Conn, *recordingPacketConn, context.CancelFunc) {
+	packetConn := &recordingPacketConn{}
+	ctx, cancel := context.WithCancel(context.Background())
+	conn := &Conn{
+		ctx:            ctx,
+		cancelFunc:     cancel,
+		conn:           packetConn,
+		raddr:          &net.UDPAddr{},
+		handler:        dialerConnectionHandler{},
+		mtu:            maxMTUSize,
+		buf:            bytes.NewBuffer(make([]byte, 0, maxMTUSize-28)),
+		ackBuf:         bytes.NewBuffer(make([]byte, 0, 128)),
+		nackBuf:        bytes.NewBuffer(make([]byte, 0, 64)),
+		retransmission: newRecoveryQueue(),
+		congestion:     newCongestionWindow(maxMTUSize - 28),
+		sendQueueFreed: make(chan struct{}),
+		sendSignal:     make(chan struct{}, 1),
+		sendBudget:     maxMTUSize - 28,
+	}
+	return conn, packetConn, cancel
+}
+
+// writeQueued queues b and then performs the drain that the send loop would do
+// on the signal write leaves behind.
+func writeQueued(t *testing.T, conn *Conn, b []byte, rel reliability) int {
+	t.Helper()
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	n, err := conn.write(b, rel, false)
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := conn.drainSendQueue(); err != nil {
+		t.Fatalf("drain send queue: %v", err)
+	}
+	return n
+}
+
+func TestSendQueueDrainsOnACK(t *testing.T) {
+	conn, packetConn, cancel := newSendTestConn()
+	defer cancel()
+
+	payload := make([]byte, int(conn.effectiveMTU())*2)
+	if n := writeQueued(t, conn, payload, reliabilityReliableOrdered); n != len(payload) {
+		t.Fatalf("write: n=%d, want %d", n, len(payload))
+	}
+	if got := len(packetConn.writes); got != 2 {
+		t.Fatalf("initial datagrams: got %d, want 2", got)
+	}
+	if len(conn.sendQueue) != 1 {
+		t.Fatalf("queued datagrams: got %d, want 1", len(conn.sendQueue))
+	}
+	if packetConn.writes[0][0]&bitFlagContinuousSend != 0 {
+		t.Fatal("first datagram advertised continuous send")
+	}
+	if packetConn.writes[1][0]&bitFlagContinuousSend == 0 {
+		t.Fatal("second datagram did not advertise continuous send")
+	}
+	if got, want := conn.congestion.inFlight, uint32(len(packetConn.writes[0])+len(packetConn.writes[1])-8); got != want {
+		t.Fatalf("initial in-flight bytes: got %d, want %d", got, want)
+	}
+
+	ackBuffer := bytes.NewBuffer(nil)
+	(&acknowledgement{packets: []uint24{0}}).write(ackBuffer, conn.effectiveMTU())
+	if err := conn.handleACK(ackBuffer.Bytes()); err != nil {
+		t.Fatalf("handle ACK: %v", err)
+	}
+	conn.update(time.Now())
+	if got := len(packetConn.writes); got != 3 {
+		t.Fatalf("datagrams after ACK: got %d, want 3", got)
+	}
+	if packetConn.writes[2][0]&bitFlagContinuousSend != 0 {
+		t.Fatal("first datagram of the next tick advertised continuous send")
+	}
+	if len(conn.sendQueue) != 0 {
+		t.Fatalf("send queue not drained: %d datagrams remain", len(conn.sendQueue))
+	}
+	if conn.congestion.inFlight == 0 {
+		t.Fatal("in-flight bytes were not recorded for drained datagrams")
+	}
+}
+
+func TestSendQueueBackpressure(t *testing.T) {
+	conn, _, cancel := newSendTestConn()
+	defer cancel()
+	conn.sendQueueBytes = maxSendQueueBytes - sendQueueReserve
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := conn.Write([]byte{1})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("write returned before queue space was available: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	conn.mu.Lock()
+	conn.sendQueueBytes = 0
+	conn.signalSendQueueFreed()
+	conn.mu.Unlock()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("write after queue space became available: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("write remained blocked after queue space became available")
+	}
+}
+
+// TestSendQueueBackpressureDoesNotBlockFittingWriters: a writer waiting on a
+// packet too big for the remaining space must not hold up one that fits.
+func TestSendQueueBackpressureDoesNotBlockFittingWriters(t *testing.T) {
+	conn, _, cancel := newSendTestConn()
+	defer cancel()
+	conn.sendQueueBytes = maxSendQueueBytes - sendQueueReserve - 1024
+
+	blocked := make(chan error, 1)
+	go func() {
+		_, err := conn.Write(make([]byte, 1<<20))
+		blocked <- err
+	}()
+	select {
+	case err := <-blocked:
+		t.Fatalf("the oversized write was not blocked: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	fits := make(chan error, 1)
+	go func() {
+		_, err := conn.Write([]byte{1})
+		fits <- err
+	}()
+	select {
+	case err := <-fits:
+		if err != nil {
+			t.Fatalf("write that fits the remaining space: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("a write that fits was held up behind a blocked one")
+	}
+}
+
+// TestSendQueueBackpressureWakesEveryWriter: freeing space must wake all the
+// writers waiting on it, not just whichever one the signal happens to reach.
+func TestSendQueueBackpressureWakesEveryWriter(t *testing.T) {
+	conn, _, cancel := newSendTestConn()
+	defer cancel()
+	conn.sendQueueBytes = maxSendQueueBytes - sendQueueReserve
+
+	const writers = 4
+	done := make(chan error, writers)
+	for range writers {
+		go func() {
+			_, err := conn.Write([]byte{1})
+			done <- err
+		}()
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("a write returned before queue space was available: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	conn.mu.Lock()
+	conn.sendQueueBytes = 0
+	conn.signalSendQueueFreed()
+	conn.mu.Unlock()
+	for i := range writers {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("writer %d: %v", i, err)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("only %d of %d writers woke on a single signal", i, writers)
+		}
+	}
+}
+
+func TestSendQueueBackpressureUnblocksOnClose(t *testing.T) {
+	conn, _, cancel := newSendTestConn()
+	conn.sendQueueBytes = maxSendQueueBytes - sendQueueReserve
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := conn.Write([]byte{1})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("write returned before cancellation: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("write after cancellation: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("write remained blocked after cancellation")
+	}
+}
+
+func TestControlPacketWaitsForApplicationWindow(t *testing.T) {
+	conn, packetConn, cancel := newSendTestConn()
+	defer cancel()
+	conn.congestion.inFlight = uint32(conn.effectiveMTU())
+	conn.sendBudget = 0
+
+	conn.mu.Lock()
+	_, err := conn.write([]byte{1}, reliabilityReliableOrdered, false)
+	conn.mu.Unlock()
+	if err != nil {
+		t.Fatalf("queue application packet: %v", err)
+	}
+	if got := len(packetConn.writes); got != 0 {
+		t.Fatalf("application datagrams sent outside window: %d", got)
+	}
+	if err := conn.writeControl([]byte{2}, reliabilityReliableOrdered); err != nil {
+		t.Fatalf("write control packet: %v", err)
+	}
+	if got := len(packetConn.writes); got != 0 {
+		t.Fatalf("control datagrams sent outside window: %d", got)
+	}
+	if len(conn.sendQueue) != 1 {
+		t.Fatalf("application queue changed while sending control packet: %d", len(conn.sendQueue))
+	}
+	if len(conn.controlQueue) != 1 {
+		t.Fatalf("control queue: got %d, want 1", len(conn.controlQueue))
+	}
+}
+
+func TestUnreliableDatagramsConsumeSendBudget(t *testing.T) {
+	conn, packetConn, cancel := newSendTestConn()
+	defer cancel()
+
+	payload := make([]byte, int(conn.effectiveMTU())*2)
+	writeQueued(t, conn, payload, reliabilityUnreliable)
+	if got := len(packetConn.writes); got != 2 {
+		t.Fatalf("initial datagrams: got %d, want 2", got)
+	}
+	if conn.sendBudget != 0 {
+		t.Fatalf("send budget: got %d, want 0", conn.sendBudget)
+	}
+	if conn.congestion.inFlight != 0 {
+		t.Fatalf("unreliable bytes counted in flight: %d", conn.congestion.inFlight)
+	}
+	if len(conn.sendQueue) == 0 {
+		t.Fatal("unreliable tail was not queued")
+	}
+}
+
+func TestContinuousSendUsesPreviousTick(t *testing.T) {
+	conn, _, cancel := newSendTestConn()
+	defer cancel()
+	conn.congestion.inFlight = uint32(conn.effectiveMTU())
+	conn.sendBudget = 0
+
+	conn.mu.Lock()
+	_, err := conn.write([]byte{1}, reliabilityReliableOrdered, false)
+	conn.mu.Unlock()
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	conn.update(time.Now())
+	if conn.congestion.continuous {
+		t.Fatal("first tick used the current queue sample")
+	}
+	conn.update(time.Now())
+	if !conn.congestion.continuous {
+		t.Fatal("second tick did not use the previous queue sample")
+	}
+}
+
+// closingPacketConn rejects writes once closed, as a real socket does.
+type closingPacketConn struct{ recordingPacketConn }
+
+func (c *closingPacketConn) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.err = net.ErrClosed
+	return nil
+}
+
+// TestCloseImmediatelyFlushesDisconnect: a dialer's socket is closed by its
+// handler, so the queued disconnect must be flushed first, and neither a shut
+// window nor a full resend buffer may hold it back at that point.
+func TestCloseImmediatelyFlushesDisconnect(t *testing.T) {
+	for _, outstanding := range []int{0, resendBufferSize} {
+		conn, _, cancel := newSendTestConn()
+		packetConn := &closingPacketConn{}
+		conn.conn = packetConn
+		conn.sendBudget = 0
+		for i := range outstanding {
+			conn.retransmission.add(uint24(i), packetPool.Get().(*packet), 1)
+		}
+
+		conn.closeImmediately()
+		cancel()
+
+		packetConn.mu.Lock()
+		sent := false
+		for _, b := range packetConn.writes {
+			if bytes.Contains(b, []byte{message.IDDisconnectNotification}) {
+				sent = true
+			}
+		}
+		packetConn.mu.Unlock()
+		if !sent {
+			t.Fatalf("outstanding=%d: disconnect notification never reached the socket", outstanding)
+		}
+	}
+}
