@@ -25,8 +25,9 @@ const (
 
 	// minMTUSize and maxMTUSize bound the MTU value negotiated during the
 	// connection handshake. The value covers the full IP datagram including
-	// the 28-byte IP+UDP header, so usable payload is MTU-28. The bounds are
-	// the range the vanilla client clamps its own negotiated MTU to.
+	// the 28-byte IP+UDP header, so usable payload is MTU-28. 1492 is the top
+	// of the vanilla MTU ladder and the largest grant a vanilla server makes;
+	// 400 is RakNet's classic minimum.
 	minMTUSize = 400
 	maxMTUSize = 1492
 	// safeMTUSize is the largest MTU handed out without first proving the

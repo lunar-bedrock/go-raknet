@@ -2,7 +2,9 @@ package raknet
 
 import (
 	"bytes"
+	"context"
 	"net"
+	"net/netip"
 	"slices"
 	"testing"
 	"time"
@@ -298,5 +300,144 @@ func TestHandshakeStepsDownWhenReplyDropped(t *testing.T) {
 	}
 	if !bytes.Equal(got, payload) {
 		t.Fatalf("read %v bytes, want %v", len(got), len(payload))
+	}
+}
+
+// TestProvenMTU checks a grant above safeMTUSize only survives when the reply
+// datagram itself was padded to the granted size.
+func TestProvenMTU(t *testing.T) {
+	for _, test := range []struct {
+		mtu  uint16
+		n    int
+		want uint16
+	}{
+		{mtu: maxMTUSize, n: int(maxMTUSize) - 28, want: maxMTUSize},
+		{mtu: maxMTUSize, n: int(maxMTUSize), want: maxMTUSize},
+		{mtu: maxMTUSize, n: 32, want: safeMTUSize},
+		{mtu: 1400, n: 1372, want: 1400},
+		{mtu: 1400, n: 1371, want: safeMTUSize},
+		{mtu: safeMTUSize, n: 32, want: safeMTUSize},
+		{mtu: minSupportedMTU, n: 32, want: minSupportedMTU},
+	} {
+		if got := provenMTU(test.mtu, test.n); got != test.want {
+			t.Fatalf("provenMTU(%v, %v): got %v, want %v", test.mtu, test.n, got, test.want)
+		}
+	}
+}
+
+// stripPaddingListener removes the padding from outgoing OpenConnectionReply1
+// datagrams, emulating a vanilla server that grants a large MTU unpadded.
+type stripPaddingListener struct{}
+
+func (stripPaddingListener) ListenPacket(network, address string) (net.PacketConn, error) {
+	conn, err := net.ListenPacket(network, address)
+	if err != nil {
+		return nil, err
+	}
+	return stripPaddingConn{PacketConn: conn}, nil
+}
+
+type stripPaddingConn struct{ net.PacketConn }
+
+func (c stripPaddingConn) WriteTo(b []byte, addr net.Addr) (int, error) {
+	if len(b) > 32 && b[0] == message.IDOpenConnectionReply1 {
+		n := 28
+		if b[25] != 0 {
+			n += 4
+		}
+		b = b[:n]
+	}
+	return c.PacketConn.WriteTo(b, addr)
+}
+
+// TestHandshakeClampsUnprovenGrant checks the dialer only commits an MTU above
+// safeMTUSize when the reply proves the path towards us carries it, so a path
+// that drops large datagrams in that direction cannot end up on one.
+func TestHandshakeClampsUnprovenGrant(t *testing.T) {
+	l, err := ListenConfig{UpstreamPacketListener: stripPaddingListener{}}.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+
+	client, server := dialListener(t, l)
+	if client.mtu != safeMTUSize || server.mtu != safeMTUSize {
+		t.Fatalf("negotiated MTU: client %v, server %v, want %v", client.mtu, server.mtu, safeMTUSize)
+	}
+}
+
+// TestOpenConnectionCapsReply2 checks the final reply cannot raise the MTU
+// past the committed value, nor wipe it with a nonsense grant.
+func TestOpenConnectionCapsReply2(t *testing.T) {
+	for _, grant := range []uint16{maxMTUSize, 0} {
+		server, err := net.ListenPacket("udp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer server.Close()
+		go func() {
+			b := make([]byte, 2048)
+			_, addr, err := server.ReadFrom(b)
+			if err != nil {
+				return
+			}
+			data, _ := (&message.OpenConnectionReply2{ServerGUID: 1, ClientAddress: netip.MustParseAddrPort("127.0.0.1:1"), MTU: grant}).MarshalBinary()
+			_, _ = server.WriteTo(data, addr)
+		}()
+
+		conn, err := net.Dial("udp", server.LocalAddr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+		state := &connState{conn: conn, raddr: conn.RemoteAddr(), mtu: safeMTUSize}
+		err = state.openConnection(ctx)
+		cancel()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state.mtu != safeMTUSize {
+			t.Fatalf("reply granting %v: committed MTU %v, want %v", grant, state.mtu, safeMTUSize)
+		}
+	}
+}
+
+// TestListenerFloorsNonsenseRequest2 checks a crafted zero-MTU request cannot
+// produce a connection defaulting to the unproven maximum.
+func TestListenerFloorsNonsenseRequest2(t *testing.T) {
+	l, err := ListenConfig{DisableCookies: true}.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+
+	conn, err := net.Dial("udp", l.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	req, _ := (&message.OpenConnectionRequest2{ServerAddress: netip.MustParseAddrPort("127.0.0.1:1"), MTU: 0, ClientGUID: -1}).MarshalBinary()
+	if _, err := conn.Write(req); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second * 5))
+
+	b := make([]byte, 2048)
+	n, err := conn.Read(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n == 0 || b[0] != message.IDOpenConnectionReply2 {
+		t.Fatalf("expected OPEN_CONNECTION_REPLY_2, got id %x", b[0])
+	}
+	pk := &message.OpenConnectionReply2{}
+	if err := pk.UnmarshalBinary(b[1:n]); err != nil {
+		t.Fatal(err)
+	}
+	if pk.MTU != minMTUSize {
+		t.Fatalf("granted MTU: got %v, want %v", pk.MTU, minMTUSize)
 	}
 }

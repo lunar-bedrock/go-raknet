@@ -150,7 +150,9 @@ func (h listenerConnectionHandler) handleOpenConnectionRequest2(b []byte, addr n
 		return fmt.Errorf("handle OPEN_CONNECTION_REQUEST_2: invalid ClientGUID '%d', expected negative", pk.ClientGUID)
 	}
 
-	mtuSize := min(pk.MTU, h.l.maxMTU())
+	// Floor the grant: newConn treats an MTU of 0 as unset and would default a
+	// nonsense request to the unproven maximum.
+	mtuSize := max(min(pk.MTU, h.l.maxMTU()), minMTUSize)
 
 	data, _ := (&message.OpenConnectionReply2{ServerGUID: h.l.id, ClientAddress: resolve(addr), MTU: mtuSize}).MarshalBinary()
 	if _, err := h.l.conn.WriteTo(data, addr); err != nil {
