@@ -356,10 +356,24 @@ type connState struct {
 	maxTransientErrors  int
 }
 
+// minSupportedMTU is the smallest MTU probed, the classic IPv4 minimum.
 const minSupportedMTU = 576
 
-// mtuSizes is the default probe sequence used for MTU discovery.
-var mtuSizes = []uint16{maxMTUSize, minSupportedMTU}
+// mtuSizes is the default probe sequence used for MTU discovery. It matches
+// the ladder the vanilla client walks, so a path that drops the largest size
+// falls back to a usable MTU rather than straight to the minimum.
+var mtuSizes = []uint16{maxMTUSize, safeMTUSize, minSupportedMTU}
+
+// provenMTU returns the MTU to commit from a reply granting mtu carried by a
+// datagram of n bytes. A grant above safeMTUSize counts only when the reply
+// itself filled the granted size, proving the path towards us carries it;
+// vanilla servers never pad, so their larger grants land on safeMTUSize.
+func provenMTU(mtu uint16, n int) uint16 {
+	if mtu > safeMTUSize && n < int(mtu)-28 {
+		return safeMTUSize
+	}
+	return mtu
+}
 
 // mtuSizesFor returns the MTU values to probe with when starting a
 // connection. If maxMTU is zero or already at least maxMTUSize, the unmodified
@@ -419,7 +433,7 @@ func (state *connState) discoverMTU(ctx context.Context) error {
 				state.openConnectionRequest2(response.MTU, state.serverSecurity, state.cookie)
 				continue
 			}
-			state.mtu = response.MTU
+			state.mtu = provenMTU(response.MTU, n)
 			return nil
 		case message.IDIncompatibleProtocolVersion:
 			response := &message.IncompatibleProtocolVersion{}
@@ -431,8 +445,9 @@ func (state *connState) discoverMTU(ctx context.Context) error {
 	}
 }
 
-// request1 sends a message.OpenConnectionRequest1 three times for each mtu
-// size passed, spaced by 500ms.
+// request1 sends a message.OpenConnectionRequest1 four times for each mtu size
+// passed, spaced by 500ms, matching the vanilla client's connection-attempt
+// cadence (12 attempts across the 3 rungs, one every 500ms).
 func (state *connState) request1(ctx context.Context, sizes []uint16) {
 	state.ticker.Reset(time.Second / 2)
 	for _, size := range sizes {
@@ -482,7 +497,7 @@ func (state *connState) openConnection(ctx context.Context) error {
 			if pk.ServerGUID == 0 || pk.MTU < minMTUSize || pk.MTU > 1500 {
 				continue
 			}
-			state.serverSecurity, state.cookie, state.mtu = pk.ServerHasSecurity, pk.Cookie, pk.MTU
+			state.serverSecurity, state.cookie, state.mtu = pk.ServerHasSecurity, pk.Cookie, provenMTU(pk.MTU, n)
 			cancelRequests()
 			requestCtx, cancelRequests = context.WithCancel(ctx)
 			go state.request2(requestCtx, state.mtu, state.serverSecurity, state.cookie)
@@ -491,7 +506,10 @@ func (state *connState) openConnection(ctx context.Context) error {
 			if err = pk.UnmarshalBinary(b[1:n]); err != nil {
 				return fmt.Errorf("read open connection reply 2: %w", err)
 			}
-			state.mtu = pk.MTU
+			if pk.MTU >= minMTUSize {
+				// A reply may lower the MTU, never raise it past what was proven.
+				state.mtu = min(state.mtu, pk.MTU)
+			}
 			return nil
 		}
 	}

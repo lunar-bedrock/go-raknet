@@ -120,7 +120,15 @@ func (h listenerConnectionHandler) handleOpenConnectionRequest1(b []byte, addr n
 		return fmt.Errorf("handle OPEN_CONNECTION_REQUEST_1: incompatible protocol version %v (listener protocol = %v)", pk.ClientProtocol, protocolVersion)
 	}
 
-	data, _ := (&message.OpenConnectionReply1{ServerGUID: h.l.id, Cookie: h.cookie(addr, h.cookieSalt.Load()), ServerHasSecurity: !h.l.conf.DisableCookies, MTU: mtuSize}).MarshalBinary()
+	// The request only proved the path towards us, so pad the reply to the size
+	// being granted: a peer that cannot receive it hears nothing and steps its
+	// own MTU ladder down. Grants up to safeMTUSize need no proof.
+	padded := mtuSize > safeMTUSize
+	if padded && !h.l.mtuProbes.allow(time.Now()) {
+		mtuSize, padded = safeMTUSize, false
+	}
+
+	data, _ := (&message.OpenConnectionReply1{ServerGUID: h.l.id, Cookie: h.cookie(addr, h.cookieSalt.Load()), ServerHasSecurity: !h.l.conf.DisableCookies, MTU: mtuSize, Padded: padded}).MarshalBinary()
 	_, err := h.l.conn.WriteTo(data, addr)
 	return err
 }
@@ -142,7 +150,9 @@ func (h listenerConnectionHandler) handleOpenConnectionRequest2(b []byte, addr n
 		return fmt.Errorf("handle OPEN_CONNECTION_REQUEST_2: invalid ClientGUID '%d', expected negative", pk.ClientGUID)
 	}
 
-	mtuSize := min(pk.MTU, h.l.maxMTU())
+	// Floor the grant: newConn treats an MTU of 0 as unset and would default a
+	// nonsense request to the unproven maximum.
+	mtuSize := max(min(pk.MTU, h.l.maxMTU()), minMTUSize)
 
 	data, _ := (&message.OpenConnectionReply2{ServerGUID: h.l.id, ClientAddress: resolve(addr), MTU: mtuSize}).MarshalBinary()
 	if _, err := h.l.conn.WriteTo(data, addr); err != nil {

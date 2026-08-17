@@ -10,6 +10,9 @@ type OpenConnectionReply1 struct {
 	ServerHasSecurity bool
 	Cookie            uint32
 	MTU               uint16
+	// Padded zero-pads the packet so the datagram carrying it is exactly MTU
+	// bytes long, mirroring OpenConnectionRequest1 in the other direction.
+	Padded bool
 }
 
 func (pk *OpenConnectionReply1) UnmarshalBinary(data []byte) error {
@@ -33,7 +36,12 @@ func (pk *OpenConnectionReply1) MarshalBinary() (data []byte, err error) {
 	if pk.ServerHasSecurity {
 		offset = 4
 	}
-	b := make([]byte, 28+offset)
+	n := 28 + offset
+	if pk.Padded {
+		// MTU covers the 20-byte IP and 8-byte UDP headers too.
+		n = max(n, int(pk.MTU)-20-8)
+	}
+	b := make([]byte, n)
 	b[0] = IDOpenConnectionReply1
 	copy(b[1:], unconnectedMessageSequence[:])
 	binary.BigEndian.PutUint64(b[17:], uint64(pk.ServerGUID))

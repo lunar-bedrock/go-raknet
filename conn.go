@@ -25,14 +25,18 @@ const (
 
 	// minMTUSize and maxMTUSize bound the MTU value negotiated during the
 	// connection handshake. The value covers the full IP datagram including
-	// the 28-byte IP+UDP header, so usable payload is MTU-28. The cap is set
-	// to the QUIC initial-packet size (RFC 9000 §14) — empirically safe on
-	// >99% of paths globally, including cellular carriers with asymmetric
-	// downstream MTU (T-Mobile GTP tunnels etc.) where larger sizes are
-	// silently dropped on the server→client path even after a successful
-	// upstream MTU probe.
-	minMTUSize    = 400
-	maxMTUSize    = 1200
+	// the 28-byte IP+UDP header, so usable payload is MTU-28. 1492 is the top
+	// of the vanilla MTU ladder and the largest grant a vanilla server makes;
+	// 400 is RakNet's classic minimum.
+	minMTUSize = 400
+	maxMTUSize = 1492
+	// safeMTUSize is the largest MTU handed out without first proving the
+	// path back to the peer carries it. It is the middle rung of the vanilla
+	// client's MTU ladder and the QUIC initial-packet size (RFC 9000 §14),
+	// which survives effectively every path, including cellular carriers with
+	// an asymmetric downstream MTU (T-Mobile GTP tunnels and similar).
+	safeMTUSize = 1200
+
 	maxWindowSize = 2048
 
 	// Caps on peer-controlled split reassembly, bounding memory per connection.
