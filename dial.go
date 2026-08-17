@@ -433,8 +433,9 @@ func (state *connState) discoverMTU(ctx context.Context) error {
 	}
 }
 
-// request1 sends a message.OpenConnectionRequest1 three times for each mtu
-// size passed, spaced by 500ms.
+// request1 sends a message.OpenConnectionRequest1 four times for each mtu size
+// passed, spaced by 500ms, matching the vanilla client's connection-attempt
+// cadence (12 attempts across the 3 rungs, one every 500ms).
 func (state *connState) request1(ctx context.Context, sizes []uint16) {
 	state.ticker.Reset(time.Second / 2)
 	for _, size := range sizes {
