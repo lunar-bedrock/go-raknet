@@ -664,16 +664,14 @@ func (conn *Conn) receiveDatagram(b []byte) error {
 	}
 	seq := loadUint24(b)
 	if conn.win.wouldOverflow(seq) {
-		// Too far ahead: adding it would make missing scan and NACK the whole
-		// gap. Drop it, unacknowledged, so it is retransmitted once the window
+		// Too far ahead: NACKing the gap would report thousands of datagrams at
+		// once. Drop it, unacknowledged, so it is retransmitted once the window
 		// has room. The client bounds the gap the same way, on every connection.
 		return nil
 	}
-	if !conn.win.add(seq) {
-		// Datagram was already received, this might happen if a packet took a
-		// long time to arrive, and we already sent a NACK for it. This is
-		// expected to happen sometimes under normal circumstances, so no reason
-		// to return an error.
+	ok, skipped := conn.win.add(seq)
+	if !ok {
+		// A duplicate of a datagram still in the window. Not an error.
 		return nil
 	}
 	conn.ackMu.Lock()
@@ -691,16 +689,15 @@ func (conn *Conn) receiveDatagram(b []byte) error {
 	conn.ackMu.Unlock()
 	conn.signalSend()
 
-	if conn.win.shift() == 0 {
-		// Datagram window couldn't be shifted up, so we're still missing
-		// packets.
-		rtt := time.Duration(conn.rtt.Load())
-		if missing := conn.win.missing(rtt + rtt/2); len(missing) > 0 {
-			if err := conn.sendNACK(missing); err != nil {
-				return fmt.Errorf("receive datagram: send NACK: %w", err)
-			}
+	if len(skipped) > 0 {
+		// NACK the gap immediately, as the client does. Waiting instead loses
+		// the race against the sender's retransmission timeout, which cuts its
+		// congestion window to one MTU for a loss a NACK recovers without.
+		if err := conn.sendNACK(skipped); err != nil {
+			return fmt.Errorf("receive datagram: send NACK: %w", err)
 		}
 	}
+	conn.win.shift()
 	return conn.handleDatagram(b[3:])
 }
 

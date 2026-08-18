@@ -49,8 +49,8 @@ func TestDatagramWindowWouldOverflow(t *testing.T) {
 }
 
 // TestReceiveDatagramDropsFarAhead is the regression guard: one far-ahead
-// datagram must be dropped before add jumps the window and missing scans and
-// NACKs the entire range between the window and it.
+// datagram must be dropped before add jumps the window and marks and NACKs the
+// entire range between the window and it.
 func TestReceiveDatagramDropsFarAhead(t *testing.T) {
 	conn := &Conn{win: newDatagramWindow()}
 	if err := conn.receiveDatagram(datagram(1 << 23)); err != nil {
@@ -60,7 +60,7 @@ func TestReceiveDatagramDropsFarAhead(t *testing.T) {
 		t.Fatalf("window jumped to %d: add ran on a far-ahead datagram", conn.win.highest)
 	}
 	if len(conn.win.queue) != 0 {
-		t.Fatalf("queue holds %d entries: missing materialised the range", len(conn.win.queue))
+		t.Fatalf("queue holds %d entries: add materialised the range", len(conn.win.queue))
 	}
 }
 
@@ -77,5 +77,39 @@ func TestReceivePacketBoundsOrderedWindow(t *testing.T) {
 	}
 	if err := conn.receivePacket(pk); err == nil {
 		t.Fatal("an ordered window past maxWindowSize was accepted on a dialer connection")
+	}
+}
+
+// TestDatagramWindowNACKsGapOnArrival: a gap is reported the moment the
+// datagram that jumped it arrives, and only once. A delayed report loses the
+// race against the sender's retransmission timeout.
+func TestDatagramWindowNACKsGapOnArrival(t *testing.T) {
+	win := newDatagramWindow()
+	if ok, skipped := win.add(0); !ok || len(skipped) != 0 {
+		t.Fatalf("add(0) = %v, %v", ok, skipped)
+	}
+	ok, skipped := win.add(4)
+	if !ok || len(skipped) != 3 || skipped[0] != 1 || skipped[2] != 3 {
+		t.Fatalf("add(4) skipped = %v, want [1 2 3]", skipped)
+	}
+	// The gap was marked, so a following datagram reports nothing new.
+	if _, skipped := win.add(5); len(skipped) != 0 {
+		t.Fatalf("add(5) reported an old gap again: %v", skipped)
+	}
+	// A marked index that arrives late was only reordered: it is processed,
+	// and only a second arrival is a duplicate.
+	if ok, skipped := win.add(2); !ok || len(skipped) != 0 {
+		t.Fatalf("late arrival of a marked index: add(2) = %v, %v", ok, skipped)
+	}
+	if ok, _ := win.add(2); ok {
+		t.Fatal("a received index was accepted again")
+	}
+	if win.shift(); win.lowest != 6 {
+		t.Fatalf("lowest = %d after shift, want 6", win.lowest)
+	}
+	// Below the window there is no duplicate detection by datagram: a
+	// reordered datagram whose gap was already shifted past is processed.
+	if ok, skipped := win.add(3); !ok || len(skipped) != 0 {
+		t.Fatalf("below-window arrival: add(3) = %v, %v", ok, skipped)
 	}
 }

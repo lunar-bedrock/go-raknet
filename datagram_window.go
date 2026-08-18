@@ -15,14 +15,35 @@ func newDatagramWindow() *datagramWindow {
 	return &datagramWindow{queue: make(map[uint24]time.Time)}
 }
 
-// add puts an index in the window.
-func (win *datagramWindow) add(index uint24) bool {
-	if win.seen(index) {
-		return false
+// add puts an index in the window. It returns false if the index was already
+// seen. skipped holds the indices the peer jumped over to reach index, each
+// marked so it is reported missing only once: the client NACKs a gap the
+// moment it appears and afterwards relies on the sender's retransmission
+// timeout, never on a repeat NACK.
+func (win *datagramWindow) add(index uint24) (ok bool, skipped []uint24) {
+	if index < win.lowest {
+		// Below the window: a wire duplicate, or a reordered datagram whose
+		// gap was already reported and shifted past. The client has no
+		// duplicate detection by datagram at all, so it is processed rather
+		// than confused with one already handled; ordered delivery drops any
+		// true repeat further up.
+		return true, nil
+	}
+	if t, present := win.queue[index]; present {
+		if !t.IsZero() {
+			return false, nil
+		}
+		// Reported missing, but it was only reordered and has arrived after all.
+		win.queue[index] = time.Now()
+		return true, nil
+	}
+	for i := win.highest; i < index; i++ {
+		skipped = append(skipped, i)
+		win.queue[i] = time.Time{}
 	}
 	win.highest = max(win.highest, index+1)
 	win.queue[index] = time.Now()
-	return true
+	return true, skipped
 }
 
 // seen checks if the index passed is known to the datagramWindow.
@@ -62,29 +83,4 @@ func (win *datagramWindow) shift() (n int) {
 	}
 	win.lowest = index
 	return n
-}
-
-// missing returns a slice of all indices in the datagram queue that weren't
-// set using add while within the window of lowest and highest index. The queue
-// is shifted after this call.
-func (win *datagramWindow) missing(since time.Duration) (indices []uint24) {
-	missing := false
-	for index := int(win.highest) - 1; index >= int(win.lowest); index-- {
-		i := uint24(index)
-		t, ok := win.queue[i]
-		if ok {
-			if time.Since(t) >= since {
-				// All packets before this one took too long to arrive, so we
-				// mark them as missing.
-				missing = true
-			}
-			continue
-		}
-		if missing {
-			indices = append(indices, i)
-			win.queue[i] = time.Time{}
-		}
-	}
-	win.shift()
-	return indices
 }
