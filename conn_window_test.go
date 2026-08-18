@@ -81,8 +81,7 @@ func TestReceivePacketBoundsOrderedWindow(t *testing.T) {
 }
 
 // TestDatagramWindowNACKsGapOnArrival: a gap is reported the moment the
-// datagram that jumped it arrives, and only once. A delayed report loses the
-// race against the sender's retransmission timeout.
+// datagram that jumped it arrives, and only once.
 func TestDatagramWindowNACKsGapOnArrival(t *testing.T) {
 	win := newDatagramWindow()
 	if ok, skipped := win.add(0); !ok || len(skipped) != 0 {
@@ -96,8 +95,7 @@ func TestDatagramWindowNACKsGapOnArrival(t *testing.T) {
 	if _, skipped := win.add(5); len(skipped) != 0 {
 		t.Fatalf("add(5) reported an old gap again: %v", skipped)
 	}
-	// A marked index that arrives late was only reordered: it is processed,
-	// and only a second arrival is a duplicate.
+	// A marked index arriving late was only reordered: processed, not a duplicate.
 	if ok, skipped := win.add(2); !ok || len(skipped) != 0 {
 		t.Fatalf("late arrival of a marked index: add(2) = %v, %v", ok, skipped)
 	}
@@ -107,8 +105,7 @@ func TestDatagramWindowNACKsGapOnArrival(t *testing.T) {
 	if win.shift(); win.lowest != 6 {
 		t.Fatalf("lowest = %d after shift, want 6", win.lowest)
 	}
-	// Below the window there is no duplicate detection by datagram: a
-	// reordered datagram whose gap was already shifted past is processed.
+	// No duplicate detection by datagram below the window: still processed.
 	if ok, skipped := win.add(3); !ok || len(skipped) != 0 {
 		t.Fatalf("below-window arrival: add(3) = %v, %v", ok, skipped)
 	}

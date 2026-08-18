@@ -690,9 +690,8 @@ func (conn *Conn) receiveDatagram(b []byte) error {
 	conn.signalSend()
 
 	if len(skipped) > 0 {
-		// NACK the gap immediately, as the client does. Waiting instead loses
-		// the race against the sender's retransmission timeout, which cuts its
-		// congestion window to one MTU for a loss a NACK recovers without.
+		// NACK the gap immediately, as the client does: a delayed report loses the
+		// race against the sender's RTO, which cuts the window for a recoverable loss.
 		if err := conn.sendNACK(skipped); err != nil {
 			return fmt.Errorf("receive datagram: send NACK: %w", err)
 		}

@@ -15,18 +15,12 @@ func newDatagramWindow() *datagramWindow {
 	return &datagramWindow{queue: make(map[uint24]time.Time)}
 }
 
-// add puts an index in the window. It returns false if the index was already
-// seen. skipped holds the indices the peer jumped over to reach index, each
-// marked so it is reported missing only once: the client NACKs a gap the
-// moment it appears and afterwards relies on the sender's retransmission
-// timeout, never on a repeat NACK.
+// add puts an index in the window. skipped holds the indices the peer jumped
+// over, each marked so a gap is NACKed once, when it appears, as the client does.
 func (win *datagramWindow) add(index uint24) (ok bool, skipped []uint24) {
 	if index < win.lowest {
-		// Below the window: a wire duplicate, or a reordered datagram whose
-		// gap was already reported and shifted past. The client has no
-		// duplicate detection by datagram at all, so it is processed rather
-		// than confused with one already handled; ordered delivery drops any
-		// true repeat further up.
+		// Wire duplicate or reordered past the window. The client has no duplicate
+		// detection by datagram, so process it; ordered delivery drops true repeats.
 		return true, nil
 	}
 	if t, present := win.queue[index]; present {
