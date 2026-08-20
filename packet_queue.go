@@ -13,16 +13,17 @@ func newPacketQueue() *packetQueue {
 }
 
 // put puts a value at the index passed. If the index was already occupied
-// once, false is returned.
+// once, false is returned. Indices wrap in 24-bit space.
 func (queue *packetQueue) put(index uint24, packet []byte) bool {
-	if index < queue.lowest {
+	if sequenceGreaterThan(queue.lowest, index) {
+		// Behind the window: the index was fetched already.
 		return false
 	}
 	if _, ok := queue.queue[index]; ok {
 		return false
 	}
-	if index >= queue.highest {
-		queue.highest = index + 1
+	if next := (index + 1) & 0xffffff; sequenceGreaterThan(next, queue.highest) {
+		queue.highest = next
 	}
 	queue.queue[index] = packet
 	return true
@@ -33,14 +34,14 @@ func (queue *packetQueue) put(index uint24, packet []byte) bool {
 // returns all values that it did find and takes them out.
 func (queue *packetQueue) fetch() (packets [][]byte) {
 	index := queue.lowest
-	for index < queue.highest {
+	for index != queue.highest {
 		packet, ok := queue.queue[index]
 		if !ok {
 			break
 		}
 		delete(queue.queue, index)
 		packets = append(packets, packet)
-		index++
+		index = (index + 1) & 0xffffff
 	}
 	queue.lowest = index
 	return
@@ -48,5 +49,5 @@ func (queue *packetQueue) fetch() (packets [][]byte) {
 
 // WindowSize returns the size of the window held by the packet queue.
 func (queue *packetQueue) WindowSize() uint24 {
-	return queue.highest - queue.lowest
+	return (queue.highest - queue.lowest) & 0xffffff
 }

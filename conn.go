@@ -37,6 +37,8 @@ const (
 	// an asymmetric downstream MTU (T-Mobile GTP tunnels and similar).
 	safeMTUSize = 1200
 
+	// maxWindowSize bounds the ordered packet queue, whose entries cannot be
+	// dropped without a delivery gap; overflowing it closes the connection.
 	maxWindowSize = 2048
 
 	// Caps on peer-controlled split reassembly, bounding memory per connection.
@@ -54,8 +56,8 @@ const (
 	// splitTimeout is how long a reassembly may go without a new fragment
 	// before its slot may be reclaimed. The client uses its connection timeout.
 	splitTimeout = time.Second * 10
-	// splitSweepInterval bounds how often arriving at the cap may sweep, so a
-	// peer cannot make every fragment it sends scan the whole reassembly map.
+	// splitSweepInterval bounds how often inbound traffic may sweep, so a peer
+	// cannot make every datagram it sends scan the whole reassembly map.
 	splitSweepInterval = time.Second
 
 	// Bound queued application data so a stalled path cannot grow memory forever.
@@ -643,6 +645,12 @@ var packetPool = sync.Pool{New: func() any { return &packet{reliability: reliabi
 func (conn *Conn) receive(b []byte) error {
 	t := time.Now()
 	conn.lastActivity.Store(&t)
+	if len(conn.splits) != 0 && t.Sub(conn.lastSplitSweep) >= splitSweepInterval {
+		// Reclaim reassemblies that stopped advancing, so an abandoned set
+		// cannot hold its slots and memory for the rest of the session.
+		conn.lastSplitSweep = t
+		conn.evictExpiredSplits(t)
+	}
 
 	switch {
 	case b[0]&bitFlagACK != 0:
@@ -663,15 +671,11 @@ func (conn *Conn) receiveDatagram(b []byte) error {
 		return fmt.Errorf("read datagram: %w", io.ErrUnexpectedEOF)
 	}
 	seq := loadUint24(b)
-	if conn.win.wouldOverflow(seq) {
-		// Too far ahead: NACKing the gap would report thousands of datagrams at
-		// once. Drop it, unacknowledged, so it is retransmitted once the window
-		// has room. The client bounds the gap the same way, on every connection.
-		return nil
-	}
 	ok, skipped := conn.win.add(seq)
 	if !ok {
-		// A duplicate of a datagram still in the window. Not an error.
+		// Too far ahead to recover: reporting the gap would NACK tens of
+		// thousands of datagrams. Drop it, unacknowledged. The client bounds
+		// the jump the same way, on every connection.
 		return nil
 	}
 	conn.ackMu.Lock()
@@ -696,7 +700,6 @@ func (conn *Conn) receiveDatagram(b []byte) error {
 			return fmt.Errorf("receive datagram: send NACK: %w", err)
 		}
 	}
-	conn.win.shift()
 	return conn.handleDatagram(b[3:])
 }
 
@@ -789,6 +792,13 @@ func (conn *Conn) receiveSplitPacket(p *packet) error {
 	if p.splitCount == 0 || p.splitCount > maxSplitCount {
 		return fmt.Errorf("split packet: split count %v is out of range (1 - %v)", p.splitCount, maxSplitCount)
 	}
+	if p.splitIndex >= p.splitCount {
+		// The fragment fits no slot of the packet it claims to belong to. Drop
+		// it before the allocation below, which nothing would retain: a peer
+		// may repeat this fragment, and the concurrency cap cannot throttle a
+		// reassembly that is never stored.
+		return nil
+	}
 	entry, ok := conn.splits[p.splitID]
 	if ok && int(p.splitCount) != len(entry.fragments) {
 		// The split count disagrees with the reassembly already under way for
@@ -796,10 +806,6 @@ func (conn *Conn) receiveSplitPacket(p *packet) error {
 		return nil
 	}
 	if !ok {
-		if now := time.Now(); len(conn.splits) >= maxConcurrentSplits && now.Sub(conn.lastSplitSweep) >= splitSweepInterval {
-			conn.lastSplitSweep = now
-			conn.evictExpiredSplits(now)
-		}
 		if len(conn.splits) >= maxConcurrentSplits {
 			// Drop the fragment starting a new packet, never one already part
 			// reassembled: its fragments are acknowledged, so the sender will
@@ -807,9 +813,6 @@ func (conn *Conn) receiveSplitPacket(p *packet) error {
 			return nil
 		}
 		entry.fragments = make([][]byte, p.splitCount)
-	}
-	if p.splitIndex > uint32(len(entry.fragments)-1) {
-		return fmt.Errorf("split packet: split index %v is out of range (0 - %v)", p.splitIndex, len(entry.fragments)-1)
 	}
 	if entry.fragments[p.splitIndex] != nil {
 		return nil
@@ -832,8 +835,7 @@ func (conn *Conn) receiveSplitPacket(p *packet) error {
 
 // evictExpiredSplits frees reassemblies that have not advanced within
 // splitTimeout, so a peer cannot hold every slot for the rest of the session.
-// The client sweeps on every update; this runs only under slot pressure, which
-// reclaims the same slots at the point they are wanted.
+// The client sweeps its split list the same way, on its connection timeout.
 func (conn *Conn) evictExpiredSplits(now time.Time) {
 	for id, entry := range conn.splits {
 		if now.Sub(entry.lastUpdate) >= splitTimeout {
