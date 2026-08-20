@@ -37,6 +37,8 @@ const (
 	// an asymmetric downstream MTU (T-Mobile GTP tunnels and similar).
 	safeMTUSize = 1200
 
+	// maxWindowSize bounds the ordered packet queue, whose entries cannot be
+	// dropped without a delivery gap; overflowing it closes the connection.
 	maxWindowSize = 2048
 
 	// Caps on peer-controlled split reassembly, bounding memory per connection.
@@ -663,15 +665,11 @@ func (conn *Conn) receiveDatagram(b []byte) error {
 		return fmt.Errorf("read datagram: %w", io.ErrUnexpectedEOF)
 	}
 	seq := loadUint24(b)
-	if conn.win.wouldOverflow(seq) {
-		// Too far ahead: NACKing the gap would report thousands of datagrams at
-		// once. Drop it, unacknowledged, so it is retransmitted once the window
-		// has room. The client bounds the gap the same way, on every connection.
-		return nil
-	}
 	ok, skipped := conn.win.add(seq)
 	if !ok {
-		// A duplicate of a datagram still in the window. Not an error.
+		// Too far ahead to recover: reporting the gap would NACK tens of
+		// thousands of datagrams. Drop it, unacknowledged. The client bounds
+		// the jump the same way, on every connection.
 		return nil
 	}
 	conn.ackMu.Lock()
@@ -696,7 +694,6 @@ func (conn *Conn) receiveDatagram(b []byte) error {
 			return fmt.Errorf("receive datagram: send NACK: %w", err)
 		}
 	}
-	conn.win.shift()
 	return conn.handleDatagram(b[3:])
 }
 

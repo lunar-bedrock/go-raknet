@@ -8,59 +8,104 @@ func datagram(seq uint24) []byte {
 	return []byte{byte(seq), byte(seq >> 8), byte(seq >> 16)}
 }
 
-// TestDatagramWindowSizeWith checks the prospective size a new index would give.
-func TestDatagramWindowSizeWith(t *testing.T) {
+// TestDatagramWindowNACKsGapOnArrival: a gap is reported the moment the
+// datagram that jumped it arrives, and only once.
+func TestDatagramWindowNACKsGapOnArrival(t *testing.T) {
 	win := newDatagramWindow()
-	win.lowest, win.highest = 10, 20
-	for _, c := range []struct {
-		index uint24
-		want  uint24
-	}{
-		{index: 15, want: 10}, // within the window, highest unchanged
-		{index: 19, want: 10},
-		{index: 20, want: 11}, // extends the window by one
-		{index: 100, want: 91},
-	} {
-		if got := win.sizeWith(c.index); got != c.want {
-			t.Fatalf("sizeWith(%d) = %d, want %d", c.index, got, c.want)
-		}
+	if ok, skipped := win.add(0); !ok || len(skipped) != 0 {
+		t.Fatalf("add(0) = %v, %v", ok, skipped)
+	}
+	ok, skipped := win.add(4)
+	if !ok || len(skipped) != 3 || skipped[0] != 1 || skipped[2] != 3 {
+		t.Fatalf("add(4) skipped = %v, want [1 2 3]", skipped)
+	}
+	// The gap was reported, so a following datagram reports nothing new.
+	if _, skipped := win.add(5); len(skipped) != 0 {
+		t.Fatalf("add(5) reported an old gap again: %v", skipped)
+	}
+	// A skipped index arriving late was only reordered: processed, and a true
+	// repeat is processed too, since ordered delivery owns duplicates.
+	if ok, skipped := win.add(2); !ok || len(skipped) != 0 {
+		t.Fatalf("late arrival: add(2) = %v, %v", ok, skipped)
+	}
+	if ok, _ := win.add(2); !ok {
+		t.Fatal("a repeated index was dropped")
+	}
+	if win.expected != 6 {
+		t.Fatalf("expected = %d, want 6", win.expected)
 	}
 }
 
-// TestDatagramWindowWouldOverflow checks the maxWindowSize boundary and that a
-// far-ahead or already-seen index is judged correctly.
-func TestDatagramWindowWouldOverflow(t *testing.T) {
+// TestDatagramWindowCapsReportedGap: a jump past maxDatagramSkips reports only
+// the most recent indices, and the window still advances past the gap.
+func TestDatagramWindowCapsReportedGap(t *testing.T) {
 	win := newDatagramWindow()
-	if win.wouldOverflow(maxWindowSize - 1) {
-		t.Fatal("an index that exactly fills the window was rejected")
+	win.add(0)
+	ok, skipped := win.add(3001)
+	if !ok || len(skipped) != maxDatagramSkips {
+		t.Fatalf("add(3001): ok = %v with %d skipped, want %d", ok, len(skipped), maxDatagramSkips)
 	}
-	if !win.wouldOverflow(maxWindowSize) {
-		t.Fatal("an index one past the window was accepted")
+	if skipped[0] != 2001 || skipped[len(skipped)-1] != 3000 {
+		t.Fatalf("skipped [%d..%d], want [2001..3000]", skipped[0], skipped[len(skipped)-1])
 	}
-	if !win.wouldOverflow(1 << 23) {
-		t.Fatal("a far-ahead index was accepted")
+	if ok, skipped := win.add(3002); !ok || len(skipped) != 0 {
+		t.Fatalf("add(3002) = %v, %v: the window did not advance past the gap", ok, skipped)
 	}
-	// An index below lowest is already seen, so never an overflow regardless of
-	// how far behind it is.
-	win.lowest, win.highest = 5000, 5001
-	if win.wouldOverflow(1) {
-		t.Fatal("an already-seen index was treated as an overflow")
+}
+
+// TestDatagramWindowRejectsHugeGap: a jump past maxDatagramGap is dropped and
+// the window holds its place, while one at the bound still recovers.
+func TestDatagramWindowRejectsHugeGap(t *testing.T) {
+	win := newDatagramWindow()
+	win.add(0)
+	if ok, _ := win.add(maxDatagramGap + 2); ok {
+		t.Fatal("a jump past maxDatagramGap was accepted")
+	}
+	if ok, skipped := win.add(1); !ok || len(skipped) != 0 || win.expected != 2 {
+		t.Fatalf("the window lost its place: %v, %v, expected = %d", ok, skipped, win.expected)
+	}
+	if ok, skipped := win.add(2 + maxDatagramGap); !ok || len(skipped) != maxDatagramSkips {
+		t.Fatalf("a jump of exactly maxDatagramGap: ok = %v with %d skipped", ok, len(skipped))
+	}
+}
+
+// TestDatagramWindowWraps: gap detection and the bounds keep working across
+// the 24-bit boundary of the sequence space.
+func TestDatagramWindowWraps(t *testing.T) {
+	win := newDatagramWindow()
+	win.expected = 0xfffffe
+	if ok, skipped := win.add(0xfffffe); !ok || len(skipped) != 0 {
+		t.Fatalf("add(0xfffffe) = %v, %v", ok, skipped)
+	}
+	// 0xffffff was lost; 1 jumps the boundary and reports the gap across it.
+	ok, skipped := win.add(1)
+	if !ok || len(skipped) != 2 || skipped[0] != 0xffffff || skipped[1] != 0 {
+		t.Fatalf("add(1) = %v, %v, want skipped [0xffffff 0]", ok, skipped)
+	}
+	if win.expected != 2 {
+		t.Fatalf("expected = %#x, want 2", win.expected)
+	}
+	// The far-ahead bound keeps firing after the wrap.
+	if ok, _ := win.add(2 + maxDatagramGap + 1); ok {
+		t.Fatal("a jump past maxDatagramGap was accepted after the wrap")
+	}
+	if ok, skipped := win.add(2); !ok || len(skipped) != 0 || win.expected != 3 {
+		t.Fatal("the window lost its place after the wrap")
 	}
 }
 
 // TestReceiveDatagramDropsFarAhead is the regression guard: one far-ahead
-// datagram must be dropped before add jumps the window and marks and NACKs the
-// entire range between the window and it.
+// datagram must be dropped without advancing the window or being acknowledged.
 func TestReceiveDatagramDropsFarAhead(t *testing.T) {
 	conn := &Conn{win: newDatagramWindow()}
 	if err := conn.receiveDatagram(datagram(1 << 23)); err != nil {
 		t.Fatalf("far-ahead datagram: unexpected error: %v", err)
 	}
-	if conn.win.highest != 0 {
-		t.Fatalf("window jumped to %d: add ran on a far-ahead datagram", conn.win.highest)
+	if conn.win.expected != 0 {
+		t.Fatalf("window advanced to %d on a far-ahead datagram", conn.win.expected)
 	}
-	if len(conn.win.queue) != 0 {
-		t.Fatalf("queue holds %d entries: add materialised the range", len(conn.win.queue))
+	if len(conn.ackSlice) != 0 {
+		t.Fatal("a rejected datagram was queued for acknowledgement")
 	}
 }
 
@@ -77,36 +122,5 @@ func TestReceivePacketBoundsOrderedWindow(t *testing.T) {
 	}
 	if err := conn.receivePacket(pk); err == nil {
 		t.Fatal("an ordered window past maxWindowSize was accepted on a dialer connection")
-	}
-}
-
-// TestDatagramWindowNACKsGapOnArrival: a gap is reported the moment the
-// datagram that jumped it arrives, and only once.
-func TestDatagramWindowNACKsGapOnArrival(t *testing.T) {
-	win := newDatagramWindow()
-	if ok, skipped := win.add(0); !ok || len(skipped) != 0 {
-		t.Fatalf("add(0) = %v, %v", ok, skipped)
-	}
-	ok, skipped := win.add(4)
-	if !ok || len(skipped) != 3 || skipped[0] != 1 || skipped[2] != 3 {
-		t.Fatalf("add(4) skipped = %v, want [1 2 3]", skipped)
-	}
-	// The gap was marked, so a following datagram reports nothing new.
-	if _, skipped := win.add(5); len(skipped) != 0 {
-		t.Fatalf("add(5) reported an old gap again: %v", skipped)
-	}
-	// A marked index arriving late was only reordered: processed, not a duplicate.
-	if ok, skipped := win.add(2); !ok || len(skipped) != 0 {
-		t.Fatalf("late arrival of a marked index: add(2) = %v, %v", ok, skipped)
-	}
-	if ok, _ := win.add(2); ok {
-		t.Fatal("a received index was accepted again")
-	}
-	if win.shift(); win.lowest != 6 {
-		t.Fatalf("lowest = %d after shift, want 6", win.lowest)
-	}
-	// No duplicate detection by datagram below the window: still processed.
-	if ok, skipped := win.add(3); !ok || len(skipped) != 0 {
-		t.Fatalf("below-window arrival: add(3) = %v, %v", ok, skipped)
 	}
 }
