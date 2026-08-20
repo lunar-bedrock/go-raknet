@@ -435,7 +435,7 @@ func (c *stripPaddingConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 // TestHandshakeProbesSafeMTUAfterUnpaddedGrant checks the dialer walks down to
 // a matching Request 1 probe instead of substituting safeMTUSize for a larger,
 // unproven grant. Vanilla servers send these short Request 1 replies.
-func TestHandshakeProbesSafeMTUAfterUnpaddedGrant(t *testing.T) {
+func TestHandshakeCommitsSafeMTUAfterUnpaddedGrant(t *testing.T) {
 	upstream := &stripPaddingListener{}
 	l, err := ListenConfig{UpstreamPacketListener: upstream}.Listen("127.0.0.1:0")
 	if err != nil {
@@ -443,12 +443,94 @@ func TestHandshakeProbesSafeMTUAfterUnpaddedGrant(t *testing.T) {
 	}
 	defer l.Close()
 
+	start := time.Now()
 	client, server := dialListener(t, l)
 	if client.mtu != safeMTUSize || server.mtu != safeMTUSize {
 		t.Fatalf("negotiated MTU: client %v, server %v, want %v", client.mtu, server.mtu, safeMTUSize)
 	}
-	if conn := upstream.conn.Load(); conn == nil || !conn.safeProbe.Load() {
-		t.Fatal("dialer committed the safe MTU without sending its matching Request 1 probe")
+	// Every server in the wild grants unpadded, so walking the rest of the
+	// ladder here would cost a rung on every connection.
+	if elapsed := time.Since(start); elapsed > time.Second/4 {
+		t.Fatalf("handshake took %v, want well under the %v probe interval", elapsed, time.Second/2)
+	}
+	if conn := upstream.conn.Load(); conn == nil || conn.safeProbe.Load() {
+		t.Fatal("dialer stepped down a rung instead of committing the safe MTU at once")
+	}
+}
+
+// TestOpenConnectionAdoptsCookieFromUnpaddedRepeatedReply checks a server that
+// rotates its cookie is still followed when its reply is unpadded, which every
+// server in the wild is.
+func TestOpenConnectionAdoptsCookieFromUnpaddedRepeatedReply(t *testing.T) {
+	server, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	const oldCookie, newCookie = uint32(1), uint32(2)
+	type request struct{ cookie, mtu uint32 }
+	adopted := make(chan request, 1)
+	go func() {
+		b := make([]byte, 2048)
+		if _, addr, err := server.ReadFrom(b); err == nil {
+			repeated, _ := (&message.OpenConnectionReply1{
+				ServerGUID: 1, ServerHasSecurity: true, Cookie: newCookie, MTU: maxMTUSize,
+			}).MarshalBinary()
+			if _, err = server.WriteTo(repeated, addr); err != nil {
+				return
+			}
+		}
+		for {
+			n, addr, err := server.ReadFrom(b)
+			if err != nil {
+				return
+			}
+			if n == 0 || b[0] != message.IDOpenConnectionRequest2 {
+				continue
+			}
+			pk := &message.OpenConnectionRequest2{ServerHasSecurity: true}
+			if err = pk.UnmarshalBinary(b[1:n]); err != nil || pk.Cookie != newCookie {
+				// The previous sender may still have one in flight.
+				continue
+			}
+			adopted <- request{cookie: pk.Cookie, mtu: uint32(pk.MTU)}
+			reply, _ := (&message.OpenConnectionReply2{
+				ServerGUID: 1, ClientAddress: netip.MustParseAddrPort("127.0.0.1:1"), MTU: pk.MTU,
+			}).MarshalBinary()
+			_, _ = server.WriteTo(reply, addr)
+			return
+		}
+	}()
+
+	conn, err := net.Dial("udp", server.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	// A dialer that ignores the reply never sends the cookie on, so bound the
+	// read rather than blocking the test forever.
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second * 2))
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+	defer cancel()
+	state := &connState{
+		conn: conn, raddr: conn.RemoteAddr(), mtu: safeMTUSize,
+		maxMTU: maxMTUSize, serverSecurity: true, cookie: oldCookie,
+	}
+	if err = state.openConnection(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-adopted:
+		if got.mtu != uint32(safeMTUSize) {
+			t.Fatalf("Request 2 MTU: got %v, want %v", got.mtu, safeMTUSize)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for a Request 2 carrying the rotated cookie")
+	}
+	if state.cookie != newCookie {
+		t.Fatalf("committed cookie: got %v, want %v", state.cookie, newCookie)
 	}
 }
 

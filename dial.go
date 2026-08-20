@@ -364,11 +364,10 @@ const minSupportedMTU = 576
 // falls back to a usable MTU rather than straight to the minimum.
 var mtuSizes = []uint16{maxMTUSize, safeMTUSize, minSupportedMTU}
 
-// provenMTU returns the MTU to use from a reply granting mtu carried by a
-// datagram of n bytes. A grant above safeMTUSize counts only when the reply
-// itself filled the granted size, proving the path towards us carries it;
-// otherwise it returns safeMTUSize so callers can recognize an unproven grant
-// and continue down the probe ladder.
+// provenMTU returns the MTU to commit from a reply granting mtu carried by a
+// datagram of n bytes. A grant above safeMTUSize holds only when the reply
+// filled the granted size, proving the path towards us carries it; otherwise
+// the safe size is committed, which needs no proof.
 func provenMTU(mtu uint16, n int) uint16 {
 	if mtu > safeMTUSize && n < int(mtu)-28 {
 		return safeMTUSize
@@ -438,13 +437,11 @@ func (state *connState) discoverMTU(ctx context.Context) error {
 			if response.MTU > maxMTU {
 				continue
 			}
-			if provenMTU(response.MTU, n) != response.MTU {
-				// Request 2 must use a grant from a Request 1 reply. Keep
-				// probing until the server grants a size proven in both
-				// directions instead of substituting an ungranted value.
-				continue
-			}
-			state.mtu = response.MTU
+			// An unproven grant commits the safe size straight away rather than
+			// waiting out the rung: the larger request reached the server, so
+			// the path towards it carries the smaller size too. A server does
+			// not check that Request 2 echoes a size it granted.
+			state.mtu = provenMTU(response.MTU, n)
 			return nil
 		case message.IDIncompatibleProtocolVersion:
 			response := &message.IncompatibleProtocolVersion{}
@@ -505,10 +502,14 @@ func (state *connState) openConnection(ctx context.Context) error {
 			if err = pk.UnmarshalBinary(b[1:n]); err != nil {
 				return fmt.Errorf("read repeated open connection reply 1: %w", err)
 			}
-			if pk.ServerGUID == 0 || pk.MTU < minMTUSize || pk.MTU > maxMTU || provenMTU(pk.MTU, n) != pk.MTU {
+			if pk.ServerGUID == 0 || pk.MTU < minMTUSize || pk.MTU > maxMTU {
 				continue
 			}
-			state.serverSecurity, state.cookie, state.mtu = pk.ServerHasSecurity, pk.Cookie, pk.MTU
+			// A repeated reply carries a fresh cookie, which a server that
+			// rotated one needs us to adopt. Its grant may lower the committed
+			// size, never raise it.
+			state.serverSecurity, state.cookie = pk.ServerHasSecurity, pk.Cookie
+			state.mtu = min(state.mtu, provenMTU(pk.MTU, n))
 			activeCancel.cancel()
 			requestCtx, cancelRequests = context.WithCancel(ctx)
 			activeCancel.cancel = cancelRequests
