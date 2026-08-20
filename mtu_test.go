@@ -326,6 +326,72 @@ func TestProvenMTU(t *testing.T) {
 	}
 }
 
+// TestDiscoverMTUClampsCompatibilityRequest2 checks the invalid-MTU fallback
+// cannot bypass Dialer.MaxMTU while sending its one-off Request 2 packet.
+func TestDiscoverMTUClampsCompatibilityRequest2(t *testing.T) {
+	server, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	requestMTU := make(chan uint16, 1)
+	go func() {
+		b := make([]byte, 2048)
+		_, addr, err := server.ReadFrom(b)
+		if err != nil {
+			return
+		}
+		invalid, _ := (&message.OpenConnectionReply1{ServerGUID: 1, MTU: 1600}).MarshalBinary()
+		if _, err = server.WriteTo(invalid, addr); err != nil {
+			return
+		}
+
+		n, addr, err := server.ReadFrom(b)
+		if err != nil || n == 0 || b[0] != message.IDOpenConnectionRequest2 {
+			return
+		}
+		request := &message.OpenConnectionRequest2{}
+		if err = request.UnmarshalBinary(b[1:n]); err != nil {
+			return
+		}
+		requestMTU <- request.MTU
+		valid, _ := (&message.OpenConnectionReply1{ServerGUID: 1, MTU: safeMTUSize}).MarshalBinary()
+		_, _ = server.WriteTo(valid, addr)
+	}()
+
+	conn, err := net.Dial("udp", server.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+	defer cancel()
+	state := &connState{
+		conn:               conn,
+		raddr:              conn.RemoteAddr(),
+		maxMTU:             safeMTUSize,
+		ticker:             time.NewTicker(time.Second / 2),
+		maxTransientErrors: 10,
+	}
+	defer state.ticker.Stop()
+	if err = state.discoverMTU(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-requestMTU:
+		if got != safeMTUSize {
+			t.Fatalf("compatibility Request 2 MTU: got %v, want cap %v", got, safeMTUSize)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for compatibility Request 2")
+	}
+	if state.mtu != safeMTUSize {
+		t.Fatalf("discovered MTU: got %v, want %v", state.mtu, safeMTUSize)
+	}
+}
+
 // stripPaddingListener removes the padding from outgoing OpenConnectionReply1
 // datagrams, emulating a vanilla server that grants a large MTU unpadded.
 type stripPaddingListener struct {
