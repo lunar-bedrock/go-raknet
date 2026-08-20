@@ -402,6 +402,7 @@ func (state *connState) discoverMTU(ctx context.Context) error {
 	defer cancel()
 
 	go state.request1(ctx, mtuSizesFor(state.maxMTU))
+	maxMTU := clampMTU(state.maxMTU, minSupportedMTU)
 
 	b := make([]byte, maxMTUSize)
 	for {
@@ -426,12 +427,15 @@ func (state *connState) discoverMTU(ctx context.Context) error {
 				return fmt.Errorf("read open connection reply 1: %w", err)
 			}
 			state.serverSecurity, state.cookie = response.ServerHasSecurity, response.Cookie
-			if response.ServerGUID == 0 || response.MTU < 400 || response.MTU > 1500 {
+			if response.ServerGUID == 0 || response.MTU < minMTUSize || response.MTU > 1500 {
 				// This is an awful hack we cooked up to deal with OVH 'DDoS'
 				// protection. For some reason they send a broken MTU size
 				// first. Sending a Request2 followed by a Request1 deals with
 				// this.
 				state.openConnectionRequest2(response.MTU, state.serverSecurity, state.cookie)
+				continue
+			}
+			if response.MTU > maxMTU {
 				continue
 			}
 			if provenMTU(response.MTU, n) != response.MTU {
@@ -477,6 +481,7 @@ func (state *connState) openConnection(ctx context.Context) error {
 	activeCancel := struct{ cancel context.CancelFunc }{cancelRequests}
 	defer func() { activeCancel.cancel() }()
 	go state.request2(requestCtx, state.mtu, state.serverSecurity, state.cookie)
+	maxMTU := clampMTU(state.maxMTU, minSupportedMTU)
 
 	b := make([]byte, maxMTUSize)
 	for {
@@ -500,7 +505,7 @@ func (state *connState) openConnection(ctx context.Context) error {
 			if err = pk.UnmarshalBinary(b[1:n]); err != nil {
 				return fmt.Errorf("read repeated open connection reply 1: %w", err)
 			}
-			if pk.ServerGUID == 0 || pk.MTU < minMTUSize || pk.MTU > 1500 || provenMTU(pk.MTU, n) != pk.MTU {
+			if pk.ServerGUID == 0 || pk.MTU < minMTUSize || pk.MTU > maxMTU || provenMTU(pk.MTU, n) != pk.MTU {
 				continue
 			}
 			state.serverSecurity, state.cookie, state.mtu = pk.ServerHasSecurity, pk.Cookie, pk.MTU
