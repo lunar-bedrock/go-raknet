@@ -792,6 +792,13 @@ func (conn *Conn) receiveSplitPacket(p *packet) error {
 	if p.splitCount == 0 || p.splitCount > maxSplitCount {
 		return fmt.Errorf("split packet: split count %v is out of range (1 - %v)", p.splitCount, maxSplitCount)
 	}
+	if p.splitIndex >= p.splitCount {
+		// The fragment fits no slot of the packet it claims to belong to. Drop
+		// it before the allocation below, which nothing would retain: a peer
+		// may repeat this fragment, and the concurrency cap cannot throttle a
+		// reassembly that is never stored.
+		return nil
+	}
 	entry, ok := conn.splits[p.splitID]
 	if ok && int(p.splitCount) != len(entry.fragments) {
 		// The split count disagrees with the reassembly already under way for
@@ -806,10 +813,6 @@ func (conn *Conn) receiveSplitPacket(p *packet) error {
 			return nil
 		}
 		entry.fragments = make([][]byte, p.splitCount)
-	}
-	if p.splitIndex >= uint32(len(entry.fragments)) {
-		// The fragment fits no slot of this reassembly. The client drops it.
-		return nil
 	}
 	if entry.fragments[p.splitIndex] != nil {
 		return nil

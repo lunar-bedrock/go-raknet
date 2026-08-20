@@ -76,6 +76,13 @@ func TestReceiveSplitPacketIndexOutOfRange(t *testing.T) {
 	if len(conn.splits) != 0 {
 		t.Fatal("an out-of-range fragment left reassembly state behind")
 	}
+	// Nothing retains the reassembly such a fragment would start, so the
+	// concurrency cap cannot throttle it: it must cost no allocation at all,
+	// or a peer can drive one per datagram without bound.
+	worst := &packet{split: true, splitCount: maxSplitCount, splitIndex: maxSplitCount, content: []byte{0x01}}
+	if allocs := testing.AllocsPerRun(50, func() { _ = conn.receiveSplitPacket(worst) }); allocs != 0 {
+		t.Fatalf("a rejected fragment allocated %v times per receive, want 0", allocs)
+	}
 	// The same against a reassembly under way must not disturb its progress.
 	if err := conn.receiveSplitPacket(&packet{split: true, splitCount: 2, splitID: 1, splitIndex: 0, content: []byte{0x01}}); err != nil {
 		t.Fatal(err)
