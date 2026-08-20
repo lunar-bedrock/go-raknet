@@ -17,7 +17,7 @@ func TestPacketQueueWraps(t *testing.T) {
 			got = append(got, pk...)
 		}
 	}
-	if len(got) != 4 || got[0] != 0 || got[3] != 3 {
+	if len(got) != 4 || got[0] != 0 || got[1] != 1 || got[2] != 2 || got[3] != 3 {
 		t.Fatalf("fetched %#v across the boundary, want [0 1 2 3] in order", got)
 	}
 	if queue.lowest != 2 || queue.WindowSize() != 0 {
@@ -39,7 +39,7 @@ func TestPacketQueueWraps(t *testing.T) {
 	if !queue.put(0xffffff, []byte{0}) || !queue.put(0, []byte{1}) {
 		t.Fatal("filling the boundary hole was rejected")
 	}
-	if fetched := queue.fetch(); len(fetched) != 3 || fetched[0][0] != 0 || fetched[2][0] != 2 {
+	if fetched := queue.fetch(); len(fetched) != 3 || fetched[0][0] != 0 || fetched[1][0] != 1 || fetched[2][0] != 2 {
 		t.Fatalf("fetched %#v after filling the hole, want [0 1 2] in order", fetched)
 	}
 }
