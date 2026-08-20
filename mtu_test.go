@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/netip"
 	"slices"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -327,19 +328,34 @@ func TestProvenMTU(t *testing.T) {
 
 // stripPaddingListener removes the padding from outgoing OpenConnectionReply1
 // datagrams, emulating a vanilla server that grants a large MTU unpadded.
-type stripPaddingListener struct{}
+type stripPaddingListener struct {
+	conn atomic.Pointer[stripPaddingConn]
+}
 
-func (stripPaddingListener) ListenPacket(network, address string) (net.PacketConn, error) {
+func (l *stripPaddingListener) ListenPacket(network, address string) (net.PacketConn, error) {
 	conn, err := net.ListenPacket(network, address)
 	if err != nil {
 		return nil, err
 	}
-	return stripPaddingConn{PacketConn: conn}, nil
+	wrapped := &stripPaddingConn{PacketConn: conn}
+	l.conn.Store(wrapped)
+	return wrapped, nil
 }
 
-type stripPaddingConn struct{ net.PacketConn }
+type stripPaddingConn struct {
+	net.PacketConn
+	safeProbe atomic.Bool
+}
 
-func (c stripPaddingConn) WriteTo(b []byte, addr net.Addr) (int, error) {
+func (c *stripPaddingConn) ReadFrom(b []byte) (int, net.Addr, error) {
+	n, addr, err := c.PacketConn.ReadFrom(b)
+	if err == nil && n > 0 && b[0] == message.IDOpenConnectionRequest1 && n+28 <= int(safeMTUSize) {
+		c.safeProbe.Store(true)
+	}
+	return n, addr, err
+}
+
+func (c *stripPaddingConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 	if len(b) > 32 && b[0] == message.IDOpenConnectionReply1 {
 		n := 28
 		if b[25] != 0 {
@@ -350,11 +366,12 @@ func (c stripPaddingConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 	return c.PacketConn.WriteTo(b, addr)
 }
 
-// TestHandshakeClampsUnprovenGrant checks the dialer only commits an MTU above
-// safeMTUSize when the reply proves the path towards us carries it, so a path
-// that drops large datagrams in that direction cannot end up on one.
-func TestHandshakeClampsUnprovenGrant(t *testing.T) {
-	l, err := ListenConfig{UpstreamPacketListener: stripPaddingListener{}}.Listen("127.0.0.1:0")
+// TestHandshakeProbesSafeMTUAfterUnpaddedGrant checks the dialer walks down to
+// a matching Request 1 probe instead of substituting safeMTUSize for a larger,
+// unproven grant. Vanilla servers send these short Request 1 replies.
+func TestHandshakeProbesSafeMTUAfterUnpaddedGrant(t *testing.T) {
+	upstream := &stripPaddingListener{}
+	l, err := ListenConfig{UpstreamPacketListener: upstream}.Listen("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -363,6 +380,9 @@ func TestHandshakeClampsUnprovenGrant(t *testing.T) {
 	client, server := dialListener(t, l)
 	if client.mtu != safeMTUSize || server.mtu != safeMTUSize {
 		t.Fatalf("negotiated MTU: client %v, server %v, want %v", client.mtu, server.mtu, safeMTUSize)
+	}
+	if conn := upstream.conn.Load(); conn == nil || !conn.safeProbe.Load() {
+		t.Fatal("dialer committed the safe MTU without sending its matching Request 1 probe")
 	}
 }
 
