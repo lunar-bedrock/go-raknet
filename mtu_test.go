@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/netip"
 	"slices"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -325,21 +326,102 @@ func TestProvenMTU(t *testing.T) {
 	}
 }
 
+// TestDiscoverMTUClampsCompatibilityRequest2 checks the invalid-MTU fallback
+// cannot bypass Dialer.MaxMTU while sending its one-off Request 2 packet.
+func TestDiscoverMTUClampsCompatibilityRequest2(t *testing.T) {
+	server, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	requestMTU := make(chan uint16, 1)
+	go func() {
+		b := make([]byte, 2048)
+		_, addr, err := server.ReadFrom(b)
+		if err != nil {
+			return
+		}
+		invalid, _ := (&message.OpenConnectionReply1{ServerGUID: 1, MTU: 1600}).MarshalBinary()
+		if _, err = server.WriteTo(invalid, addr); err != nil {
+			return
+		}
+
+		n, addr, err := server.ReadFrom(b)
+		if err != nil || n == 0 || b[0] != message.IDOpenConnectionRequest2 {
+			return
+		}
+		request := &message.OpenConnectionRequest2{}
+		if err = request.UnmarshalBinary(b[1:n]); err != nil {
+			return
+		}
+		requestMTU <- request.MTU
+		valid, _ := (&message.OpenConnectionReply1{ServerGUID: 1, MTU: safeMTUSize}).MarshalBinary()
+		_, _ = server.WriteTo(valid, addr)
+	}()
+
+	conn, err := net.Dial("udp", server.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+	defer cancel()
+	state := &connState{
+		conn:               conn,
+		raddr:              conn.RemoteAddr(),
+		maxMTU:             safeMTUSize,
+		ticker:             time.NewTicker(time.Second / 2),
+		maxTransientErrors: 10,
+	}
+	defer state.ticker.Stop()
+	if err = state.discoverMTU(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-requestMTU:
+		if got != safeMTUSize {
+			t.Fatalf("compatibility Request 2 MTU: got %v, want cap %v", got, safeMTUSize)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for compatibility Request 2")
+	}
+	if state.mtu != safeMTUSize {
+		t.Fatalf("discovered MTU: got %v, want %v", state.mtu, safeMTUSize)
+	}
+}
+
 // stripPaddingListener removes the padding from outgoing OpenConnectionReply1
 // datagrams, emulating a vanilla server that grants a large MTU unpadded.
-type stripPaddingListener struct{}
+type stripPaddingListener struct {
+	conn atomic.Pointer[stripPaddingConn]
+}
 
-func (stripPaddingListener) ListenPacket(network, address string) (net.PacketConn, error) {
+func (l *stripPaddingListener) ListenPacket(network, address string) (net.PacketConn, error) {
 	conn, err := net.ListenPacket(network, address)
 	if err != nil {
 		return nil, err
 	}
-	return stripPaddingConn{PacketConn: conn}, nil
+	wrapped := &stripPaddingConn{PacketConn: conn}
+	l.conn.Store(wrapped)
+	return wrapped, nil
 }
 
-type stripPaddingConn struct{ net.PacketConn }
+type stripPaddingConn struct {
+	net.PacketConn
+	safeProbe atomic.Bool
+}
 
-func (c stripPaddingConn) WriteTo(b []byte, addr net.Addr) (int, error) {
+func (c *stripPaddingConn) ReadFrom(b []byte) (int, net.Addr, error) {
+	n, addr, err := c.PacketConn.ReadFrom(b)
+	if err == nil && n > 0 && b[0] == message.IDOpenConnectionRequest1 && n+28 <= int(safeMTUSize) {
+		c.safeProbe.Store(true)
+	}
+	return n, addr, err
+}
+
+func (c *stripPaddingConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 	if len(b) > 32 && b[0] == message.IDOpenConnectionReply1 {
 		n := 28
 		if b[25] != 0 {
@@ -350,11 +432,12 @@ func (c stripPaddingConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 	return c.PacketConn.WriteTo(b, addr)
 }
 
-// TestHandshakeClampsUnprovenGrant checks the dialer only commits an MTU above
-// safeMTUSize when the reply proves the path towards us carries it, so a path
-// that drops large datagrams in that direction cannot end up on one.
-func TestHandshakeClampsUnprovenGrant(t *testing.T) {
-	l, err := ListenConfig{UpstreamPacketListener: stripPaddingListener{}}.Listen("127.0.0.1:0")
+// TestHandshakeProbesSafeMTUAfterUnpaddedGrant checks the dialer walks down to
+// a matching Request 1 probe instead of substituting safeMTUSize for a larger,
+// unproven grant. Vanilla servers send these short Request 1 replies.
+func TestHandshakeProbesSafeMTUAfterUnpaddedGrant(t *testing.T) {
+	upstream := &stripPaddingListener{}
+	l, err := ListenConfig{UpstreamPacketListener: upstream}.Listen("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -363,6 +446,9 @@ func TestHandshakeClampsUnprovenGrant(t *testing.T) {
 	client, server := dialListener(t, l)
 	if client.mtu != safeMTUSize || server.mtu != safeMTUSize {
 		t.Fatalf("negotiated MTU: client %v, server %v, want %v", client.mtu, server.mtu, safeMTUSize)
+	}
+	if conn := upstream.conn.Load(); conn == nil || !conn.safeProbe.Load() {
+		t.Fatal("dialer committed the safe MTU without sending its matching Request 1 probe")
 	}
 }
 
@@ -401,6 +487,65 @@ func TestOpenConnectionCapsReply2(t *testing.T) {
 		if state.mtu != safeMTUSize {
 			t.Fatalf("reply granting %v: committed MTU %v, want %v", grant, state.mtu, safeMTUSize)
 		}
+	}
+}
+
+// TestOpenConnectionRejectsRepeatedReplyAboveMaxMTU checks a delayed Reply 1
+// cannot bypass Dialer.MaxMTU after discovery has already committed its cap.
+func TestOpenConnectionRejectsRepeatedReplyAboveMaxMTU(t *testing.T) {
+	server, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	requestMTU := make(chan uint16, 1)
+	go func() {
+		b := make([]byte, 2048)
+		_, addr, err := server.ReadFrom(b)
+		if err != nil {
+			return
+		}
+		repeated, _ := (&message.OpenConnectionReply1{ServerGUID: 1, MTU: maxMTUSize, Padded: true}).MarshalBinary()
+		if _, err = server.WriteTo(repeated, addr); err != nil {
+			return
+		}
+
+		n, addr, err := server.ReadFrom(b)
+		if err != nil || n == 0 || b[0] != message.IDOpenConnectionRequest2 {
+			return
+		}
+		request := &message.OpenConnectionRequest2{}
+		if err = request.UnmarshalBinary(b[1:n]); err != nil {
+			return
+		}
+		requestMTU <- request.MTU
+		reply, _ := (&message.OpenConnectionReply2{ServerGUID: 1, ClientAddress: netip.MustParseAddrPort("127.0.0.1:1"), MTU: request.MTU}).MarshalBinary()
+		_, _ = server.WriteTo(reply, addr)
+	}()
+
+	conn, err := net.Dial("udp", server.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+	defer cancel()
+	state := &connState{conn: conn, raddr: conn.RemoteAddr(), mtu: safeMTUSize, maxMTU: safeMTUSize}
+	if err = state.openConnection(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-requestMTU:
+		if got != safeMTUSize {
+			t.Fatalf("Request 2 MTU: got %v, want cap %v", got, safeMTUSize)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for Request 2")
+	}
+	if state.mtu != safeMTUSize {
+		t.Fatalf("committed MTU: got %v, want cap %v", state.mtu, safeMTUSize)
 	}
 }
 

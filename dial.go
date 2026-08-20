@@ -364,10 +364,11 @@ const minSupportedMTU = 576
 // falls back to a usable MTU rather than straight to the minimum.
 var mtuSizes = []uint16{maxMTUSize, safeMTUSize, minSupportedMTU}
 
-// provenMTU returns the MTU to commit from a reply granting mtu carried by a
+// provenMTU returns the MTU to use from a reply granting mtu carried by a
 // datagram of n bytes. A grant above safeMTUSize counts only when the reply
 // itself filled the granted size, proving the path towards us carries it;
-// vanilla servers never pad, so their larger grants land on safeMTUSize.
+// otherwise it returns safeMTUSize so callers can recognize an unproven grant
+// and continue down the probe ladder.
 func provenMTU(mtu uint16, n int) uint16 {
 	if mtu > safeMTUSize && n < int(mtu)-28 {
 		return safeMTUSize
@@ -401,6 +402,7 @@ func (state *connState) discoverMTU(ctx context.Context) error {
 	defer cancel()
 
 	go state.request1(ctx, mtuSizesFor(state.maxMTU))
+	maxMTU := clampMTU(state.maxMTU, minSupportedMTU)
 
 	b := make([]byte, maxMTUSize)
 	for {
@@ -425,15 +427,24 @@ func (state *connState) discoverMTU(ctx context.Context) error {
 				return fmt.Errorf("read open connection reply 1: %w", err)
 			}
 			state.serverSecurity, state.cookie = response.ServerHasSecurity, response.Cookie
-			if response.ServerGUID == 0 || response.MTU < 400 || response.MTU > 1500 {
+			if response.ServerGUID == 0 || response.MTU < minMTUSize || response.MTU > 1500 {
 				// This is an awful hack we cooked up to deal with OVH 'DDoS'
 				// protection. For some reason they send a broken MTU size
 				// first. Sending a Request2 followed by a Request1 deals with
 				// this.
-				state.openConnectionRequest2(response.MTU, state.serverSecurity, state.cookie)
+				state.openConnectionRequest2(min(response.MTU, maxMTU), state.serverSecurity, state.cookie)
 				continue
 			}
-			state.mtu = provenMTU(response.MTU, n)
+			if response.MTU > maxMTU {
+				continue
+			}
+			if provenMTU(response.MTU, n) != response.MTU {
+				// Request 2 must use a grant from a Request 1 reply. Keep
+				// probing until the server grants a size proven in both
+				// directions instead of substituting an ungranted value.
+				continue
+			}
+			state.mtu = response.MTU
 			return nil
 		case message.IDIncompatibleProtocolVersion:
 			response := &message.IncompatibleProtocolVersion{}
@@ -466,11 +477,11 @@ func (state *connState) request1(ctx context.Context, sizes []uint16) {
 // openConnection sends open connection request 2 packets continuously
 // until it receives an open connection reply 2 packet from the server.
 func (state *connState) openConnection(ctx context.Context) error {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
 	requestCtx, cancelRequests := context.WithCancel(ctx)
+	activeCancel := struct{ cancel context.CancelFunc }{cancelRequests}
+	defer func() { activeCancel.cancel() }()
 	go state.request2(requestCtx, state.mtu, state.serverSecurity, state.cookie)
+	maxMTU := clampMTU(state.maxMTU, minSupportedMTU)
 
 	b := make([]byte, maxMTUSize)
 	for {
@@ -494,12 +505,13 @@ func (state *connState) openConnection(ctx context.Context) error {
 			if err = pk.UnmarshalBinary(b[1:n]); err != nil {
 				return fmt.Errorf("read repeated open connection reply 1: %w", err)
 			}
-			if pk.ServerGUID == 0 || pk.MTU < minMTUSize || pk.MTU > 1500 {
+			if pk.ServerGUID == 0 || pk.MTU < minMTUSize || pk.MTU > maxMTU || provenMTU(pk.MTU, n) != pk.MTU {
 				continue
 			}
-			state.serverSecurity, state.cookie, state.mtu = pk.ServerHasSecurity, pk.Cookie, provenMTU(pk.MTU, n)
-			cancelRequests()
+			state.serverSecurity, state.cookie, state.mtu = pk.ServerHasSecurity, pk.Cookie, pk.MTU
+			activeCancel.cancel()
 			requestCtx, cancelRequests = context.WithCancel(ctx)
+			activeCancel.cancel = cancelRequests
 			go state.request2(requestCtx, state.mtu, state.serverSecurity, state.cookie)
 		case message.IDOpenConnectionReply2:
 			pk := &message.OpenConnectionReply2{}
