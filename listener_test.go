@@ -42,6 +42,24 @@ func TestListenConfigUsesConfiguredServerID(t *testing.T) {
 	}
 }
 
+func TestListenConfigGeneratesServerIDsByDefault(t *testing.T) {
+	first, err := (raknet.ListenConfig{}).Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen first: %v", err)
+	}
+	t.Cleanup(func() { _ = first.Close() })
+
+	second, err := (raknet.ListenConfig{}).Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen second: %v", err)
+	}
+	t.Cleanup(func() { _ = second.Close() })
+
+	if first.ID() == second.ID() {
+		t.Fatalf("generated listener IDs are equal: %d", first.ID())
+	}
+}
+
 func accept(l *raknet.Listener, c chan error) {
 	if _, err := l.Accept(); err != nil {
 		c <- fmt.Errorf("error accepting connection: %v", err)
