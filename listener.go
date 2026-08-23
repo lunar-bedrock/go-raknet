@@ -27,6 +27,10 @@ type ListenConfig struct {
 	// is always disabled. Error messages are thus not logged by default.
 	ErrorLog *slog.Logger
 
+	// ServerID is the RakNet server GUID advertised during discovery and the
+	// connection handshake. If zero, a random per-listener ID is generated.
+	ServerID int64
+
 	// UpstreamPacketListener adds an abstraction for net.ListenPacket.
 	UpstreamPacketListener UpstreamPacketListener
 
@@ -168,12 +172,16 @@ func (conf ListenConfig) Listen(address string) (*Listener, error) {
 	if err != nil {
 		return nil, &net.OpError{Op: "listen", Net: "raknet", Source: nil, Addr: nil, Err: err}
 	}
+	serverID := conf.ServerID
+	if serverID == 0 {
+		serverID = atomic.AddInt64(&listenerID, 1)
+	}
 	listener := &Listener{
 		conf:     conf,
 		conn:     conn,
 		incoming: make(chan *Conn),
 		closed:   make(chan struct{}),
-		id:       atomic.AddInt64(&listenerID, 1),
+		id:       serverID,
 	}
 	listener.handler = &listenerConnectionHandler{l: listener, cookieSalt: &atomic.Uint64{}, previousSalt: &atomic.Uint64{}}
 	listener.sec = newSecurity(conf, listener.handler)
