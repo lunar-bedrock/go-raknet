@@ -112,6 +112,11 @@ type Conn struct {
 	conn    net.PacketConn
 	raddr   net.Addr
 	handler connectionHandler
+	// replyConn is set for listener-side connections so replies can reuse the
+	// interface metadata captured by the listening socket. Dialer-side and
+	// custom connections keep using conn directly.
+	replyConn packetConn
+	control   atomic.Pointer[packetControl]
 
 	once      sync.Once
 	connected chan struct{}
@@ -1094,7 +1099,17 @@ func (conn *Conn) sendDatagram(pk *packet, size uint32, retransmit bool) error {
 // is logged but not returned. This is done because at this stage, packets
 // being lost to an error can be recovered through resending.
 func (conn *Conn) writeTo(p []byte, raddr net.Addr) error {
-	if _, err := conn.conn.WriteTo(p, raddr); errors.Is(err, net.ErrClosed) {
+	var err error
+	if conn.replyConn != nil {
+		var control packetControl
+		if current := conn.control.Load(); current != nil {
+			control = *current
+		}
+		_, err = conn.replyConn.WriteToPacket(p, control, raddr)
+	} else {
+		_, err = conn.conn.WriteTo(p, raddr)
+	}
+	if errors.Is(err, net.ErrClosed) {
 		return fmt.Errorf("write to: %w", err)
 	} else if err != nil {
 		conn.handler.log().Error("write to: "+err.Error(), "raddr", raddr.String())
