@@ -70,8 +70,9 @@ type Listener struct {
 	// address.
 	connections sync.Map
 
-	// id is a random server ID generated upon starting listening. It is used
-	// several times throughout the connection sequence of RakNet.
+	// id is the configured or generated server ID used throughout the RakNet
+	// connection sequence. Configured IDs may intentionally be shared by
+	// multiple listeners.
 	id int64
 
 	// pongData is a byte slice of data that is sent in an unconnected pong
@@ -264,8 +265,9 @@ func (listener *Listener) PongDataFunc(f func(addr net.Addr) []byte) {
 	}
 }
 
-// ID returns the unique ID of the listener. This ID is usually used by a
-// client to identify a specific server during a single session.
+// ID returns the server ID advertised by the listener. Generated IDs are
+// unique per listener, while a configured ServerID may be shared by multiple
+// listeners representing one server.
 func (listener *Listener) ID() int64 {
 	return listener.id
 }
