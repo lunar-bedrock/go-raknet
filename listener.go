@@ -61,7 +61,7 @@ type Listener struct {
 	once   sync.Once
 	closed chan struct{}
 
-	conn net.PacketConn
+	conn packetConn
 	// incoming is a channel of incoming connections. Connections that end up in
 	// here will also end up in the connections map.
 	incoming chan *Conn
@@ -162,16 +162,20 @@ func (conf ListenConfig) Listen(address string) (*Listener, error) {
 		conf.BlockDuration = time.Second * 10
 	}
 	conf.MaxMTU = clampMTU(conf.MaxMTU, minMTUSize)
-	var conn net.PacketConn
+	var rawConn net.PacketConn
 	var err error
 
 	if conf.UpstreamPacketListener == nil {
-		conn, err = net.ListenPacket("udp", address)
+		rawConn, err = net.ListenPacket("udp", address)
 	} else {
-		conn, err = conf.UpstreamPacketListener.ListenPacket("udp", address)
+		rawConn, err = conf.UpstreamPacketListener.ListenPacket("udp", address)
 	}
 	if err != nil {
 		return nil, &net.OpError{Op: "listen", Net: "raknet", Source: nil, Addr: nil, Err: err}
+	}
+	conn, pinned := newPacketConn(rawConn)
+	if !pinned {
+		conf.ErrorLog.Warn("reply interface pinning unavailable; LAN discovery may fail on multi-homed hosts", "addr", address)
 	}
 	serverID := conf.ServerID
 	if serverID == 0 {
@@ -295,7 +299,7 @@ func (listener *Listener) listen() {
 	// allowed to have. We can re-use this buffer for each packet.
 	b := make([]byte, 1500)
 	for {
-		n, addr, err := listener.conn.ReadFrom(b)
+		n, control, addr, err := listener.conn.ReadFromPacket(b)
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return
@@ -305,7 +309,7 @@ func (listener *Listener) listen() {
 		} else if n == 0 || listener.sec.blocked(addr) {
 			continue
 		}
-		if err = listener.handle(b[:n], addr); err != nil && !errors.Is(err, net.ErrClosed) {
+		if err = listener.handle(b[:n], addr, control); err != nil && !errors.Is(err, net.ErrClosed) {
 			listener.conf.ErrorLog.Error("handle packet: "+err.Error(), "raddr", addrToStr(addr), "block-duration", max(0, listener.conf.BlockDuration))
 			listener.sec.block(addr)
 		}
@@ -322,10 +326,10 @@ func addrToStr(addr net.Addr) string {
 
 // handle handles an incoming packet in buffer b from the address passed. If
 // not successful, an error is returned describing the issue.
-func (listener *Listener) handle(b []byte, addr net.Addr) error {
+func (listener *Listener) handle(b []byte, addr net.Addr, control packetControl) error {
 	value, found := listener.connections.Load(resolve(addr))
 	if !found {
-		return listener.handler.handleUnconnected(b, addr)
+		return listener.handler.handleUnconnected(b, addr, control)
 	}
 	conn := value.(*Conn)
 	select {
@@ -333,6 +337,9 @@ func (listener *Listener) handle(b []byte, addr net.Addr) error {
 		// Connection was closed already.
 		return nil
 	default:
+		if old := conn.control.Load(); old == nil || !old.samePin(control) {
+			conn.control.Store(&control)
+		}
 		if err := conn.receive(b); err != nil {
 			conn.closeImmediately()
 			return err

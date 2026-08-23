@@ -60,14 +60,14 @@ func (h listenerConnectionHandler) cookie(addr net.Addr, salt uint64) uint32 {
 	return crc32.ChecksumIEEE(b)
 }
 
-func (h listenerConnectionHandler) handleUnconnected(b []byte, addr net.Addr) error {
+func (h listenerConnectionHandler) handleUnconnected(b []byte, addr net.Addr, control packetControl) error {
 	switch b[0] {
 	case message.IDUnconnectedPing, message.IDUnconnectedPingOpenConnections:
-		return h.handleUnconnectedPing(b[1:], addr)
+		return h.handleUnconnectedPing(b[1:], addr, control)
 	case message.IDOpenConnectionRequest1:
-		return h.handleOpenConnectionRequest1(b[1:], addr)
+		return h.handleOpenConnectionRequest1(b[1:], addr, control)
 	case message.IDOpenConnectionRequest2:
-		return h.handleOpenConnectionRequest2(b[1:], addr)
+		return h.handleOpenConnectionRequest2(b[1:], addr, control)
 	}
 	if b[0]&bitFlagDatagram != 0 {
 		// In some cases, the client will keep trying to send datagrams
@@ -81,7 +81,7 @@ func (h listenerConnectionHandler) handleUnconnected(b []byte, addr net.Addr) er
 
 // handleUnconnectedPing handles an unconnected ping packet stored in buffer b,
 // coming from an address.
-func (h listenerConnectionHandler) handleUnconnectedPing(b []byte, addr net.Addr) error {
+func (h listenerConnectionHandler) handleUnconnectedPing(b []byte, addr net.Addr, control packetControl) error {
 	pk := &message.UnconnectedPing{}
 	if err := pk.UnmarshalBinary(b); err != nil {
 		return fmt.Errorf("read UNCONNECTED_PING: %w", err)
@@ -95,13 +95,13 @@ func (h listenerConnectionHandler) handleUnconnectedPing(b []byte, addr net.Addr
 		}
 	}
 	data, _ := (&message.UnconnectedPong{ServerGUID: h.l.id, PingTime: pk.PingTime, Data: pongData}).MarshalBinary()
-	_, err := h.l.conn.WriteTo(data, addr)
+	_, err := h.l.conn.WriteToPacket(data, control, addr)
 	return err
 }
 
 // handleOpenConnectionRequest1 handles an open connection request 1 packet
 // stored in buffer b, coming from an address.
-func (h listenerConnectionHandler) handleOpenConnectionRequest1(b []byte, addr net.Addr) error {
+func (h listenerConnectionHandler) handleOpenConnectionRequest1(b []byte, addr net.Addr, control packetControl) error {
 	pk := &message.OpenConnectionRequest1{}
 	if err := pk.UnmarshalBinary(b); err != nil {
 		return fmt.Errorf("read OPEN_CONNECTION_REQUEST_1: %w", err)
@@ -111,7 +111,7 @@ func (h listenerConnectionHandler) handleOpenConnectionRequest1(b []byte, addr n
 
 	if pk.ClientProtocol != protocolVersion {
 		data, _ := (&message.IncompatibleProtocolVersion{ServerGUID: h.l.id, ServerProtocol: protocolVersion}).MarshalBinary()
-		_, _ = h.l.conn.WriteTo(data, addr)
+		_, _ = h.l.conn.WriteToPacket(data, control, addr)
 		return fmt.Errorf("handle OPEN_CONNECTION_REQUEST_1: incompatible protocol version %v (listener protocol = %v)", pk.ClientProtocol, protocolVersion)
 	}
 
@@ -124,13 +124,13 @@ func (h listenerConnectionHandler) handleOpenConnectionRequest1(b []byte, addr n
 	}
 
 	data, _ := (&message.OpenConnectionReply1{ServerGUID: h.l.id, Cookie: h.cookie(addr, h.cookieSalt.Load()), ServerHasSecurity: !h.l.conf.DisableCookies, MTU: mtuSize, Padded: padded}).MarshalBinary()
-	_, err := h.l.conn.WriteTo(data, addr)
+	_, err := h.l.conn.WriteToPacket(data, control, addr)
 	return err
 }
 
 // handleOpenConnectionRequest2 handles an open connection request 2 packet
 // stored in buffer b, coming from an address.
-func (h listenerConnectionHandler) handleOpenConnectionRequest2(b []byte, addr net.Addr) error {
+func (h listenerConnectionHandler) handleOpenConnectionRequest2(b []byte, addr net.Addr, control packetControl) error {
 	pk := &message.OpenConnectionRequest2{ServerHasSecurity: !h.l.conf.DisableCookies}
 	if err := pk.UnmarshalBinary(b); err != nil {
 		return fmt.Errorf("read OPEN_CONNECTION_REQUEST_2: %w", err)
@@ -150,13 +150,15 @@ func (h listenerConnectionHandler) handleOpenConnectionRequest2(b []byte, addr n
 	mtuSize := max(min(pk.MTU, h.l.maxMTU()), minMTUSize)
 
 	data, _ := (&message.OpenConnectionReply2{ServerGUID: h.l.id, ClientAddress: resolve(addr), MTU: mtuSize}).MarshalBinary()
-	if _, err := h.l.conn.WriteTo(data, addr); err != nil {
+	if _, err := h.l.conn.WriteToPacket(data, control, addr); err != nil {
 		return fmt.Errorf("send OPEN_CONNECTION_REPLY_2: %w", err)
 	}
 
 	h.l.stats.connectionsStarted.Add(1)
 	go func() {
 		conn := newConn(h.l.conn, addr, mtuSize, h)
+		conn.replyConn = h.l.conn
+		conn.control.Store(&control)
 		h.l.connections.Store(resolve(addr), conn)
 
 		t := time.NewTimer(time.Second * 10)
