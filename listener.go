@@ -27,6 +27,10 @@ type ListenConfig struct {
 	// is always disabled. Error messages are thus not logged by default.
 	ErrorLog *slog.Logger
 
+	// ServerID is the RakNet server GUID advertised during discovery and the
+	// connection handshake. If zero, a random per-listener ID is generated.
+	ServerID int64
+
 	// UpstreamPacketListener adds an abstraction for net.ListenPacket.
 	UpstreamPacketListener UpstreamPacketListener
 
@@ -66,8 +70,9 @@ type Listener struct {
 	// address.
 	connections sync.Map
 
-	// id is a random server ID generated upon starting listening. It is used
-	// several times throughout the connection sequence of RakNet.
+	// id is the configured or generated server ID used throughout the RakNet
+	// connection sequence. Configured IDs may intentionally be shared by
+	// multiple listeners.
 	id int64
 
 	// pongData is a byte slice of data that is sent in an unconnected pong
@@ -168,12 +173,16 @@ func (conf ListenConfig) Listen(address string) (*Listener, error) {
 	if err != nil {
 		return nil, &net.OpError{Op: "listen", Net: "raknet", Source: nil, Addr: nil, Err: err}
 	}
+	serverID := conf.ServerID
+	if serverID == 0 {
+		serverID = atomic.AddInt64(&listenerID, 1)
+	}
 	listener := &Listener{
 		conf:     conf,
 		conn:     conn,
 		incoming: make(chan *Conn),
 		closed:   make(chan struct{}),
-		id:       atomic.AddInt64(&listenerID, 1),
+		id:       serverID,
 	}
 	listener.handler = &listenerConnectionHandler{l: listener, cookieSalt: &atomic.Uint64{}, previousSalt: &atomic.Uint64{}}
 	listener.sec = newSecurity(conf, listener.handler)
@@ -256,8 +265,9 @@ func (listener *Listener) PongDataFunc(f func(addr net.Addr) []byte) {
 	}
 }
 
-// ID returns the unique ID of the listener. This ID is usually used by a
-// client to identify a specific server during a single session.
+// ID returns the server ID advertised by the listener. Generated IDs are
+// unique per listener, while a configured ServerID may be shared by multiple
+// listeners representing one server.
 func (listener *Listener) ID() int64 {
 	return listener.id
 }
