@@ -11,7 +11,7 @@ import (
 func TestPing(t *testing.T) {
 	//noinspection SpellCheckingInspection
 	const (
-		addr   = "mco.mineplex.com:19132"
+		addr   = "play.lbsg.net:19132"
 		prefix = "MCPE"
 	)
 
@@ -28,7 +28,7 @@ func TestPing(t *testing.T) {
 func TestPingWithCustomDialer(t *testing.T) {
 	//noinspection SpellCheckingInspection
 	const (
-		addr   = "mco.mineplex.com:19132"
+		addr   = "play.lbsg.net:19132"
 		prefix = "MCPE"
 	)
 
@@ -56,7 +56,7 @@ func TestPingWithCustomDialer(t *testing.T) {
 func TestDial(t *testing.T) {
 	//noinspection SpellCheckingInspection
 	const (
-		addr = "mco.mineplex.com:19132"
+		addr = "play.lbsg.net:19132"
 	)
 
 	conn, err := raknet.Dial(addr)
@@ -71,7 +71,7 @@ func TestDial(t *testing.T) {
 func TestDialWithCustomDialer(t *testing.T) {
 	//noinspection SpellCheckingInspection
 	const (
-		addr = "mco.mineplex.com:19132"
+		addr = "play.lbsg.net:19132"
 	)
 
 	localDialAddr, err := net.ResolveUDPAddr("udp", "0.0.0.0:55555")
