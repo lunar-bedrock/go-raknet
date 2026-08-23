@@ -28,6 +28,20 @@ func TestListen(t *testing.T) {
 	}
 }
 
+func TestListenConfigUsesConfiguredServerID(t *testing.T) {
+	const serverID = 123456789
+
+	listener, err := (raknet.ListenConfig{ServerID: serverID}).Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+
+	if got := listener.ID(); got != serverID {
+		t.Fatalf("listener ID = %d, want %d", got, serverID)
+	}
+}
+
 func accept(l *raknet.Listener, c chan error) {
 	if _, err := l.Accept(); err != nil {
 		c <- fmt.Errorf("error accepting connection: %v", err)
