@@ -336,14 +336,21 @@ func TestDiscoverMTUEchoesCompatibilityRequest2(t *testing.T) {
 	}
 	defer server.Close()
 
-	requestMTU := make(chan uint16, 1)
+	const challenge, cookie = uint16(44819), uint32(0x12345678)
+	type compatibilityRequest struct {
+		mtu    uint16
+		cookie uint32
+	}
+	requestData := make(chan compatibilityRequest, 1)
 	go func() {
 		b := make([]byte, 2048)
 		_, addr, err := server.ReadFrom(b)
 		if err != nil {
 			return
 		}
-		invalid, _ := (&message.OpenConnectionReply1{ServerGUID: 1, MTU: 44819}).MarshalBinary()
+		invalid, _ := (&message.OpenConnectionReply1{
+			ServerGUID: 1, ServerHasSecurity: true, Cookie: cookie, MTU: challenge,
+		}).MarshalBinary()
 		if _, err = server.WriteTo(invalid, addr); err != nil {
 			return
 		}
@@ -352,12 +359,14 @@ func TestDiscoverMTUEchoesCompatibilityRequest2(t *testing.T) {
 		if err != nil || n == 0 || b[0] != message.IDOpenConnectionRequest2 {
 			return
 		}
-		request := &message.OpenConnectionRequest2{}
+		request := &message.OpenConnectionRequest2{ServerHasSecurity: true}
 		if err = request.UnmarshalBinary(b[1:n]); err != nil {
 			return
 		}
-		requestMTU <- request.MTU
-		valid, _ := (&message.OpenConnectionReply1{ServerGUID: 1, MTU: safeMTUSize}).MarshalBinary()
+		requestData <- compatibilityRequest{mtu: request.MTU, cookie: request.Cookie}
+		valid, _ := (&message.OpenConnectionReply1{
+			ServerGUID: 1, ServerHasSecurity: true, Cookie: cookie, MTU: safeMTUSize,
+		}).MarshalBinary()
 		_, _ = server.WriteTo(valid, addr)
 	}()
 
@@ -381,9 +390,12 @@ func TestDiscoverMTUEchoesCompatibilityRequest2(t *testing.T) {
 		t.Fatal(err)
 	}
 	select {
-	case got := <-requestMTU:
-		if got != 44819 {
-			t.Fatalf("compatibility Request 2 MTU: got %v, want challenge %v", got, 44819)
+	case got := <-requestData:
+		if got.mtu != challenge {
+			t.Fatalf("compatibility Request 2 MTU: got %v, want challenge %v", got.mtu, challenge)
+		}
+		if got.cookie != cookie {
+			t.Fatalf("compatibility Request 2 cookie: got %v, want %v", got.cookie, cookie)
 		}
 	case <-ctx.Done():
 		t.Fatal("timed out waiting for compatibility Request 2")
