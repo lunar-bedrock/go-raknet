@@ -101,7 +101,7 @@ type Dialer struct {
 
 	// MaxTransientErrors is the maximum number of transient errors to ignore
 	// before returning an error. These include errors that can occur on
-	// bad connections such as ECONNREFUSED, EHOSTUNREACH, ENETUNREACH, ECONNRESET.
+	// bad connections such as EMSGSIZE, ECONNREFUSED, EHOSTUNREACH, ENETUNREACH, ECONNRESET.
 	// If there is no limit it will continue to retry reading until the context deadline.
 	// Default is 10. -1 means no limit.
 	// This is only used for the initial connection handshake.
