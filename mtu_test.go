@@ -326,9 +326,10 @@ func TestProvenMTU(t *testing.T) {
 	}
 }
 
-// TestDiscoverMTUClampsCompatibilityRequest2 checks the invalid-MTU fallback
-// cannot bypass Dialer.MaxMTU while sending its one-off Request 2 packet.
-func TestDiscoverMTUClampsCompatibilityRequest2(t *testing.T) {
+// TestDiscoverMTUEchoesCompatibilityRequest2 checks the invalid-MTU fallback
+// echoes the challenge value exactly. DDoS protection may require that value
+// even though it is not a usable packet size.
+func TestDiscoverMTUEchoesCompatibilityRequest2(t *testing.T) {
 	server, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -342,7 +343,7 @@ func TestDiscoverMTUClampsCompatibilityRequest2(t *testing.T) {
 		if err != nil {
 			return
 		}
-		invalid, _ := (&message.OpenConnectionReply1{ServerGUID: 1, MTU: 1600}).MarshalBinary()
+		invalid, _ := (&message.OpenConnectionReply1{ServerGUID: 1, MTU: 44819}).MarshalBinary()
 		if _, err = server.WriteTo(invalid, addr); err != nil {
 			return
 		}
@@ -381,8 +382,8 @@ func TestDiscoverMTUClampsCompatibilityRequest2(t *testing.T) {
 	}
 	select {
 	case got := <-requestMTU:
-		if got != safeMTUSize {
-			t.Fatalf("compatibility Request 2 MTU: got %v, want cap %v", got, safeMTUSize)
+		if got != 44819 {
+			t.Fatalf("compatibility Request 2 MTU: got %v, want challenge %v", got, 44819)
 		}
 	case <-ctx.Done():
 		t.Fatal("timed out waiting for compatibility Request 2")
