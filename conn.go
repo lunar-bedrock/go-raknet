@@ -213,6 +213,7 @@ func newConn(conn net.PacketConn, raddr net.Addr, mtu uint16, h connectionHandle
 	c.ctx, c.cancelFunc = context.WithCancel(context.Background())
 	t := time.Now()
 	c.lastActivity.Store(&t)
+	registerMetricsConnection(c)
 	go c.startTicking()
 	return c
 }
@@ -540,6 +541,7 @@ func (conn *Conn) closeImmediately() {
 
 		conn.handler.close(conn)
 		conn.cancelFunc()
+		unregisterMetricsConnection(conn)
 
 		conn.mu.Lock()
 		defer conn.mu.Unlock()
@@ -889,10 +891,12 @@ func (conn *Conn) handleACK(b []byte) error {
 	if err := ack.read(b); err != nil {
 		return fmt.Errorf("read ACK: %w", err)
 	}
+	metricsACKs.Add(uint64(len(ack.packets)))
 	conn.ackedAny.Store(true)
 	conn.congestion.continuous = conn.continuousSend
 	for _, sequenceNumber := range ack.packets {
 		if record, ok := conn.retransmission.acknowledge(sequenceNumber); ok {
+			metricsBytesACKed.Add(uint64(record.inFlightBytes))
 			conn.congestion.acknowledged(record.inFlightBytes)
 			conn.congestion.ack(sequenceNumber, conn.seq)
 			record.pk.content = record.pk.content[:0]
@@ -914,6 +918,7 @@ func (conn *Conn) handleNACK(b []byte) error {
 	if err := nack.read(b); err != nil {
 		return fmt.Errorf("read NACK: %w", err)
 	}
+	metricsNACKs.Add(uint64(len(nack.packets)))
 	conn.congestion.nak(conn.seq)
 	// Bring the send timers forward so the next update retransmits them, which
 	// is how the client turns a NAK into a resend.
@@ -1081,6 +1086,13 @@ func (conn *Conn) sendDatagram(pk *packet, size uint32, retransmit bool) error {
 		pk.content = pk.content[:0]
 		packetPool.Put(pk)
 		return fmt.Errorf("send datagram: %w", err)
+	}
+	if pk.reliability.reliable() {
+		metricsDatagrams.Add(1)
+		metricsBytesSent.Add(uint64(conn.buf.Len()))
+		if retransmit {
+			metricsRetransmits.Add(1)
+		}
 	}
 	if !pk.reliability.reliable() {
 		pk.content = pk.content[:0]
