@@ -101,7 +101,7 @@ type Dialer struct {
 
 	// MaxTransientErrors is the maximum number of transient errors to ignore
 	// before returning an error. These include errors that can occur on
-	// bad connections such as ECONNREFUSED, EHOSTUNREACH, ENETUNREACH, ECONNRESET.
+	// bad connections such as EMSGSIZE, ECONNREFUSED, EHOSTUNREACH, ENETUNREACH, ECONNRESET.
 	// If there is no limit it will continue to retry reading until the context deadline.
 	// Default is 10. -1 means no limit.
 	// This is only used for the initial connection handshake.
@@ -431,7 +431,9 @@ func (state *connState) discoverMTU(ctx context.Context) error {
 				// protection. For some reason they send a broken MTU size
 				// first. Sending a Request2 followed by a Request1 deals with
 				// this.
-				state.openConnectionRequest2(min(response.MTU, maxMTU), state.serverSecurity, state.cookie)
+				// Echo the broken value exactly: protection layers use it as a
+				// challenge, not as the datagram size for this Request 2.
+				state.openConnectionRequest2(response.MTU, state.serverSecurity, state.cookie)
 				continue
 			}
 			if response.MTU > maxMTU {

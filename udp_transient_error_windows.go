@@ -9,9 +9,11 @@ import (
 
 // Winsock error codes for transient UDP errors.
 const (
+	wsaeMsgSize     = syscall.Errno(10040) // WSAEMSGSIZE
 	wsaeConnRefused = syscall.Errno(10061) // ECONNREFUSED
 	wsaeHostUnreach = syscall.Errno(10065) // EHOSTUNREACH
 	wsaeNetUnreach  = syscall.Errno(10051) // ENETUNREACH
+	wsaeNetReset    = syscall.Errno(10052) // WSAENETRESET
 	wsaeConnReset   = syscall.Errno(10054) // ECONNRESET
 	wsaeConnAborted = syscall.Errno(10053) // ECONNABORTED
 )
@@ -26,7 +28,7 @@ func isTransientUDPReadError(err error) bool {
 	var errno syscall.Errno
 	if errors.As(err, &errno) {
 		switch errno {
-		case wsaeConnRefused, wsaeHostUnreach, wsaeNetUnreach, wsaeConnReset, wsaeConnAborted:
+		case wsaeMsgSize, wsaeConnRefused, wsaeHostUnreach, wsaeNetUnreach, wsaeNetReset, wsaeConnReset, wsaeConnAborted:
 			return true
 		}
 	}
