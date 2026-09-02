@@ -140,6 +140,10 @@ type Conn struct {
 	// which datagrams were missing, so that we can send NACKs to request
 	// missing datagrams.
 	win *datagramWindow
+	// reliableWin drops reliable messages that were received before, so a
+	// repeat carried by a retransmitted or duplicated datagram is processed
+	// only once whatever its ordering class.
+	reliableWin reliableWindow
 
 	ackMu sync.Mutex
 	// ackSlice is a slice containing sequence numbers of datagrams that were
@@ -191,15 +195,16 @@ type Conn struct {
 func newConn(conn net.PacketConn, raddr net.Addr, mtu uint16, h connectionHandler) *Conn {
 	mtu = clampMTU(mtu, minMTUSize)
 	c := &Conn{
-		raddr:          raddr,
-		conn:           conn,
-		mtu:            mtu,
-		handler:        h,
-		pk:             new(packet),
-		connected:      make(chan struct{}),
-		packets:        internal.Chan[[]byte](4, 4096),
-		splits:         make(map[uint16]splitEntry),
-		win:            newDatagramWindow(),
+		raddr:     raddr,
+		conn:      conn,
+		mtu:       mtu,
+		handler:   h,
+		pk:        new(packet),
+		connected: make(chan struct{}),
+		packets:   internal.Chan[[]byte](4, 4096),
+		splits:    make(map[uint16]splitEntry),
+		win:       newDatagramWindow(),
+
 		packetQueue:    newPacketQueue(),
 		retransmission: newRecoveryQueue(),
 		congestion:     newCongestionWindow(mtu - 28),
@@ -714,6 +719,11 @@ func (conn *Conn) handleDatagram(b []byte) error {
 		}
 		b = b[n:]
 
+		if conn.pk.reliability.reliable() && !conn.reliableWin.add(conn.pk.messageIndex) {
+			// Received before: the datagram carrying it is acknowledged either
+			// way, and the repeat must not be processed twice.
+			continue
+		}
 		handle := conn.receivePacket
 		if conn.pk.split {
 			handle = conn.receiveSplitPacket
