@@ -176,13 +176,13 @@ func (h listenerConnectionHandler) handle(conn *Conn, b []byte) (handled bool, e
 	case message.IDConnectedPing:
 		return true, handleConnectedPing(conn, b[1:])
 	case message.IDConnectedPong:
-		return true, handleConnectedPong(b[1:])
+		return true, handleConnectedPong(conn, b[1:])
 	case message.IDDisconnectNotification:
 		conn.closeImmediately()
 		return true, nil
 	case message.IDDetectLostConnections:
 		// Let the other end know the connection is still alive.
-		return true, conn.send(&message.ConnectedPing{PingTime: timestamp()})
+		return true, conn.sendConnectedPing()
 	default:
 		return false, nil
 	}
@@ -242,13 +242,13 @@ func (h dialerConnectionHandler) handle(conn *Conn, b []byte) (handled bool, err
 	case message.IDConnectedPing:
 		return true, handleConnectedPing(conn, b[1:])
 	case message.IDConnectedPong:
-		return true, handleConnectedPong(b[1:])
+		return true, handleConnectedPong(conn, b[1:])
 	case message.IDDisconnectNotification:
 		conn.closeImmediately()
 		return true, nil
 	case message.IDDetectLostConnections:
 		// Let the other end know the connection is still alive.
-		return true, conn.send(&message.ConnectedPing{PingTime: timestamp()})
+		return true, conn.sendConnectedPing()
 	default:
 		return false, nil
 	}
@@ -286,15 +286,11 @@ func handleConnectedPing(conn *Conn, b []byte) error {
 
 // handleConnectedPong handles a connected pong packet inside of buffer b. An
 // error is returned if the packet was invalid.
-func handleConnectedPong(b []byte) error {
+func handleConnectedPong(conn *Conn, b []byte) error {
 	pk := &message.ConnectedPong{}
 	if err := pk.UnmarshalBinary(b); err != nil {
 		return fmt.Errorf("read CONNECTED_PONG: %w", err)
 	}
-	if pk.PingTime > timestamp() {
-		return fmt.Errorf("handle CONNECTED_PONG: timestamp is in the future")
-	}
-	// We don't actually use the ConnectedPong to measure rtt. It is too
-	// unreliable and doesn't give a good idea of the connection quality.
+	conn.observeConnectedPong(pk.PingTime, time.Now())
 	return nil
 }

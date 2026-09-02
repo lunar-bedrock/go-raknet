@@ -28,6 +28,14 @@ func (queue *packetQueue) put(index uint24, packet []byte) bool {
 	return true
 }
 
+func (queue *packetQueue) contains(index uint24) bool {
+	if index < queue.lowest {
+		return true
+	}
+	_, ok := queue.queue[index]
+	return ok
+}
+
 // fetch attempts to take out as many values from the ordered queue as
 // possible. Upon encountering an index that has no value yet, the function
 // returns all values that it did find and takes them out.
@@ -49,4 +57,12 @@ func (queue *packetQueue) fetch() (packets [][]byte) {
 // WindowSize returns the size of the window held by the packet queue.
 func (queue *packetQueue) WindowSize() uint24 {
 	return queue.highest - queue.lowest
+}
+
+func (queue *packetQueue) WindowSizeWith(index uint24) uint24 {
+	highest := queue.highest
+	if index >= highest {
+		highest = index + 1
+	}
+	return highest - queue.lowest
 }

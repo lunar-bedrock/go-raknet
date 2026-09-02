@@ -16,7 +16,24 @@ const (
 	packetSingle
 )
 
-var errMaxAcknowledgement = errors.New("maximum amount of packets in acknowledgement exceeded")
+// maxAcknowledgementPackets caps the number of datagram sequence numbers that
+// one ACK/NACK packet may expand to while being parsed.
+const maxAcknowledgementPackets = 8192
+
+var (
+	// errInvalidAcknowledgementRange is returned when an ACK/NACK range has a
+	// start sequence greater than its end sequence.
+	errInvalidAcknowledgementRange = errors.New("invalid acknowledgement range")
+	// errInvalidAcknowledgementRecord is returned when an ACK/NACK record has an
+	// unknown record type.
+	errInvalidAcknowledgementRecord = errors.New("invalid acknowledgement record")
+	// errMaxAcknowledgement is returned when one ACK/NACK packet expands to too
+	// many datagram sequence numbers.
+	errMaxAcknowledgement = errors.New("maximum amount of packets in acknowledgement exceeded")
+	// errUnexpectedAcknowledgement is returned when bytes remain after all
+	// declared ACK/NACK records have been consumed.
+	errUnexpectedAcknowledgement = errors.New("unexpected acknowledgement data")
+)
 
 // acknowledgement is an acknowledgement packet that may either be an ACK or a
 // NACK, depending on the purpose that it is sent with.
@@ -72,6 +89,8 @@ func (ack *acknowledgement) write(buf *bytes.Buffer, mtu uint16) int {
 	return n
 }
 
+// writeRecord appends one single-packet or range ACK/NACK record to buf and
+// increments count.
 func (ack *acknowledgement) writeRecord(buf *bytes.Buffer, first, last uint24, count *uint16) {
 	if first == last {
 		// First packet equals last packet, so we have a single packet
@@ -93,7 +112,6 @@ func (ack *acknowledgement) writeRecord(buf *bytes.Buffer, first, last uint24, c
 // read decodes an acknowledgement packet and returns an error if not
 // successful.
 func (ack *acknowledgement) read(b []byte) error {
-	const maxAcknowledgementPackets = 8192
 	if len(b) < 2 {
 		return io.ErrUnexpectedEOF
 	}
@@ -108,7 +126,11 @@ func (ack *acknowledgement) read(b []byte) error {
 				return io.ErrUnexpectedEOF
 			}
 			start, end := loadUint24(b[offset+1:]), loadUint24(b[offset+4:])
-			if uint24(len(ack.packets))+end-start > maxAcknowledgementPackets {
+			if start > end {
+				return errInvalidAcknowledgementRange
+			}
+			count := uint64(end-start) + 1
+			if uint64(len(ack.packets))+count > maxAcknowledgementPackets {
 				return errMaxAcknowledgement
 			}
 			for pk := start; pk <= end; pk++ {
@@ -121,7 +143,12 @@ func (ack *acknowledgement) read(b []byte) error {
 			}
 			ack.packets = append(ack.packets, loadUint24(b[offset+1:]))
 			offset += 4
+		default:
+			return errInvalidAcknowledgementRecord
 		}
+	}
+	if offset != len(b) {
+		return errUnexpectedAcknowledgement
 	}
 	return nil
 }
