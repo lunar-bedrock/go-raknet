@@ -23,10 +23,24 @@ const (
 	// specific.
 	protocolVersion byte = 11
 
-	minMTUSize    = 400
-	maxMTUSize    = 1492
-	maxWindowSize = 2048
+	minMTUSize               = 400
+	maxMTUSize               = 1492
+	maxWindowSize            = 2048
+	maxSplitCount            = 512
+	maxConcurrentSplits      = 16
+	maxSplitRetainedBytes    = maxSplitCount * maxMTUSize
+	maxNACKResendsPerPacket  = 64
+	minNACKResendDelay       = 50 * time.Millisecond
+	maxSplitAssemblyLifetime = time.Second * 30
 )
+
+type splitAssembly struct {
+	count     uint32
+	fragments [][]byte
+	bytes     int
+	created   time.Time
+	lastSeen  time.Time
+}
 
 // Conn represents a connection to a specific client. It is not a real
 // connection, as UDP is connectionless, but rather a connection emulated using
@@ -68,10 +82,10 @@ type Conn struct {
 	// losing bytes.
 	mtu uint16
 
-	// splits is a map of slices indexed by split IDs. The length of each of the
-	// slices is equal to the split count, and packets are positioned in that
-	// slice indexed by the split index.
-	splits map[uint16][][]byte
+	// splits is a map of incomplete split packet assemblies indexed by split
+	// IDs.
+	splits     map[uint16]*splitAssembly
+	splitBytes int
 
 	// win is an ordered queue used to track which datagrams were received and
 	// which datagrams were missing, so that we can send NACKs to request
@@ -110,7 +124,7 @@ func newConn(conn net.PacketConn, raddr net.Addr, mtu uint16, h connectionHandle
 		pk:             new(packet),
 		connected:      make(chan struct{}),
 		packets:        internal.Chan[[]byte](4, 4096),
-		splits:         make(map[uint16][][]byte),
+		splits:         make(map[uint16]*splitAssembly),
 		win:            newDatagramWindow(),
 		packetQueue:    newPacketQueue(),
 		retransmission: newRecoveryQueue(),
@@ -432,6 +446,9 @@ func (conn *Conn) receiveDatagram(b []byte) error {
 		return fmt.Errorf("read datagram: %w", io.ErrUnexpectedEOF)
 	}
 	seq := loadUint24(b)
+	if conn.handler.limitsEnabled() && !conn.win.seen(seq) && seq-conn.win.lowest >= maxWindowSize {
+		return fmt.Errorf("receive datagram: sequence number %v exceeds receive window (%v-%v)", seq, conn.win.lowest, conn.win.lowest+maxWindowSize-1)
+	}
 	if !conn.win.add(seq) {
 		// Datagram was already received, this might happen if a packet took a
 		// long time to arrive, and we already sent a NACK for it. This is
@@ -522,7 +539,9 @@ func (conn *Conn) handlePacket(b []byte) error {
 		return fmt.Errorf("handle packet: %w", err)
 	}
 	if !handled {
-		conn.packets.Send(b)
+		if !conn.packets.TrySend(b) {
+			return ErrPacketQueueFull
+		}
 	}
 	return nil
 }
@@ -543,36 +562,74 @@ func resolve(addr net.Addr) netip.AddrPort {
 // packet of its sequence, it will continue handling the full packet as it
 // otherwise would. An error is returned if the packet was not valid.
 func (conn *Conn) receiveSplitPacket(p *packet) error {
-	const maxSplitCount = 512
-	const maxConcurrentSplits = 16
-
-	if p.splitCount > maxSplitCount && conn.handler.limitsEnabled() {
+	if p.splitCount < 2 {
+		return fmt.Errorf("split packet: split count %v is invalid", p.splitCount)
+	}
+	if p.splitIndex >= p.splitCount {
+		return fmt.Errorf("split packet: split index %v is out of range (0 - %v)", p.splitIndex, p.splitCount-1)
+	}
+	now := time.Now()
+	limits := conn.handler.limitsEnabled()
+	conn.expireSplits(now)
+	if limits && p.splitCount > maxSplitCount {
 		return fmt.Errorf("split packet: split count %v exceeds the maximum %v", p.splitCount, maxSplitCount)
 	}
-	if len(conn.splits) > maxConcurrentSplits && conn.handler.limitsEnabled() {
-		return fmt.Errorf("split packet: maximum concurrent splits %v reached", maxConcurrentSplits)
+	assembly, ok := conn.splits[p.splitID]
+	if ok && assembly.count != p.splitCount {
+		return fmt.Errorf("split packet: conflicting split count %v for split ID %v, expected %v", p.splitCount, p.splitID, assembly.count)
 	}
-	m, ok := conn.splits[p.splitID]
 	if !ok {
-		m = make([][]byte, p.splitCount)
-		conn.splits[p.splitID] = m
+		if limits && len(conn.splits) >= maxConcurrentSplits {
+			return fmt.Errorf("split packet: maximum concurrent splits %v reached", maxConcurrentSplits)
+		}
+		assembly = &splitAssembly{
+			count:     p.splitCount,
+			fragments: make([][]byte, p.splitCount),
+			created:   now,
+			lastSeen:  now,
+		}
+		conn.splits[p.splitID] = assembly
 	}
-	if p.splitIndex > uint32(len(m)-1) {
-		// The split index was either negative or was bigger than the slice
-		// size, meaning the packet is invalid.
-		return fmt.Errorf("split packet: split index %v is out of range (0 - %v)", p.splitIndex, len(m)-1)
+	if assembly.fragments[p.splitIndex] != nil {
+		return nil
 	}
-	m[p.splitIndex] = p.content
+	if limits && conn.splitBytes+len(p.content) > maxSplitRetainedBytes {
+		if assembly.bytes == 0 {
+			delete(conn.splits, p.splitID)
+		}
+		return fmt.Errorf("split packet: retained split bytes %v exceed the maximum %v", conn.splitBytes+len(p.content), maxSplitRetainedBytes)
+	}
+	assembly.fragments[p.splitIndex] = p.content
+	assembly.lastSeen = now
+	assembly.bytes += len(p.content)
+	conn.splitBytes += len(p.content)
 
-	if slices.ContainsFunc(m, func(i []byte) bool { return len(i) == 0 }) {
+	if slices.ContainsFunc(assembly.fragments, func(fragment []byte) bool { return fragment == nil }) {
 		// We haven't yet received all split fragments, so we cannot add the
 		// packets together yet.
 		return nil
 	}
-	p.content = slices.Concat(m...)
+	p.content = slices.Concat(assembly.fragments...)
 
 	delete(conn.splits, p.splitID)
+	conn.splitBytes -= assembly.bytes
 	return conn.receivePacket(p)
+}
+
+func (conn *Conn) expireSplits(now time.Time) {
+	if !conn.handler.limitsEnabled() {
+		return
+	}
+	for splitID, assembly := range conn.splits {
+		if now.Sub(assembly.lastSeen) <= maxSplitAssemblyLifetime {
+			continue
+		}
+		conn.splitBytes -= assembly.bytes
+		delete(conn.splits, splitID)
+	}
+	if conn.splitBytes < 0 {
+		conn.splitBytes = 0
+	}
 }
 
 // sendACK sends an acknowledgement packet containing the packet sequence
@@ -642,7 +699,28 @@ func (conn *Conn) handleNACK(b []byte) error {
 	if err := nack.read(b); err != nil {
 		return fmt.Errorf("read NACK: %w", err)
 	}
-	return conn.resend(nack.packets)
+	return conn.resendNACK(nack.packets)
+}
+
+func (conn *Conn) resendNACK(sequenceNumbers []uint24) error {
+	now := time.Now()
+	seen := make(map[uint24]struct{}, min(len(sequenceNumbers), maxNACKResendsPerPacket))
+	resend := make([]uint24, 0, min(len(sequenceNumbers), maxNACKResendsPerPacket))
+	for _, sequenceNumber := range sequenceNumbers {
+		if _, ok := seen[sequenceNumber]; ok {
+			continue
+		}
+		record, ok := conn.retransmission.unacknowledged[sequenceNumber]
+		if !ok || now.Sub(record.timestamp) < minNACKResendDelay {
+			continue
+		}
+		seen[sequenceNumber] = struct{}{}
+		resend = append(resend, sequenceNumber)
+		if len(resend) == maxNACKResendsPerPacket {
+			break
+		}
+	}
+	return conn.resend(resend)
 }
 
 // resend sends all datagrams currently in the recovery queue with the sequence
