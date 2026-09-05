@@ -386,7 +386,8 @@ func TestDiscoverMTUEchoesCompatibilityRequest2(t *testing.T) {
 		maxTransientErrors: 10,
 	}
 	defer state.ticker.Stop()
-	if err = state.discoverMTU(ctx); err != nil {
+	go state.request1(ctx, mtuSizesFor(state.maxMTU))
+	if err = state.discoverMTU(); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -679,5 +680,103 @@ func TestListenerFloorsNonsenseRequest2(t *testing.T) {
 	}
 	if pk.MTU != minMTUSize {
 		t.Fatalf("granted MTU: got %v, want %v", pk.MTU, minMTUSize)
+	}
+}
+
+// TestNegotiateContinuesProbingAfterReply1 reproduces protection that answers large
+// probes but only accepts Request 2 after a smaller probe with a refreshed cookie.
+func TestNegotiateContinuesProbingAfterReply1(t *testing.T) {
+	server, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	accepted := make(chan uint16, 1)
+	go func() {
+		b := make([]byte, 2048)
+		cookie := uint32(1)
+		for {
+			n, addr, err := server.ReadFrom(b)
+			if err != nil {
+				return
+			}
+			if n == 0 {
+				continue
+			}
+			switch b[0] {
+			case message.IDOpenConnectionRequest1:
+				size := uint16(n + 28)
+				if size <= safeMTUSize {
+					cookie = 2
+				}
+				data, _ := (&message.OpenConnectionReply1{ServerGUID: 1, ServerHasSecurity: true, Cookie: cookie, MTU: size}).MarshalBinary()
+				_, _ = server.WriteTo(data, addr)
+			case message.IDOpenConnectionRequest2:
+				request := &message.OpenConnectionRequest2{ServerHasSecurity: true}
+				if request.UnmarshalBinary(b[1:n]) != nil || cookie != 2 || request.Cookie != cookie {
+					continue
+				}
+				accepted <- request.MTU
+				data, _ := (&message.OpenConnectionReply2{ServerGUID: 1, ClientAddress: netip.MustParseAddrPort("127.0.0.1:1"), MTU: request.MTU}).MarshalBinary()
+				_, _ = server.WriteTo(data, addr)
+				return
+			}
+		}
+	}()
+	conn, err := net.Dial("udp", server.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	state := &connState{conn: conn, raddr: conn.RemoteAddr(), ticker: time.NewTicker(time.Hour)}
+	defer state.ticker.Stop()
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	if err := state.negotiate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if mtu := <-accepted; mtu != safeMTUSize {
+		t.Fatalf("accepted MTU = %d, want %d", mtu, safeMTUSize)
+	}
+	// The socket remains usable, but neither offline sender may outlive negotiation.
+	_ = server.SetReadDeadline(time.Now().Add(600 * time.Millisecond))
+	b := make([]byte, 2048)
+	if n, _, err := server.ReadFrom(b); err == nil {
+		t.Fatalf("offline packet after negotiation: %x", b[:n])
+	}
+}
+
+// TestNegotiateCancellationClosesRead verifies cancellation without a deadline
+// interrupts the offline read and joins its senders.
+func TestNegotiateCancellationClosesRead(t *testing.T) {
+	server, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	conn, err := net.Dial("udp", server.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	state := &connState{conn: conn, raddr: conn.RemoteAddr(), ticker: time.NewTicker(time.Hour)}
+	defer state.ticker.Stop()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- state.negotiate(ctx) }()
+	_ = server.SetReadDeadline(time.Now().Add(time.Second))
+	b := make([]byte, 2048)
+	if _, _, err := server.ReadFrom(b); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("canceled negotiation succeeded")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancellation did not interrupt negotiation")
 	}
 }

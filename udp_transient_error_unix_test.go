@@ -3,7 +3,6 @@
 package raknet
 
 import (
-	"context"
 	"net"
 	"os"
 	"syscall"
@@ -63,9 +62,7 @@ func TestDiscoverMTU_ContinuesAfterMessageTooLong(t *testing.T) {
 	}
 	defer state.ticker.Stop()
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	if err = state.discoverMTU(ctx); err != nil {
+	if err = state.discoverMTU(); err != nil {
 		t.Fatal(err)
 	}
 	if state.mtu != safeMTUSize {
