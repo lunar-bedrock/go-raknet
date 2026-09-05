@@ -728,7 +728,8 @@ func TestNegotiateContinuesProbingAfterReply1(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	state := &connState{conn: conn, raddr: conn.RemoteAddr(), ticker: time.NewTicker(time.Hour)}
+	counted := &offlineWriteCounter{Conn: conn}
+	state := &connState{conn: counted, raddr: conn.RemoteAddr(), ticker: time.NewTicker(time.Hour)}
 	defer state.ticker.Stop()
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 	defer cancel()
@@ -738,11 +739,12 @@ func TestNegotiateContinuesProbingAfterReply1(t *testing.T) {
 	if mtu := <-accepted; mtu != safeMTUSize {
 		t.Fatalf("accepted MTU = %d, want %d", mtu, safeMTUSize)
 	}
-	// The socket remains usable, but neither offline sender may outlive negotiation.
-	_ = server.SetReadDeadline(time.Now().Add(600 * time.Millisecond))
-	b := make([]byte, 2048)
-	if n, _, err := server.ReadFrom(b); err == nil {
-		t.Fatalf("offline packet after negotiation: %x", b[:n])
+	// Count writes instead of received datagrams: packets sent before Reply 2
+	// may still be queued on the server when negotiation returns.
+	writes := counted.writes.Load()
+	time.Sleep(600 * time.Millisecond)
+	if got := counted.writes.Load(); got != writes {
+		t.Fatalf("offline sender survived negotiation: writes grew from %d to %d", writes, got)
 	}
 }
 
@@ -779,4 +781,16 @@ func TestNegotiateCancellationClosesRead(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("cancellation did not interrupt negotiation")
 	}
+}
+
+// offlineWriteCounter counts sends independently of UDP receive scheduling.
+type offlineWriteCounter struct {
+	net.Conn
+	writes atomic.Uint64
+}
+
+// Write records a send before forwarding it to the socket.
+func (c *offlineWriteCounter) Write(b []byte) (int, error) {
+	c.writes.Add(1)
+	return c.Conn.Write(b)
 }
