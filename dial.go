@@ -254,19 +254,9 @@ func (dialer Dialer) DialContext(ctx context.Context, address string) (*Conn, er
 		maxMTU:             dialer.MaxMTU,
 	}
 	defer cs.ticker.Stop()
-	if err = cs.discoverMTU(ctx); err != nil {
-		return nil, dialer.error("dial", fmt.Errorf("discover mtu: %w", err))
+	if err = cs.negotiate(ctx); err != nil {
+		return nil, dialer.error("dial", err)
 	}
-	// dialer.ErrorLog.Debug("raknet mtu discovered",
-	// 	"mtu", cs.mtu,
-	// 	"server_security", cs.serverSecurity,
-	// )
-	if err = cs.openConnection(ctx); err != nil {
-		return nil, dialer.error("dial", fmt.Errorf("open connection: %w", err))
-	}
-	// dialer.ErrorLog.Debug("raknet open connection succeeded",
-	// 	"mtu", cs.mtu,
-	// )
 	return dialer.connect(ctx, cs)
 }
 
@@ -393,14 +383,40 @@ func mtuSizesFor(maxMTU uint16) []uint16 {
 	return out
 }
 
-// discoverMTU starts discovering an MTU size, the maximum packet size we
-// can send, by sending multiple open connection request 1 packets to the
-// server with a decreasing MTU size padding.
-func (state *connState) discoverMTU(ctx context.Context) error {
+// negotiate keeps MTU probes running until Reply 2 completes the offline handshake.
+// All senders stop before the connected packet reader takes over the socket.
+func (state *connState) negotiate(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		state.request1(ctx, mtuSizesFor(state.maxMTU))
+	}()
+	closed := make(chan struct{})
+	stopClose := context.AfterFunc(ctx, func() {
+		state.close()
+		close(closed)
+	})
+	defer func() {
+		if !stopClose() {
+			<-closed
+		}
+		cancel()
+		<-done
+	}()
+	if err := state.discoverMTU(); err != nil {
+		state.close()
+		return fmt.Errorf("discover mtu: %w", err)
+	}
+	if err := state.openConnection(ctx); err != nil {
+		state.close()
+		return fmt.Errorf("open connection: %w", err)
+	}
+	return nil
+}
 
-	go state.request1(ctx, mtuSizesFor(state.maxMTU))
+// discoverMTU reads the initial MTU grant while negotiate runs the probe ladder.
+func (state *connState) discoverMTU() error {
 	maxMTU := clampMTU(state.maxMTU, minSupportedMTU)
 
 	b := make([]byte, maxMTUSize)
@@ -439,10 +455,8 @@ func (state *connState) discoverMTU(ctx context.Context) error {
 			if response.MTU > maxMTU {
 				continue
 			}
-			// An unproven grant commits the safe size straight away rather than
-			// waiting out the rung: the larger request reached the server, so
-			// the path towards it carries the smaller size too. A server does
-			// not check that Request 2 echoes a size it granted.
+			// Commit a safe size while the probe ladder continues. Some protected
+			// servers only accept Request 2 after a smaller Request 1 arrives.
 			state.mtu = provenMTU(response.MTU, n)
 			return nil
 		case message.IDIncompatibleProtocolVersion:
@@ -462,6 +476,9 @@ func (state *connState) request1(ctx context.Context, sizes []uint16) {
 	state.ticker.Reset(time.Second / 2)
 	for _, size := range sizes {
 		for range 4 {
+			if ctx.Err() != nil {
+				return
+			}
 			state.openConnectionRequest1(size)
 			select {
 			case <-state.ticker.C:
@@ -476,10 +493,8 @@ func (state *connState) request1(ctx context.Context, sizes []uint16) {
 // openConnection sends open connection request 2 packets continuously
 // until it receives an open connection reply 2 packet from the server.
 func (state *connState) openConnection(ctx context.Context) error {
-	requestCtx, cancelRequests := context.WithCancel(ctx)
-	activeCancel := struct{ cancel context.CancelFunc }{cancelRequests}
-	defer func() { activeCancel.cancel() }()
-	go state.request2(requestCtx, state.mtu, state.serverSecurity, state.cookie)
+	stopRequests := state.startRequest2(ctx)
+	defer func() { stopRequests() }()
 	maxMTU := clampMTU(state.maxMTU, minSupportedMTU)
 
 	b := make([]byte, maxMTUSize)
@@ -512,10 +527,8 @@ func (state *connState) openConnection(ctx context.Context) error {
 			// size, never raise it.
 			state.serverSecurity, state.cookie = pk.ServerHasSecurity, pk.Cookie
 			state.mtu = min(state.mtu, provenMTU(pk.MTU, n))
-			activeCancel.cancel()
-			requestCtx, cancelRequests = context.WithCancel(ctx)
-			activeCancel.cancel = cancelRequests
-			go state.request2(requestCtx, state.mtu, state.serverSecurity, state.cookie)
+			stopRequests()
+			stopRequests = state.startRequest2(ctx)
 		case message.IDOpenConnectionReply2:
 			pk := &message.OpenConnectionReply2{}
 			if err = pk.UnmarshalBinary(b[1:n]); err != nil {
@@ -530,11 +543,30 @@ func (state *connState) openConnection(ctx context.Context) error {
 	}
 }
 
+// startRequest2 starts retries with a snapshot of the current grant and cookie.
+// The returned function cancels and joins the sender before its replacement starts.
+func (state *connState) startRequest2(ctx context.Context) func() {
+	ctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	mtu, security, cookie := state.mtu, state.serverSecurity, state.cookie
+	go func() {
+		defer close(done)
+		state.request2(ctx, mtu, security, cookie)
+	}()
+	return func() {
+		cancel()
+		<-done
+	}
+}
+
 // request2 continuously sends a message.OpenConnectionRequest2 every 500ms.
 func (state *connState) request2(ctx context.Context, mtu uint16, serverSecurity bool, cookie uint32) {
 	ticker := time.NewTicker(time.Second / 2)
 	defer ticker.Stop()
 	for {
+		if ctx.Err() != nil {
+			return
+		}
 		state.openConnectionRequest2(mtu, serverSecurity, cookie)
 		select {
 		case <-ticker.C:
