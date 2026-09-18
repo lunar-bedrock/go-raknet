@@ -35,8 +35,8 @@ const (
 	// splitTimeout is how long a reassembly may go without a new fragment
 	// before its slot may be reclaimed. The client uses its connection timeout.
 	splitTimeout = time.Second * 10
-	// splitSweepInterval bounds how often arriving at the cap may sweep, so a
-	// peer cannot make every fragment it sends scan the whole reassembly map.
+	// splitSweepInterval bounds how often inbound traffic may sweep, so a peer
+	// cannot make every datagram it sends scan the whole reassembly map.
 	splitSweepInterval = time.Second
 )
 
@@ -431,6 +431,12 @@ var packetPool = sync.Pool{New: func() any { return &packet{reliability: reliabi
 func (conn *Conn) receive(b []byte) error {
 	t := time.Now()
 	conn.lastActivity.Store(&t)
+	if len(conn.splits) != 0 && t.Sub(conn.lastSplitSweep) >= splitSweepInterval {
+		// Reclaim reassemblies that stopped advancing, so an abandoned set
+		// cannot hold its slots and memory for the rest of the session.
+		conn.lastSplitSweep = t
+		conn.evictExpiredSplits(t)
+	}
 
 	switch {
 	case b[0]&bitFlagACK != 0:
@@ -566,6 +572,12 @@ func (conn *Conn) receiveSplitPacket(p *packet) error {
 	if p.splitCount == 0 || p.splitCount > maxSplitCount {
 		return fmt.Errorf("split packet: split count %v is out of range (1 - %v)", p.splitCount, maxSplitCount)
 	}
+	if p.splitIndex >= p.splitCount {
+		// The fragment fits no slot of the packet it claims to belong to. Drop
+		// it before the allocation below, which nothing would retain: a peer
+		// may repeat this fragment, and the concurrency cap cannot throttle it.
+		return nil
+	}
 	entry, ok := conn.splits[p.splitID]
 	if ok && int(p.splitCount) != len(entry.fragments) {
 		// The split count disagrees with the reassembly already under way for
@@ -573,10 +585,6 @@ func (conn *Conn) receiveSplitPacket(p *packet) error {
 		return nil
 	}
 	if !ok {
-		if now := time.Now(); len(conn.splits) >= maxConcurrentSplits && now.Sub(conn.lastSplitSweep) >= splitSweepInterval {
-			conn.lastSplitSweep = now
-			conn.evictExpiredSplits(now)
-		}
 		if len(conn.splits) >= maxConcurrentSplits {
 			// Drop the fragment starting a new packet, never one already part
 			// reassembled: its fragments are acknowledged, so the sender will
@@ -584,9 +592,6 @@ func (conn *Conn) receiveSplitPacket(p *packet) error {
 			return nil
 		}
 		entry.fragments = make([][]byte, p.splitCount)
-	}
-	if p.splitIndex > uint32(len(entry.fragments)-1) {
-		return fmt.Errorf("split packet: split index %v is out of range (0 - %v)", p.splitIndex, len(entry.fragments)-1)
 	}
 	if entry.fragments[p.splitIndex] != nil {
 		return nil
@@ -609,8 +614,7 @@ func (conn *Conn) receiveSplitPacket(p *packet) error {
 
 // evictExpiredSplits frees reassemblies that have not advanced within
 // splitTimeout, so a peer cannot hold every slot for the rest of the session.
-// The client sweeps on every update; this runs only under slot pressure, which
-// reclaims the same slots at the point they are wanted.
+// The client sweeps its split list the same way, on its connection timeout.
 func (conn *Conn) evictExpiredSplits(now time.Time) {
 	for id, entry := range conn.splits {
 		if now.Sub(entry.lastUpdate) >= splitTimeout {
