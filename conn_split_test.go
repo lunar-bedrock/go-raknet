@@ -90,7 +90,7 @@ func TestReceiveSplitPacketIndexOutOfRange(t *testing.T) {
 	if err := conn.receiveSplitPacket(&packet{split: true, splitCount: 2, splitID: 1, splitIndex: 2, content: []byte{0x02}}); err != nil {
 		t.Fatalf("out-of-range split index: got error %v, want the fragment dropped", err)
 	}
-	if got := conn.splits[1].received; got != 1 {
+	if got := len(conn.splits[1].fragments); got != 1 {
 		t.Fatalf("received = %d, want 1: the dropped fragment mutated the reassembly", got)
 	}
 }
@@ -239,8 +239,7 @@ func TestReceiveSplitPacketKeepsAdvancingReassemblies(t *testing.T) {
 }
 
 // TestReceiveSplitPacketEmptyFragment: an empty fragment must count as arrived
-// exactly once. packet.read produces a non-nil slice for a zero length payload,
-// which is what keeps the arrival count in step with the filled slots.
+// exactly once, using its presence in the fragment map.
 func TestReceiveSplitPacketEmptyFragment(t *testing.T) {
 	conn := newSplitTestConn()
 	for _, index := range []uint32{0, 1, 1, 0} {
@@ -250,8 +249,8 @@ func TestReceiveSplitPacketEmptyFragment(t *testing.T) {
 		}
 	}
 	entry := conn.splits[7]
-	if entry.received != 2 {
-		t.Fatalf("received = %d, want 2: a duplicate empty fragment was counted twice", entry.received)
+	if len(entry.fragments) != 2 {
+		t.Fatalf("received = %d, want 2: a duplicate empty fragment was counted twice", len(entry.fragments))
 	}
 	if entry.fragments[0] == nil || entry.fragments[1] == nil {
 		t.Fatal("an empty fragment was counted without filling its slot")
@@ -311,7 +310,7 @@ func TestReceiveSplitPacketCountMismatchDropped(t *testing.T) {
 	if err := conn.receiveSplitPacket(rogue); err != nil {
 		t.Fatalf("mismatched split count out of range: unexpected error: %v", err)
 	}
-	if len(conn.splits[1].fragments) != 3 {
-		t.Fatalf("reassembly was resized: got %d fragments", len(conn.splits[1].fragments))
+	if conn.splits[1].count != 3 {
+		t.Fatalf("reassembly was resized: got %d fragments", conn.splits[1].count)
 	}
 }
