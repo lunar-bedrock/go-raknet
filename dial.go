@@ -303,6 +303,10 @@ func (dialer Dialer) clientListen(rakConn *Conn, conn net.Conn) {
 			if errors.Is(err, net.ErrClosed) {
 				return
 			}
+			if errors.Is(err, errSplitBudget) {
+				rakConn.closeImmediately()
+				return
+			}
 			if errors.Is(err, os.ErrDeadlineExceeded) {
 				select {
 				case <-rakConn.connected:
