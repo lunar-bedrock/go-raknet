@@ -419,3 +419,67 @@ func TestListenerCloseNotifiesConnections(t *testing.T) {
 		t.Fatal("client was not told the listener closed")
 	}
 }
+
+// sentPacketHeaders returns every packet in the datagrams written, in order,
+// skipping ACKs and NACKs.
+func sentPacketHeaders(t *testing.T, socket *recordingPacketConn) []packet {
+	t.Helper()
+	socket.mu.Lock()
+	defer socket.mu.Unlock()
+	var out []packet
+	for _, b := range socket.writes {
+		if b[0]&(bitFlagACK|bitFlagNACK) != 0 {
+			continue
+		}
+		for rest := b[4:]; len(rest) > 0; {
+			pk := packet{}
+			n, err := pk.read(rest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pk.content = bytes.Clone(pk.content)
+			out = append(out, pk)
+			rest = rest[n:]
+		}
+	}
+	return out
+}
+
+// An established connection pings at once, unreliably, then every five
+// seconds.
+func TestPingsUnreliableEveryFiveSeconds(t *testing.T) {
+	conn, socket, cancel := newCloseTestConn()
+	close(conn.connected)
+	runSendLoop(t, conn, cancel)
+	time.Sleep(1200 * time.Millisecond)
+	var pings []packet
+	for _, pk := range sentPacketHeaders(t, socket) {
+		if pk.content[0] == message.IDConnectedPing {
+			pings = append(pings, pk)
+		}
+	}
+	if len(pings) != 1 {
+		t.Fatalf("sent %d pings in the first 1.2 s, want 1", len(pings))
+	}
+	if pings[0].reliability != reliabilityUnreliable {
+		t.Fatalf("ping reliability %v, want unreliable", pings[0].reliability)
+	}
+}
+
+// A lost-connection probe is ignored, as on the client.
+func TestDetectLostConnectionsIgnored(t *testing.T) {
+	for _, handler := range []connectionHandler{dialerConnectionHandler{}, listenerConnectionHandler{}} {
+		conn, socket, cancel := newCloseTestConn()
+		conn.handler = handler
+		if err := conn.handlePacket([]byte{message.IDDetectLostConnections}); err != nil {
+			t.Fatal(err)
+		}
+		conn.mu.Lock()
+		queued := len(conn.sendQueue) + len(conn.controlQueue)
+		conn.mu.Unlock()
+		if queued != 0 || len(sentPackets(t, socket)) != 0 {
+			t.Fatalf("%T answered a lost-connection probe", handler)
+		}
+		cancel()
+	}
+}

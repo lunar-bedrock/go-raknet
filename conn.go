@@ -80,8 +80,9 @@ const (
 	// reliableTimeout is how long reliable traffic may go unacknowledged,
 	// counted from the last datagram received, before the peer is taken as gone.
 	reliableTimeout = 10 * time.Second
-	// pingInterval spaces the pings that keep an established connection alive.
-	pingInterval = 500 * time.Millisecond
+	// pingInterval spaces the unreliable pings an established connection
+	// sends, the first as soon as it is established.
+	pingInterval = 5 * time.Second
 )
 
 // Connection states. A connection leaves stateOpen for good; the two closing
@@ -258,7 +259,7 @@ func (conn *Conn) effectiveMTU() uint16 {
 func (conn *Conn) startTicking() {
 	ticker := time.NewTicker(updateInterval)
 	defer ticker.Stop()
-	nextPing := time.Now().Add(pingInterval)
+	var nextPing time.Time
 	for {
 		var now time.Time
 		select {
@@ -279,10 +280,10 @@ func (conn *Conn) startTicking() {
 			return
 		}
 		if !now.Before(nextPing) {
-			nextPing = now.Add(pingInterval)
 			select {
 			case <-conn.connected:
-				_ = conn.send(&message.ConnectedPing{PingTime: timestamp()})
+				nextPing = now.Add(pingInterval)
+				_ = conn.sendUnreliable(&message.ConnectedPing{PingTime: timestamp()})
 			default:
 			}
 		}
