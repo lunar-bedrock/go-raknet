@@ -102,8 +102,9 @@ type Conn struct {
 	// connection. The rtt is measured in nanoseconds.
 	rtt atomic.Int64
 
-	closing        atomic.Int64
-	disconnectSent atomic.Bool
+	closing          atomic.Int64
+	disconnectSent   atomic.Bool
+	peerDisconnected atomic.Bool // The peer sent a disconnect notification.
 
 	ctx        context.Context
 	cancelFunc context.CancelFunc
@@ -250,10 +251,16 @@ func (conn *Conn) startTicking() {
 			// retransmission due. The client runs the same update on a 10ms
 			// timer that network activity signals early.
 			conn.flushACKs()
+			if conn.closeOnPeerDisconnect() {
+				continue
+			}
 			conn.update(time.Now())
 		case t := <-ticker.C:
 			i++
 			conn.flushACKs()
+			if conn.closeOnPeerDisconnect() {
+				continue
+			}
 			conn.update(t)
 			if unix := conn.closing.Load(); unix != 0 {
 				conn.mu.Lock()
@@ -308,6 +315,23 @@ func (conn *Conn) flushACKs() {
 	}
 	conn.ackSlice = conn.ackSlice[:0]
 	conn.oldestUnsentAck = time.Time{}
+}
+
+// closeOnPeerDisconnect drops the connection without sending anything further
+// once the peer has sent a disconnect notification and every received datagram,
+// the notification's included, has been acknowledged. It reports whether it did.
+func (conn *Conn) closeOnPeerDisconnect() bool {
+	if !conn.peerDisconnected.Load() {
+		return false
+	}
+	conn.ackMu.Lock()
+	pending := len(conn.ackSlice) != 0
+	conn.ackMu.Unlock()
+	if pending {
+		return false
+	}
+	conn.once.Do(conn.release)
+	return true
 }
 
 // ackDue reports whether pending ACKs have been held long enough. It must be
@@ -542,27 +566,32 @@ func (conn *Conn) closeImmediately() {
 		_ = conn.drainSendQueue()
 		conn.mu.Unlock()
 
-		conn.handler.close(conn)
-		conn.cancelFunc()
-		unregisterMetricsConnection(conn)
-
-		conn.mu.Lock()
-		defer conn.mu.Unlock()
-		// The flush re-added whatever it sent.
-		conn.releaseUnacknowledged()
-		for _, datagram := range conn.sendQueue {
-			datagram.pk.content = datagram.pk.content[:0]
-			packetPool.Put(datagram.pk)
-		}
-		for _, datagram := range conn.controlQueue {
-			datagram.pk.content = datagram.pk.content[:0]
-			packetPool.Put(datagram.pk)
-		}
-		conn.controlQueue = nil
-		conn.sendQueue = nil
-		conn.sendQueueBytes = 0
-		conn.signalSendQueueFreed()
+		conn.release()
 	})
+}
+
+// release stops the connection and returns everything still queued or
+// awaiting acknowledgement to the pool. Only for use inside conn.once.
+func (conn *Conn) release() {
+	conn.handler.close(conn)
+	conn.cancelFunc()
+	unregisterMetricsConnection(conn)
+
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	conn.releaseUnacknowledged()
+	for _, datagram := range conn.sendQueue {
+		datagram.pk.content = datagram.pk.content[:0]
+		packetPool.Put(datagram.pk)
+	}
+	for _, datagram := range conn.controlQueue {
+		datagram.pk.content = datagram.pk.content[:0]
+		packetPool.Put(datagram.pk)
+	}
+	conn.controlQueue = nil
+	conn.sendQueue = nil
+	conn.sendQueueBytes = 0
+	conn.signalSendQueueFreed()
 }
 
 // releaseUnacknowledged returns every packet awaiting acknowledgement to the
@@ -759,6 +788,13 @@ func (conn *Conn) receivePacket(packet *packet) error {
 func (conn *Conn) handlePacket(b []byte) error {
 	if len(b) == 0 {
 		// Empty packets can safely be ignored.
+		return nil
+	}
+	if b[0] == message.IDDisconnectNotification {
+		// Honoured even mid-close: the peer is gone either way. The send loop
+		// drops the connection once this datagram's ACK is out.
+		conn.peerDisconnected.Store(true)
+		conn.signalSend()
 		return nil
 	}
 	if conn.closing.Load() != 0 {

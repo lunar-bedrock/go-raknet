@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"net"
+	"slices"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/sandertv/go-raknet/internal"
 	"github.com/sandertv/go-raknet/internal/message"
 )
 
@@ -554,5 +557,107 @@ func TestCloseNotificationACKTimeout(t *testing.T) {
 	case <-done:
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("notification ACK timeout did not close the connection")
+	}
+}
+
+// disconnectDatagram encodes a datagram carrying a reliable ordered disconnect
+// notification as the given sequence number.
+func disconnectDatagram(seq uint24) []byte {
+	buf := bytes.NewBuffer([]byte{bitFlagDatagram})
+	writeUint24(buf, seq)
+	(&packet{reliability: reliabilityReliableOrdered, content: []byte{message.IDDisconnectNotification}}).write(buf)
+	return buf.Bytes()
+}
+
+// A received disconnect notification must be acknowledged before the
+// connection drops, with no reply, even while our own close is still waiting
+// on its notification's ACK.
+func TestDisconnectNotificationACKedBeforeClose(t *testing.T) {
+	for _, closing := range []bool{false, true} {
+		socket := &recordingPacketConn{}
+		conn := newConn(socket, &net.UDPAddr{}, maxMTUSize, dialerConnectionHandler{l: slog.New(internal.DiscardHandler{})})
+		if closing {
+			_ = conn.Close()
+			waitForCloseDatagrams(t, socket, 1)
+		}
+		const seq = 0
+		if err := conn.receive(disconnectDatagram(seq)); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-conn.ctx.Done():
+		case <-time.After(time.Second):
+			t.Fatalf("closing=%v: connection did not close after the peer's disconnect notification", closing)
+		}
+
+		socket.mu.Lock()
+		acked, replies := false, 0
+		for _, b := range socket.writes {
+			if b[0]&bitFlagACK != 0 {
+				ack := &acknowledgement{}
+				if err := ack.read(b[1:]); err != nil {
+					t.Fatal(err)
+				}
+				acked = acked || slices.Contains(ack.packets, seq)
+				continue
+			}
+			pk := new(packet)
+			for rest := b[4:]; len(rest) > 0; {
+				n, err := pk.read(rest)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if pk.content[0] == message.IDDisconnectNotification {
+					replies++
+				}
+				rest = rest[n:]
+			}
+		}
+		socket.mu.Unlock()
+		if !acked {
+			t.Fatalf("closing=%v: disconnect notification was never acknowledged", closing)
+		}
+		// A closing connection had already sent its own notification.
+		if want := map[bool]int{false: 0, true: 1}[closing]; replies != want {
+			t.Fatalf("closing=%v: sent %d disconnect notifications, want %d", closing, replies, want)
+		}
+	}
+}
+
+// A graceful Close against a go-raknet peer ends once the peer acknowledges
+// the notification, rather than on the acknowledgement timeout.
+func TestGracefulCloseEndsOnPeerACK(t *testing.T) {
+	listener, err := Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		if c, err := listener.Accept(); err == nil {
+			accepted <- c
+		}
+	}()
+	client, err := DialTimeout(listener.Addr().String(), 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var server *Conn
+	select {
+	case c := <-accepted:
+		server = c.(*Conn)
+	case <-time.After(5 * time.Second):
+		t.Fatal("listener did not accept the connection")
+	}
+
+	_ = client.Close()
+	// The acknowledgement timeout closes after at least four seconds.
+	deadline := time.After(2 * time.Second)
+	for name, conn := range map[string]*Conn{"server": server, "client": client} {
+		select {
+		case <-conn.Context().Done():
+		case <-deadline:
+			t.Fatalf("%s did not close before the acknowledgement timeout", name)
+		}
 	}
 }
