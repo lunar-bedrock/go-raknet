@@ -106,8 +106,10 @@ type Conn struct {
 	closing        atomic.Int64
 	disconnectSent atomic.Bool
 
-	ctx        context.Context
-	cancelFunc context.CancelFunc
+	ctx         context.Context
+	cancelFunc  context.CancelFunc
+	cancelCause context.CancelCauseFunc
+	closeCause  atomic.Pointer[TransportCloseError]
 
 	conn    net.PacketConn
 	raddr   net.Addr
@@ -210,7 +212,8 @@ func newConn(conn net.PacketConn, raddr net.Addr, mtu uint16, h connectionHandle
 		ackBuf:         bytes.NewBuffer(make([]byte, 0, 128)),
 		nackBuf:        bytes.NewBuffer(make([]byte, 0, 64)),
 	}
-	c.ctx, c.cancelFunc = context.WithCancel(context.Background())
+	c.ctx, c.cancelCause = context.WithCancelCause(context.Background())
+	c.cancelFunc = func() { c.cancelCause(context.Canceled) }
 	t := time.Now()
 	c.lastActivity.Store(&t)
 	registerMetricsConnection(c)
@@ -282,6 +285,7 @@ func (conn *Conn) startTicking() {
 				if timedOut {
 					// Close sends a disconnect through Write, which takes conn.mu.
 					// Do not call it while holding the same non-reentrant mutex.
+					conn.recordCloseReason("inactivity_timeout")
 					_ = conn.Close()
 				}
 			}
@@ -513,6 +517,7 @@ func (conn *Conn) ReadPacket() (b []byte, err error) {
 func (conn *Conn) Close() error {
 	// Let queued application packets reach the peer before sending the transport
 	// notification. Bedrock otherwise discards its final disconnect message.
+	conn.recordCloseReason("local_close")
 	conn.closing.CompareAndSwap(0, time.Now().Unix())
 	return nil
 }
@@ -528,6 +533,7 @@ func (conn *Conn) Context() context.Context {
 // connection and closes the underlying UDP connection immediately.
 func (conn *Conn) closeImmediately() {
 	conn.once.Do(func() {
+		conn.recordCloseReason("local_close")
 		_ = conn.sendDisconnect()
 
 		conn.mu.Lock()
@@ -542,7 +548,7 @@ func (conn *Conn) closeImmediately() {
 		conn.mu.Unlock()
 
 		conn.handler.close(conn)
-		conn.cancelFunc()
+		conn.cancelClosed()
 		unregisterMetricsConnection(conn)
 
 		conn.mu.Lock()
