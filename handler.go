@@ -169,9 +169,11 @@ func (h listenerConnectionHandler) handleOpenConnectionRequest2(b []byte, addr n
 			case h.l.incoming <- conn:
 				h.l.stats.connectionsAccepted.Add(1)
 			case <-h.l.closed:
+				conn.recordCloseReason("listener_closed")
 				_ = conn.Close()
 			}
 		case <-h.l.closed:
+			conn.recordCloseReason("listener_closed")
 			_ = conn.Close()
 		case <-t.C:
 			// It took too long to complete this connection. We close it and go
@@ -195,6 +197,7 @@ func (h listenerConnectionHandler) handle(conn *Conn, b []byte) (handled bool, e
 	case message.IDConnectedPong:
 		return true, handleConnectedPong(b[1:])
 	case message.IDDisconnectNotification:
+		conn.recordCloseReason("remote_disconnect")
 		conn.closeImmediately()
 		return true, nil
 	case message.IDDetectLostConnections:
@@ -255,6 +258,7 @@ func (h dialerConnectionHandler) handle(conn *Conn, b []byte) (handled bool, err
 	case message.IDConnectedPong:
 		return true, handleConnectedPong(b[1:])
 	case message.IDDisconnectNotification:
+		conn.recordCloseReason("remote_disconnect")
 		conn.closeImmediately()
 		return true, nil
 	case message.IDDetectLostConnections:

@@ -280,6 +280,7 @@ func (dialer Dialer) connect(ctx context.Context, state *connState) (*Conn, erro
 		// dialer.ErrorLog.Debug("raknet connection accepted")
 		return conn, nil
 	case <-ctx.Done():
+		conn.recordCloseReason("dial_cancelled")
 		_ = conn.Close()
 		// dialer.ErrorLog.Warn("raknet connection canceled before accept",
 		// 	"error", ctx.Err(),
@@ -301,6 +302,7 @@ func (dialer Dialer) clientListen(rakConn *Conn, conn net.Conn) {
 		}
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
+				rakConn.recordCloseReason("raw_read_closed")
 				return
 			}
 			if errors.Is(err, errSplitBudget) {
@@ -317,6 +319,7 @@ func (dialer Dialer) clientListen(rakConn *Conn, conn net.Conn) {
 					}
 				default:
 				}
+				rakConn.recordCloseReason("raw_read_deadline")
 				return
 			}
 			// Errors reading a packet other than the connection being
