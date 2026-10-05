@@ -528,6 +528,14 @@ func (conn *Conn) Close() error {
 	return nil
 }
 
+// Abort sends a best-effort disconnect notification and closes without waiting for acknowledgements.
+func (conn *Conn) Abort() error {
+	conn.recordCloseReason("local_close")
+	conn.closing.CompareAndSwap(0, time.Now().Unix())
+	conn.closeImmediately()
+	return nil
+}
+
 // Context returns the connection's context. The context is canceled when
 // the connection is closed, allowing for cancellation of operations
 // that are tied to the lifecycle of the connection.
