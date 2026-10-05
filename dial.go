@@ -280,7 +280,9 @@ func (dialer Dialer) connect(ctx context.Context, state *connState) (*Conn, erro
 		// dialer.ErrorLog.Debug("raknet connection accepted")
 		return conn, nil
 	case <-ctx.Done():
-		_ = conn.Close()
+		// Dropped silently, as the client drops a connection attempt that
+		// times out.
+		conn.once.Do(conn.release)
 		// dialer.ErrorLog.Warn("raknet connection canceled before accept",
 		// 	"error", ctx.Err(),
 		// )
