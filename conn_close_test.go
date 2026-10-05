@@ -5,6 +5,7 @@ import (
 	"context"
 	"log/slog"
 	"net"
+	"net/netip"
 	"slices"
 	"sync/atomic"
 	"testing"
@@ -466,6 +467,7 @@ func TestDetectLostConnectionsIgnored(t *testing.T) {
 	for _, handler := range []connectionHandler{dialerConnectionHandler{}, listenerConnectionHandler{}} {
 		conn, socket, cancel := newCloseTestConn()
 		conn.handler = handler
+		conn.requested.Store(true)
 		if err := conn.handlePacket([]byte{message.IDDetectLostConnections}); err != nil {
 			t.Fatal(err)
 		}
@@ -715,5 +717,112 @@ func TestReceiveLimitDropsSilently(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	if rec.notified.Load() {
 		t.Fatal("limit drop sent a disconnect notification")
+	}
+}
+
+// queuedPacket reports whether a packet starting with id is queued to send.
+func queuedPacket(conn *Conn, id byte) bool {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	for _, q := range [][]queuedDatagram{conn.controlQueue, conn.sendQueue} {
+		for _, d := range q {
+			if len(d.pk.content) > 0 && d.pk.content[0] == id {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// A connection request reaching a client is answered with an accepted reply,
+// connected or not; one still connecting then takes the server's side of the
+// handshake, so a new incoming connection completes it.
+func TestClientAnswersConnectionRequest(t *testing.T) {
+	req, _ := (&message.ConnectionRequest{ClientGUID: -1, RequestTime: 1234}).MarshalBinary()
+	nic, _ := (&message.NewIncomingConnection{ServerAddress: netip.MustParseAddrPort("127.0.0.1:1")}).MarshalBinary()
+	for _, connected := range []bool{false, true} {
+		conn, _, cancel := newCloseTestConn()
+		conn.conn = &recordingPacketConn{}
+		if connected {
+			close(conn.connected)
+		}
+		if err := conn.handlePacket(req); err != nil {
+			t.Fatal(err)
+		}
+		if !queuedPacket(conn, message.IDConnectionRequestAccepted) {
+			t.Fatalf("connected=%v: connection request was not answered", connected)
+		}
+		if !connected {
+			if err := conn.handlePacket(nic); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-conn.connected:
+			default:
+				t.Fatal("new incoming connection did not complete the crossed handshake")
+			}
+		}
+		cancel()
+	}
+}
+
+// An accepted reply reaching a server connection that has a request but no
+// new incoming connection yet completes it, answering with a new incoming
+// connection. A new incoming connection shorter than the client accepts does
+// not.
+func TestServerCompletesOnAcceptedReply(t *testing.T) {
+	req, _ := (&message.ConnectionRequest{ClientGUID: -1, RequestTime: 1}).MarshalBinary()
+	cra, _ := (&message.ConnectionRequestAccepted{ClientAddress: netip.MustParseAddrPort("127.0.0.1:1")}).MarshalBinary()
+	conn, _, cancel := newCloseTestConn()
+	defer cancel()
+	conn.handler = listenerConnectionHandler{}
+	if err := conn.handlePacket(req); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.handlePacket([]byte{message.IDNewIncomingConnection, 0}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-conn.connected:
+		t.Fatal("a truncated new incoming connection completed the handshake")
+	default:
+	}
+	if err := conn.handlePacket(cra); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-conn.connected:
+	default:
+		t.Fatal("accepted reply did not complete the handshake")
+	}
+	if !queuedPacket(conn, message.IDNewIncomingConnection) {
+		t.Fatal("accepted reply was not answered with a new incoming connection")
+	}
+}
+
+// Anything but a connection request as a new connection's first message
+// drops it silently and blocks the address, as the client does.
+func TestMessageBeforeRequestDropsAndBlocks(t *testing.T) {
+	l, raw, rec := rawListener(t)
+	nic, _ := (&message.NewIncomingConnection{ServerAddress: resolve(l.Addr())}).MarshalBinary()
+	if _, err := raw.Write(orderedDatagram(0, nic)); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		if _, ok := l.connections.Load(resolve(raw.LocalAddr())); !ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("connection was not dropped")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if !l.sec.blocked(raw.LocalAddr()) {
+		t.Fatal("address was not blocked")
+	}
+	if rec.notified.Load() {
+		t.Fatal("drop sent a disconnect notification")
 	}
 }

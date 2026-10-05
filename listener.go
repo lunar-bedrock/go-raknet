@@ -366,7 +366,7 @@ func (listener *Listener) handle(b []byte, addr net.Addr) error {
 		return nil
 	default:
 		if err := conn.receive(b); err != nil {
-			if errors.Is(err, errReceiveLimit) {
+			if errors.Is(err, errDropConnection) {
 				conn.drop()
 				return err
 			}

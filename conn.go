@@ -125,6 +125,9 @@ type Conn struct {
 	rtt atomic.Int64
 
 	state atomic.Int32 // Changed only with mu held.
+	// requested is set once a connection request has been answered: this end
+	// holds the server's side of the handshake.
+	requested atomic.Bool
 
 	ctx        context.Context
 	cancelFunc context.CancelFunc
@@ -811,7 +814,7 @@ func (conn *Conn) receivePacket(packet *packet) error {
 	if conn.packetQueue.WindowSize() > maxWindowSize {
 		// An acknowledged ordered packet can't be dropped without a gap, so an
 		// overflowing ordered window closes the connection instead of trimming.
-		return fmt.Errorf("packet queue window size is too big (%v-%v): %w", conn.packetQueue.lowest, conn.packetQueue.highest, errReceiveLimit)
+		return fmt.Errorf("packet queue window size is too big (%v-%v): %w", conn.packetQueue.lowest, conn.packetQueue.highest, errDropConnection)
 	}
 	for _, content := range conn.packetQueue.fetch() {
 		if err := conn.handlePacket(content); err != nil {
@@ -846,6 +849,9 @@ func (conn *Conn) handlePacket(b []byte) error {
 		}
 	}
 	handled, err := conn.handler.handle(conn, b)
+	if errors.Is(err, errDropConnection) {
+		return err
+	}
 	if err != nil {
 		// A bad internal message is discarded; the rest are still handled.
 		conn.handler.log().Debug("discarded packet: "+err.Error(), "raddr", conn.raddr.String())
@@ -869,12 +875,13 @@ func resolve(addr net.Addr) netip.AddrPort {
 	return netip.AddrPort{}
 }
 
-// errReceiveLimit marks input that breaks a bound on what a peer may make us
-// hold. Such a connection is dropped; other bad input is discarded and the
-// connection kept, as on the client.
-var errReceiveLimit = errors.New("receive limit exceeded")
+// errDropConnection marks input that ends the connection: a first message
+// other than a connection request, as on the client, or a break of a bound on
+// what a peer may make us hold. Such a connection is dropped silently; other
+// bad input is discarded and the connection kept, as on the client.
+var errDropConnection = errors.New("connection dropped")
 
-var errSplitBudget = fmt.Errorf("split packet: reassembly memory limit reached: %w", errReceiveLimit)
+var errSplitBudget = fmt.Errorf("split packet: reassembly memory limit reached: %w", errDropConnection)
 
 // receiveSplitPacket handles a passed split packet. If it is the last split
 // packet of its sequence, it will continue handling the full packet as it
