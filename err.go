@@ -15,6 +15,9 @@ var (
 	// ErrNotSupported is returned for deadline methods of a Conn, which are not
 	// supported on a raknet.Conn.
 	ErrNotSupported = errors.New("feature not supported")
+
+	errConnectionAttemptFailed = errors.New("connection attempt failed")
+	errConnectionClosed        = errors.New("connection closed before it was established")
 )
 
 // error wraps the error passed into a net.OpError with the op as operation and

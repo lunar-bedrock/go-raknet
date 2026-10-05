@@ -15,6 +15,7 @@ const (
 	IDConnectionAttemptFailed        byte = 0x11
 	IDNewIncomingConnection          byte = 0x13
 	IDDisconnectNotification         byte = 0x15
+	IDInvalidPassword                byte = 0x18
 
 	IDIncompatibleProtocolVersion byte = 0x19
 

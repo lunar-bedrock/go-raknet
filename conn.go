@@ -38,17 +38,20 @@ const (
 	safeMTUSize = 1200
 
 	// maxWindowSize bounds the ordered packet queue, whose entries cannot be
-	// dropped without a delivery gap; overflowing it closes the connection.
+	// dropped without a delivery gap; overflowing it drops the connection. The
+	// client has no such bound: it is a deliberate memory-safety deviation for
+	// public listeners.
 	maxWindowSize = 2048
 
-	// maxSplitCount allows large packets from third-party servers. Vanilla
-	// accepts 2048 fragments; Cloudburst's limit is 8192.
-	maxSplitCount = 8192
+	// maxSplitCount is the most fragments the client accepts for one packet.
+	maxSplitCount = 2048
 	// maxConcurrentSplits bounds packets part way through reassembly, matching
 	// the client, which drops fragments that would start a further one.
 	maxConcurrentSplits = 256
 	// Bound fragments actually retained across incomplete packets. The count
 	// limit bounds metadata even when each fragment has little or no data.
+	// Like maxWindowSize, these are deliberate deviations: the client keeps no
+	// aggregate bound, and breaking one drops the connection.
 	maxSplitFragments = 2 * maxSplitCount
 	maxSplitBytes     = 16 << 20
 	// splitTimeout is how long a reassembly may go without a new fragment
@@ -651,6 +654,27 @@ func (conn *Conn) startClose() {
 	conn.state.Store(stateClosing)
 }
 
+// established reports whether the handshake has completed.
+func (conn *Conn) established() bool {
+	select {
+	case <-conn.connected:
+		return true
+	default:
+		return false
+	}
+}
+
+// closeQuietly enters stateClosing without a notification, as the client does
+// after refusing a connection request or being refused.
+func (conn *Conn) closeQuietly() {
+	conn.mu.Lock()
+	if conn.ctx.Err() == nil {
+		conn.state.Store(stateClosing)
+	}
+	conn.mu.Unlock()
+	conn.signalSend()
+}
+
 // Context returns the connection's context. The context is canceled when
 // the connection is closed, allowing for cancellation of operations
 // that are tied to the lifecycle of the connection.
@@ -909,7 +933,9 @@ func (conn *Conn) handlePacket(b []byte) error {
 		conn.handler.log().Debug("discarded packet: "+err.Error(), "raddr", conn.raddr.String())
 		return nil
 	}
-	if !handled {
+	if !handled && (b[0] >= 0x1b || b[0] == 0x0e || b[0] == 0x0f) {
+		// The client never hands other reserved identifiers to the
+		// application.
 		conn.packets.Send(b)
 	}
 	return nil
@@ -939,11 +965,11 @@ var errSplitBudget = fmt.Errorf("split packet: reassembly memory limit reached: 
 // packet of its sequence, it will continue handling the full packet as it
 // otherwise would. An error is returned if the packet was not valid.
 func (conn *Conn) receiveSplitPacket(p *packet) error {
+	// read already rejects these; the checks keep reassembly safe on its own.
 	if p.splitCount == 0 || p.splitCount > maxSplitCount {
 		return fmt.Errorf("split packet: split count %v is out of range (1 - %v)", p.splitCount, maxSplitCount)
 	}
 	if p.splitIndex >= p.splitCount {
-		// The fragment fits no slot of the packet it claims to belong to.
 		return nil
 	}
 	entry, ok := conn.splits[p.splitID]

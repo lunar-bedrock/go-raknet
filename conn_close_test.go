@@ -29,6 +29,11 @@ func newCloseTestConn() (*Conn, *recordingPacketConn, context.CancelFunc) {
 	return conn, socket, cancel
 }
 
+// testListenerHandler returns a listener handler with a discarding logger.
+func testListenerHandler() listenerConnectionHandler {
+	return listenerConnectionHandler{l: &Listener{id: 1, conf: ListenConfig{ErrorLog: slog.New(internal.DiscardHandler{})}}}
+}
+
 // runSendLoop starts the connection's send loop and returns a channel closed
 // when it exits.
 func runSendLoop(t *testing.T, conn *Conn, cancel context.CancelFunc) <-chan struct{} {
@@ -464,7 +469,7 @@ func TestPingsUnreliableEveryFiveSeconds(t *testing.T) {
 
 // A lost-connection probe is ignored, as on the client.
 func TestDetectLostConnectionsIgnored(t *testing.T) {
-	for _, handler := range []connectionHandler{dialerConnectionHandler{}, listenerConnectionHandler{}} {
+	for _, handler := range []connectionHandler{dialerConnectionHandler{}, testListenerHandler()} {
 		conn, socket, cancel := newCloseTestConn()
 		conn.handler = handler
 		conn.requested.Store(true)
@@ -582,7 +587,7 @@ func TestHandshakeMessagesIgnoredWhileClosing(t *testing.T) {
 	for _, connected := range []bool{false, true} {
 		for _, peer := range []bool{false, true} {
 			conn, _, cancel := newCloseTestConn()
-			conn.handler = listenerConnectionHandler{}
+			conn.handler = testListenerHandler()
 			conn.requested.Store(true)
 			if connected {
 				close(conn.connected)
@@ -776,7 +781,7 @@ func TestServerCompletesOnAcceptedReply(t *testing.T) {
 	cra, _ := (&message.ConnectionRequestAccepted{ClientAddress: netip.MustParseAddrPort("127.0.0.1:1")}).MarshalBinary()
 	conn, _, cancel := newCloseTestConn()
 	defer cancel()
-	conn.handler = listenerConnectionHandler{}
+	conn.handler = testListenerHandler()
 	if err := conn.handlePacket(req); err != nil {
 		t.Fatal(err)
 	}
@@ -853,7 +858,7 @@ func TestHandshakeCompletionPings(t *testing.T) {
 		conn.conn = &recordingPacketConn{}
 		b := cra
 		if server {
-			conn.handler = listenerConnectionHandler{}
+			conn.handler = testListenerHandler()
 			conn.requested.Store(true)
 			b = nic
 		}
