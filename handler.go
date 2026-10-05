@@ -174,7 +174,7 @@ func (h listenerConnectionHandler) handleOpenConnectionRequest2(b []byte, addr n
 		case <-h.l.closed:
 			_ = conn.Close()
 		case <-t.C:
-			conn.once.Do(conn.release)
+			conn.drop()
 		}
 	}()
 	return nil

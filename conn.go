@@ -268,13 +268,13 @@ func (conn *Conn) startTicking() {
 			return
 		}
 		if conn.dead(now) {
-			conn.once.Do(conn.release)
+			conn.drop()
 			return
 		}
 		conn.flushACKs()
 		conn.update(now)
 		if conn.closed(now) {
-			conn.once.Do(conn.release)
+			conn.drop()
 			return
 		}
 		established := false
@@ -617,24 +617,10 @@ func (conn *Conn) Context() context.Context {
 	return conn.ctx
 }
 
-// closeImmediately sends a Disconnect notification to the other end of the
-// connection and closes the underlying UDP connection immediately.
-func (conn *Conn) closeImmediately() {
-	conn.once.Do(func() {
-		conn.mu.Lock()
-		conn.startClose()
-		// Sends belong to the send loop, which is about to stop. Flush here so
-		// the disconnect notification still reaches the peer, before the
-		// handler closes a dialer's socket. Nothing outstanding will be
-		// acknowledged now, so release it first: that opens the resend buffer
-		// for the flush.
-		conn.releaseUnacknowledged()
-		conn.sendBudget = max(conn.sendBudget, uint32(conn.effectiveMTU()))
-		_ = conn.drainSendQueue()
-		conn.mu.Unlock()
-
-		conn.release()
-	})
+// drop ends the connection without sending anything further, which is how
+// the client ends every connection it drops on its own.
+func (conn *Conn) drop() {
+	conn.once.Do(conn.release)
 }
 
 // release stops the connection and returns everything still queued or
@@ -825,7 +811,7 @@ func (conn *Conn) receivePacket(packet *packet) error {
 	if conn.packetQueue.WindowSize() > maxWindowSize {
 		// An acknowledged ordered packet can't be dropped without a gap, so an
 		// overflowing ordered window closes the connection instead of trimming.
-		return fmt.Errorf("packet queue window size is too big (%v-%v)", conn.packetQueue.lowest, conn.packetQueue.highest)
+		return fmt.Errorf("packet queue window size is too big (%v-%v): %w", conn.packetQueue.lowest, conn.packetQueue.highest, errReceiveLimit)
 	}
 	for _, content := range conn.packetQueue.fetch() {
 		if err := conn.handlePacket(content); err != nil {
@@ -861,7 +847,9 @@ func (conn *Conn) handlePacket(b []byte) error {
 	}
 	handled, err := conn.handler.handle(conn, b)
 	if err != nil {
-		return fmt.Errorf("handle packet: %w", err)
+		// A bad internal message is discarded; the rest are still handled.
+		conn.handler.log().Debug("discarded packet: "+err.Error(), "raddr", conn.raddr.String())
+		return nil
 	}
 	if !handled {
 		conn.packets.Send(b)
@@ -881,7 +869,12 @@ func resolve(addr net.Addr) netip.AddrPort {
 	return netip.AddrPort{}
 }
 
-var errSplitBudget = errors.New("split packet: reassembly memory limit reached")
+// errReceiveLimit marks input that breaks a bound on what a peer may make us
+// hold. Such a connection is dropped; other bad input is discarded and the
+// connection kept, as on the client.
+var errReceiveLimit = errors.New("receive limit exceeded")
+
+var errSplitBudget = fmt.Errorf("split packet: reassembly memory limit reached: %w", errReceiveLimit)
 
 // receiveSplitPacket handles a passed split packet. If it is the last split
 // packet of its sequence, it will continue handling the full packet as it

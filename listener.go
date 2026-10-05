@@ -270,7 +270,7 @@ func (listener *Listener) shutdown() {
 	}
 	listener.connections.Range(func(_, value any) bool {
 		conn := value.(*Conn)
-		conn.once.Do(conn.release)
+		conn.drop()
 		return true
 	})
 }
@@ -366,8 +366,12 @@ func (listener *Listener) handle(b []byte, addr net.Addr) error {
 		return nil
 	default:
 		if err := conn.receive(b); err != nil {
-			conn.closeImmediately()
-			return err
+			if errors.Is(err, errReceiveLimit) {
+				conn.drop()
+				return err
+			}
+			// Bad input is discarded and the connection kept, as on the client.
+			listener.conf.ErrorLog.Debug("discarded packet: "+err.Error(), "raddr", addrToStr(addr))
 		}
 		return nil
 	}

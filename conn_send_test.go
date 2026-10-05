@@ -317,46 +317,6 @@ func TestContinuousSendUsesPreviousTick(t *testing.T) {
 	}
 }
 
-// closingPacketConn rejects writes once closed, as a real socket does.
-type closingPacketConn struct{ recordingPacketConn }
-
-func (c *closingPacketConn) Close() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.err = net.ErrClosed
-	return nil
-}
-
-// TestCloseImmediatelyFlushesDisconnect: a dialer's socket is closed by its
-// handler, so the queued disconnect must be flushed first, and neither a shut
-// window nor a full resend buffer may hold it back at that point.
-func TestCloseImmediatelyFlushesDisconnect(t *testing.T) {
-	for _, outstanding := range []int{0, resendBufferSize} {
-		conn, _, cancel := newSendTestConn()
-		packetConn := &closingPacketConn{}
-		conn.conn = packetConn
-		conn.sendBudget = 0
-		for i := range outstanding {
-			conn.retransmission.add(uint24(i), packetPool.Get().(*packet), 1)
-		}
-
-		conn.closeImmediately()
-		cancel()
-
-		packetConn.mu.Lock()
-		sent := false
-		for _, b := range packetConn.writes {
-			if bytes.Contains(b, []byte{message.IDDisconnectNotification}) {
-				sent = true
-			}
-		}
-		packetConn.mu.Unlock()
-		if !sent {
-			t.Fatalf("outstanding=%d: disconnect notification never reached the socket", outstanding)
-		}
-	}
-}
-
 // The send loop must close an empty connection once its notification is
 // acknowledged, and keep queued or unacknowledged work alive until it drains.
 func TestCloseThroughTicker(t *testing.T) {

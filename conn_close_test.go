@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"slices"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -604,5 +605,115 @@ func TestHandshakeMessagesIgnoredWhileClosing(t *testing.T) {
 			}
 			cancel()
 		}
+	}
+}
+
+// rawListener sets up a listener with cookies disabled and a raw UDP client
+// that has sent the second open connection request, so the listener holds a
+// connection for it. It reports whether the listener wrote a notification.
+func rawListener(t *testing.T) (*Listener, net.Conn, *notifyRecorder) {
+	t.Helper()
+	rec := &notifyRecorder{}
+	l, err := ListenConfig{DisableCookies: true, UpstreamPacketListener: rec}.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	raw, err := net.Dial("udp", l.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = raw.Close() })
+	req, _ := (&message.OpenConnectionRequest2{ServerAddress: resolve(l.Addr()), MTU: 1400, ClientGUID: -1}).MarshalBinary()
+	if _, err := raw.Write(req); err != nil {
+		t.Fatal(err)
+	}
+	_ = raw.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := raw.Read(make([]byte, 2048)); err != nil {
+		t.Fatal(err)
+	}
+	return l, raw, rec
+}
+
+type notifyRecorder struct{ notified atomic.Bool }
+
+func (r *notifyRecorder) ListenPacket(network, address string) (net.PacketConn, error) {
+	conn, err := net.ListenPacket(network, address)
+	if err != nil {
+		return nil, err
+	}
+	return notifyRecordingConn{PacketConn: conn, r: r}, nil
+}
+
+type notifyRecordingConn struct {
+	net.PacketConn
+	r *notifyRecorder
+}
+
+func (c notifyRecordingConn) WriteTo(b []byte, addr net.Addr) (int, error) {
+	if b[0]&bitFlagDatagram != 0 && b[0]&(bitFlagACK|bitFlagNACK) == 0 {
+		pk := new(packet)
+		for rest := b[4:]; len(rest) > 0; {
+			n, err := pk.read(rest)
+			if err != nil {
+				break
+			}
+			if len(pk.content) > 0 && pk.content[0] == message.IDDisconnectNotification {
+				c.r.notified.Store(true)
+			}
+			rest = rest[n:]
+		}
+	}
+	return c.PacketConn.WriteTo(b, addr)
+}
+
+// Malformed input from a connected peer is discarded; the connection stays up
+// and the peer is not blocked, as on the client.
+func TestMalformedInputKeepsConnection(t *testing.T) {
+	l, raw, rec := rawListener(t)
+	for _, b := range [][]byte{
+		{bitFlagDatagram | bitFlagACK},      // truncated ACK
+		{bitFlagDatagram, 0},                // truncated datagram header
+		{bitFlagDatagram, 0, 0, 0, 0x60, 0}, // truncated encapsulated packet
+	} {
+		if _, err := raw.Write(b); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(200 * time.Millisecond)
+	if _, ok := l.connections.Load(resolve(raw.LocalAddr())); !ok {
+		t.Fatal("malformed input dropped the connection")
+	}
+	if l.sec.blocked(raw.LocalAddr()) {
+		t.Fatal("malformed input blocked the peer")
+	}
+	if rec.notified.Load() {
+		t.Fatal("malformed input sent a disconnect notification")
+	}
+}
+
+// A peer that breaks a receive limit is dropped without a notification, the
+// way the client drops a connection on its own.
+func TestReceiveLimitDropsSilently(t *testing.T) {
+	l, raw, rec := rawListener(t)
+	buf := bytes.NewBuffer([]byte{bitFlagDatagram})
+	writeUint24(buf, 0)
+	(&packet{reliability: reliabilityReliableOrdered, orderIndex: maxWindowSize + 10, content: []byte{0xfe}}).write(buf)
+	if _, err := raw.Write(buf.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		if _, ok := l.connections.Load(resolve(raw.LocalAddr())); !ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("connection breaking the ordered window limit was not dropped")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if rec.notified.Load() {
+		t.Fatal("limit drop sent a disconnect notification")
 	}
 }
