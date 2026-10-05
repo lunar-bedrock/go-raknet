@@ -570,3 +570,39 @@ func TestIdleConnectionDoesNotPoll(t *testing.T) {
 		t.Fatal("idle connection woke without anything due")
 	}
 }
+
+// Handshake messages that arrive while closing are ignored, as on the client:
+// they neither complete a pending handshake nor count as bad input.
+func TestHandshakeMessagesIgnoredWhileClosing(t *testing.T) {
+	nic, _ := (&message.NewIncomingConnection{}).MarshalBinary()
+	cra, _ := (&message.ConnectionRequestAccepted{}).MarshalBinary()
+	for _, connected := range []bool{false, true} {
+		for _, peer := range []bool{false, true} {
+			conn, _, cancel := newCloseTestConn()
+			conn.handler = listenerConnectionHandler{}
+			if connected {
+				close(conn.connected)
+			}
+			if peer {
+				if err := conn.receive(disconnectDatagram(0)); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				_ = conn.Close()
+			}
+			for _, b := range [][]byte{nic, cra} {
+				if err := conn.handlePacket(b); err != nil {
+					t.Fatalf("connected=%v peer=%v: %x while closing: %v", connected, peer, b[0], err)
+				}
+			}
+			if !connected {
+				select {
+				case <-conn.connected:
+					t.Fatalf("peer=%v: a handshake completed while closing", peer)
+				default:
+				}
+			}
+			cancel()
+		}
+	}
+}

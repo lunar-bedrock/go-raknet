@@ -852,6 +852,13 @@ func (conn *Conn) handlePacket(b []byte) error {
 		conn.signalSend()
 		return nil
 	}
+	if conn.state.Load() != stateOpen {
+		switch b[0] {
+		case message.IDConnectionRequest, message.IDConnectionRequestAccepted, message.IDNewIncomingConnection:
+			// The client ignores handshake messages in its closing states.
+			return nil
+		}
+	}
 	handled, err := conn.handler.handle(conn, b)
 	if err != nil {
 		return fmt.Errorf("handle packet: %w", err)
