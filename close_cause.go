@@ -64,3 +64,8 @@ func (conn *Conn) cancelClosed() {
 	terminal.closeWait = time.Since(cause.observed)
 	conn.cancelCause(&terminal)
 }
+
+func (conn *Conn) remotelyClosed() bool {
+	cause := conn.closeCause.Load()
+	return cause != nil && cause.reason == "remote_disconnect"
+}

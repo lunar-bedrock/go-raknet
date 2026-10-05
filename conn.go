@@ -492,6 +492,9 @@ func (conn *Conn) write(b []byte, rel reliability, control bool) (n int, err err
 // session is closed or the read times out, in which case an error is returned.
 func (conn *Conn) Read(b []byte) (n int, err error) {
 	pk, ok := conn.packets.Recv(conn.ctx)
+	if !ok && conn.remotelyClosed() {
+		pk, ok = conn.packets.TryRecv()
+	}
 	if !ok {
 		return 0, conn.error(net.ErrClosed, "read")
 	} else if len(b) < len(pk) {
@@ -505,6 +508,9 @@ func (conn *Conn) Read(b []byte) (n int, err error) {
 // is closed or the read times out, in which case an error is returned.
 func (conn *Conn) ReadPacket() (b []byte, err error) {
 	pk, ok := conn.packets.Recv(conn.ctx)
+	if !ok && conn.remotelyClosed() {
+		pk, ok = conn.packets.TryRecv()
+	}
 	if !ok {
 		return nil, conn.error(net.ErrClosed, "read")
 	}
