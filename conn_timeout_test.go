@@ -21,17 +21,18 @@ func TestTimeoutCloseDoesNotKeepConnectionMutexLocked(t *testing.T) {
 		maxMTUSize,
 		dialerConnectionHandler{l: slog.New(slog.NewTextHandler(io.Discard, nil))},
 	)
+	conn.mu.Lock()
+	conn.retransmission.add(conn.seq.Inc(), packetPool.Get().(*packet), 1)
+	conn.mu.Unlock()
 	stale := time.Now().Add(-time.Hour)
 	conn.lastActivity.Store(&stale)
 
+	select {
+	case <-conn.ctx.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("connection was not dropped after timing out")
+	}
 	deadline := time.Now().Add(2 * time.Second)
-	for conn.closing.Load() == 0 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if conn.closing.Load() == 0 {
-		t.Fatal("connection did not enter closing state after timing out")
-	}
-
 	for time.Now().Before(deadline) {
 		if conn.mu.TryLock() {
 			conn.mu.Unlock()

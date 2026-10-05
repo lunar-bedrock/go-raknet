@@ -73,6 +73,27 @@ const (
 	// reliable data while the slot for the next message number is taken, which
 	// bounds a burst even when the congestion window is far larger.
 	resendBufferSize = 512
+
+	// updateInterval is the longest the send loop sleeps between updates.
+	// Network activity wakes it sooner, as it does on the client.
+	updateInterval = 10 * time.Millisecond
+	// reliableTimeout is how long reliable traffic may go unacknowledged,
+	// counted from the last datagram received, before the peer is taken as gone.
+	reliableTimeout = 10 * time.Second
+	// pingInterval spaces the pings that keep an established connection alive.
+	pingInterval = 500 * time.Millisecond
+)
+
+// Connection states. A connection leaves stateOpen for good; the two closing
+// states can replace each other, as on the client.
+const (
+	stateOpen int32 = iota
+	// stateClosing: Close queued the notification. Ends once nothing is left
+	// to send or resend.
+	stateClosing
+	// statePeerDisconnected: the peer's notification arrived. Ends once every
+	// received datagram has been acknowledged.
+	statePeerDisconnected
 )
 
 // splitEntry retains only fragments that have arrived, indexed by split index.
@@ -102,9 +123,7 @@ type Conn struct {
 	// connection. The rtt is measured in nanoseconds.
 	rtt atomic.Int64
 
-	closing          atomic.Int64
-	disconnectSent   atomic.Bool
-	peerDisconnected atomic.Bool // The peer sent a disconnect notification.
+	state atomic.Int32 // Changed only with mu held.
 
 	ctx        context.Context
 	cancelFunc context.CancelFunc
@@ -234,69 +253,68 @@ func (conn *Conn) effectiveMTU() uint16 {
 	return conn.mtu - 28
 }
 
-// startTicking makes the connection start ticking, sending ACKs and pings to
-// the other end where necessary and checking if the connection should be timed
-// out.
+// startTicking runs the connection's send loop: every wakeup sends due ACKs,
+// retransmissions and queued data, then checks whether the connection ended.
 func (conn *Conn) startTicking() {
-	var (
-		interval = time.Second / 10
-		ticker   = time.NewTicker(interval)
-		i        int64
-	)
+	ticker := time.NewTicker(updateInterval)
 	defer ticker.Stop()
+	nextPing := time.Now().Add(pingInterval)
 	for {
+		var now time.Time
 		select {
 		case <-conn.sendSignal:
-			// Protocol activity opened the window, queued data or made a
-			// retransmission due. The client runs the same update on a 10ms
-			// timer that network activity signals early.
-			conn.flushACKs()
-			if conn.closeOnPeerDisconnect() {
-				continue
-			}
-			conn.update(time.Now())
-		case t := <-ticker.C:
-			i++
-			conn.flushACKs()
-			if conn.closeOnPeerDisconnect() {
-				continue
-			}
-			conn.update(t)
-			if unix := conn.closing.Load(); unix != 0 {
-				conn.mu.Lock()
-				acksLeft := len(conn.retransmission.unacknowledged) + len(conn.sendQueue) + len(conn.controlQueue)
-				conn.mu.Unlock()
-
-				since := t.Sub(time.Unix(unix, 0))
-				if since > time.Second*5 {
-					conn.closeImmediately()
-				} else if acksLeft == 0 {
-					if conn.disconnectSent.Load() {
-						conn.closeImmediately()
-					} else {
-						// Keep ticking so the final notification is retransmitted
-						// until acknowledged, just like the application data.
-						_ = conn.sendDisconnect()
-					}
-				}
-				continue
-			}
-			if i%5 == 0 {
-				_ = conn.send(&message.ConnectedPing{PingTime: timestamp()})
-
-				conn.mu.Lock()
-				timedOut := t.Sub(*conn.lastActivity.Load()) > time.Second*5+conn.retransmission.rtt()*2
-				conn.mu.Unlock()
-				if timedOut {
-					// Close sends a disconnect through Write, which takes conn.mu.
-					// Do not call it while holding the same non-reentrant mutex.
-					_ = conn.Close()
-				}
-			}
+			now = time.Now()
+		case now = <-ticker.C:
 		case <-conn.ctx.Done():
 			return
 		}
+		if conn.dead(now) {
+			conn.once.Do(conn.release)
+			return
+		}
+		conn.flushACKs()
+		conn.update(now)
+		if conn.closed(now) {
+			conn.once.Do(conn.release)
+			return
+		}
+		if !now.Before(nextPing) {
+			nextPing = now.Add(pingInterval)
+			select {
+			case <-conn.connected:
+				_ = conn.send(&message.ConnectedPing{PingTime: timestamp()})
+			default:
+			}
+		}
 	}
+}
+
+// dead reports whether reliable traffic is outstanding and nothing has been
+// received for reliableTimeout. Such a connection is dropped without sending
+// anything further.
+func (conn *Conn) dead(now time.Time) bool {
+	conn.mu.Lock()
+	outstanding := len(conn.retransmission.unacknowledged) != 0
+	conn.mu.Unlock()
+	return outstanding && now.Sub(*conn.lastActivity.Load()) > reliableTimeout
+}
+
+// closed reports whether a closing connection has finished: locally closed
+// once nothing is left to send or resend, closed by the peer once every
+// received datagram is acknowledged, or nothing received for reliableTimeout.
+func (conn *Conn) closed(now time.Time) bool {
+	switch conn.state.Load() {
+	case stateClosing:
+		conn.mu.Lock()
+		defer conn.mu.Unlock()
+		return len(conn.sendQueue) == 0 && len(conn.controlQueue) == 0 && len(conn.retransmission.unacknowledged) == 0
+	case statePeerDisconnected:
+		conn.ackMu.Lock()
+		pending := len(conn.ackSlice) != 0
+		conn.ackMu.Unlock()
+		return !pending || now.Sub(*conn.lastActivity.Load()) > reliableTimeout
+	}
+	return false
 }
 
 // flushACKs flushes pending datagram acknowledgements once they have been held
@@ -315,23 +333,6 @@ func (conn *Conn) flushACKs() {
 	}
 	conn.ackSlice = conn.ackSlice[:0]
 	conn.oldestUnsentAck = time.Time{}
-}
-
-// closeOnPeerDisconnect drops the connection without sending anything further
-// once the peer has sent a disconnect notification and every received datagram,
-// the notification's included, has been acknowledged. It reports whether it did.
-func (conn *Conn) closeOnPeerDisconnect() bool {
-	if !conn.peerDisconnected.Load() {
-		return false
-	}
-	conn.ackMu.Lock()
-	pending := len(conn.ackSlice) != 0
-	conn.ackMu.Unlock()
-	if pending {
-		return false
-	}
-	conn.once.Do(conn.release)
-	return true
 }
 
 // ackDue reports whether pending ACKs have been held long enough. It must be
@@ -421,6 +422,10 @@ func (conn *Conn) writeWithReliability(b []byte, rel reliability) (n int, err er
 				conn.mu.Unlock()
 				return 0, conn.error(net.ErrClosed, "write")
 			default:
+			}
+			if conn.state.Load() != stateOpen {
+				conn.mu.Unlock()
+				return 0, conn.error(net.ErrClosed, "write")
 			}
 			if conn.sendQueueBytes+required <= maxSendQueueBytes-sendQueueReserve {
 				n, err = conn.write(b, rel, false)
@@ -532,14 +537,28 @@ func (conn *Conn) ReadPacket() (b []byte, err error) {
 	return pk, err
 }
 
-// Close closes the connection. All blocking Read or Write actions are
-// cancelled and will return an error, as soon as the closing of the connection
-// is acknowledged by the client.
+// Close starts closing the connection and returns at once. The disconnect
+// notification is queued behind data already written, and Write fails from
+// now on. The context is cancelled once nothing is left to send or resend, or
+// the peer stops responding.
 func (conn *Conn) Close() error {
-	// Let queued application packets reach the peer before sending the transport
-	// notification. Bedrock otherwise discards its final disconnect message.
-	conn.closing.CompareAndSwap(0, time.Now().Unix())
+	conn.mu.Lock()
+	conn.startClose()
+	conn.mu.Unlock()
+	conn.signalSend()
 	return nil
+}
+
+// startClose queues the disconnect notification if the connection is still
+// open, and enters stateClosing. It must be called with conn.mu held.
+func (conn *Conn) startClose() {
+	if conn.ctx.Err() != nil {
+		return
+	}
+	if conn.state.Load() == stateOpen {
+		_, _ = conn.write([]byte{message.IDDisconnectNotification}, reliabilityReliableOrdered, false)
+	}
+	conn.state.Store(stateClosing)
 }
 
 // Context returns the connection's context. The context is canceled when
@@ -553,9 +572,8 @@ func (conn *Conn) Context() context.Context {
 // connection and closes the underlying UDP connection immediately.
 func (conn *Conn) closeImmediately() {
 	conn.once.Do(func() {
-		_ = conn.sendDisconnect()
-
 		conn.mu.Lock()
+		conn.startClose()
 		// Sends belong to the send loop, which is about to stop. Flush here so
 		// the disconnect notification still reaches the peer, before the
 		// handler closes a dialer's socket. Nothing outstanding will be
@@ -604,19 +622,6 @@ func (conn *Conn) releaseUnacknowledged() {
 	clear(conn.retransmission.unacknowledged)
 }
 
-func (conn *Conn) sendDisconnect() error {
-	if !conn.disconnectSent.CompareAndSwap(false, true) {
-		return nil
-	}
-	if err := conn.writeControl([]byte{message.IDDisconnectNotification}, reliabilityReliableOrdered); err != nil {
-		// Queueing failed. Release the flag so a later attempt can retry rather
-		// than never telling the peer at all.
-		conn.disconnectSent.Store(false)
-		return err
-	}
-	return nil
-}
-
 // RemoteAddr returns the remote address of the connection, meaning the address
 // this connection leads to.
 func (conn *Conn) RemoteAddr() net.Addr {
@@ -658,12 +663,16 @@ func (conn *Conn) sendUnreliable(pk encoding.BinaryMarshaler) error {
 	return conn.writeControl(b, reliabilityUnreliable)
 }
 
-// writeControl queues an internal packet (ping, disconnect) ahead of application
-// data. It fails rather than blocks when the queue is full.
+// writeControl queues an internal packet (ping, pong) ahead of application
+// data. It fails rather than blocks when the queue is full, and is silently
+// refused once the connection is closing, as on the client.
 func (conn *Conn) writeControl(b []byte, rel reliability) error {
 	required := conn.queuedSize(b, rel)
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
+	if conn.state.Load() != stateOpen {
+		return nil
+	}
 	if conn.sendQueueBytes+required > maxSendQueueBytes {
 		return conn.error(errors.New("send queue is full"), "write")
 	}
@@ -791,13 +800,14 @@ func (conn *Conn) handlePacket(b []byte) error {
 		return nil
 	}
 	if b[0] == message.IDDisconnectNotification {
-		// Honoured even mid-close: the peer is gone either way. The send loop
-		// drops the connection once this datagram's ACK is out.
-		conn.peerDisconnected.Store(true)
+		// Honoured even mid-close: the peer is gone either way.
+		conn.mu.Lock()
+		conn.state.Store(statePeerDisconnected)
+		conn.mu.Unlock()
 		conn.signalSend()
 		return nil
 	}
-	if conn.closing.Load() != 0 {
+	if conn.state.Load() == stateClosing {
 		// Don't continue handling packets if the connection is being closed.
 		return nil
 	}
