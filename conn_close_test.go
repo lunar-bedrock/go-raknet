@@ -381,3 +381,41 @@ func TestCloseCompletesOnACKWakeup(t *testing.T) {
 		waitDone(t, done, 40*time.Millisecond, "close completion waited for the ticker after its ACK")
 	}
 }
+
+// Closing a listener notifies its connections and gives them a bounded window
+// to finish before the socket closes.
+func TestListenerCloseNotifiesConnections(t *testing.T) {
+	listener, err := Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		if c, err := listener.Accept(); err == nil {
+			accepted <- c
+		}
+	}()
+	client, err := DialTimeout(listener.Addr().String(), 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	select {
+	case <-accepted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("listener did not accept the connection")
+	}
+
+	start := time.Now()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed > shutdownBlock+200*time.Millisecond {
+		t.Fatalf("listener close blocked for %v", elapsed)
+	}
+	select {
+	case <-client.Context().Done():
+	case <-time.After(time.Second):
+		t.Fatal("client was not told the listener closed")
+	}
+}

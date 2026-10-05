@@ -232,15 +232,47 @@ func (listener *Listener) BlockFor(addr net.Addr, duration time.Duration) {
 	listener.sec.blockFor(addr, duration)
 }
 
-// Close closes the listener so that it may be cleaned up. It makes sure the
-// goroutine handling incoming packets is able to be freed.
+// shutdownBlock bounds how long Close keeps serving connections it is closing,
+// polled every shutdownPoll, as the client does when it shuts down.
+const (
+	shutdownBlock = 100 * time.Millisecond
+	shutdownPoll  = 15 * time.Millisecond
+)
+
+// Close closes every connection and then the listener's socket. Connections
+// are notified and given up to shutdownBlock to finish; any left are dropped.
 func (listener *Listener) Close() error {
 	var err error
 	listener.once.Do(func() {
 		close(listener.closed)
+		listener.shutdown()
 		err = listener.conn.Close()
 	})
 	return err
+}
+
+// shutdown starts a graceful close on every connection and waits for them to
+// finish, for at most shutdownBlock, then drops the rest.
+func (listener *Listener) shutdown() {
+	listener.connections.Range(func(_, value any) bool {
+		_ = value.(*Conn).Close()
+		return true
+	})
+	for end := time.Now().Add(shutdownBlock); time.Now().Before(end); time.Sleep(shutdownPoll) {
+		remaining := false
+		listener.connections.Range(func(any, any) bool {
+			remaining = true
+			return false
+		})
+		if !remaining {
+			return
+		}
+	}
+	listener.connections.Range(func(_, value any) bool {
+		conn := value.(*Conn)
+		conn.once.Do(conn.release)
+		return true
+	})
 }
 
 // PongData sets the pong data that is used to respond with when a client sends
