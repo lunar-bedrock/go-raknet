@@ -800,16 +800,13 @@ func (conn *Conn) handlePacket(b []byte) error {
 		// Empty packets can safely be ignored.
 		return nil
 	}
+	// Packets keep being handled and delivered while closing, as on the
+	// client; anything a handler sends in reply is refused.
 	if b[0] == message.IDDisconnectNotification {
-		// Honoured even mid-close: the peer is gone either way.
 		conn.mu.Lock()
 		conn.state.Store(statePeerDisconnected)
 		conn.mu.Unlock()
 		conn.signalSend()
-		return nil
-	}
-	if conn.state.Load() == stateClosing {
-		// Don't continue handling packets if the connection is being closed.
 		return nil
 	}
 	handled, err := conn.handler.handle(conn, b)

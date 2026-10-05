@@ -358,13 +358,7 @@ func TestQuietPeerKeptUntilTimeout(t *testing.T) {
 	if n := countPackets(t, socket, message.IDDisconnectNotification); n != 0 {
 		t.Fatal("started a graceful close before the receive timeout")
 	}
-	// A closing connection would no longer deliver what it receives.
-	if err := conn.receive(orderedDatagram(0, []byte{0xfe})); err != nil {
-		t.Fatal(err)
-	}
-	ctx, stop := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer stop()
-	if _, ok := conn.packets.Recv(ctx); !ok {
+	if _, err := conn.Write([]byte{0xfe}); err != nil {
 		t.Fatal("started closing before the receive timeout")
 	}
 }
@@ -530,5 +524,34 @@ func TestPendingHandshakeTimeoutDropsSilently(t *testing.T) {
 	}
 	if _, ok := l.connections.Load(resolve(raw.LocalAddr())); ok {
 		t.Fatal("timed-out handshake was not dropped")
+	}
+}
+
+// Received application packets are still delivered in either closing state.
+func TestClosingConnectionStillDelivers(t *testing.T) {
+	for _, peer := range []bool{false, true} {
+		conn, _, cancel := newCloseTestConn()
+		seq := uint24(0)
+		if peer {
+			if err := conn.receive(disconnectDatagram(seq)); err != nil {
+				t.Fatal(err)
+			}
+			seq++
+		} else {
+			_ = conn.Close()
+		}
+		buf := bytes.NewBuffer([]byte{bitFlagDatagram})
+		writeUint24(buf, seq)
+		(&packet{reliability: reliabilityReliableOrdered, orderIndex: seq, content: []byte{0xfe, 1}}).write(buf)
+		if err := conn.receive(buf.Bytes()); err != nil {
+			t.Fatal(err)
+		}
+		ctx, stop := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		b, ok := conn.packets.Recv(ctx)
+		stop()
+		if !ok || !bytes.Equal(b, []byte{0xfe, 1}) {
+			t.Fatalf("peer=%v: received packet was not delivered while closing", peer)
+		}
+		cancel()
 	}
 }
