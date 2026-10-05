@@ -219,33 +219,33 @@ func TestQueuedSizeMatchesQueuedBytes(t *testing.T) {
 	}
 }
 
-// TestPendingACKsWakeSendLoop checks that a batch no further traffic follows is
-// still flushed after ackDelay, rather than waiting for the next tick.
+// A batch of ACKs that no further traffic follows is still sent once the
+// batching window has passed.
 func TestPendingACKsWakeSendLoop(t *testing.T) {
-	conn, _, cancel := newSendTestConn()
-	defer cancel()
+	conn, packetConn, cancel := newSendTestConn()
 	conn.win = newDatagramWindow()
 	conn.ackedAny.Store(true)
+	done := make(chan struct{})
+	go func() { defer close(done); conn.startTicking() }()
+	defer func() { cancel(); <-done }()
 
+	start := time.Now()
 	if err := conn.receiveDatagram([]byte{0, 0, 0}); err != nil {
 		t.Fatalf("receive datagram: %v", err)
 	}
-	// The datagram itself signals the loop; drain that so only the timer is left.
-	select {
-	case <-conn.sendSignal:
-	default:
-		t.Fatal("receiving a datagram did not signal the send loop")
+	for {
+		packetConn.mu.Lock()
+		sent := len(packetConn.writes) != 0
+		packetConn.mu.Unlock()
+		if sent {
+			break
+		}
+		if time.Since(start) > time.Second {
+			t.Fatal("pending ACKs were not sent within a second of being queued")
+		}
+		time.Sleep(time.Millisecond)
 	}
-
-	select {
-	case <-conn.sendSignal:
-	case <-time.After(time.Second):
-		t.Fatal("pending ACKs were not woken within a second of being queued")
-	}
-	conn.ackMu.Lock()
-	due := conn.ackDue(time.Now())
-	conn.ackMu.Unlock()
-	if !due {
-		t.Fatal("ACKs were woken before the batching window elapsed")
+	if elapsed := time.Since(start); elapsed < ackDelay {
+		t.Fatalf("ACK sent after %v, before the batching window elapsed", elapsed)
 	}
 }

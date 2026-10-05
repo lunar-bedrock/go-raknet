@@ -545,6 +545,7 @@ func TestCloseNotificationACKTimeout(t *testing.T) {
 	// A peer that never acknowledges must not keep the transport alive forever.
 	stale := time.Now().Add(-reliableTimeout - time.Second)
 	conn.lastActivity.Store(&stale)
+	conn.signalSend()
 	select {
 	case <-done:
 	case <-time.After(500 * time.Millisecond):

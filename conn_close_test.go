@@ -555,3 +555,18 @@ func TestClosingConnectionStillDelivers(t *testing.T) {
 		cancel()
 	}
 }
+
+// An idle connection sleeps until its next due event instead of polling.
+func TestIdleConnectionDoesNotPoll(t *testing.T) {
+	conn, _, cancel := newCloseTestConn()
+	close(conn.connected)
+	runSendLoop(t, conn, cancel)
+	time.Sleep(50 * time.Millisecond) // Let the first ping go out.
+	// Every update stores the RTT estimate, so a sentinel that survives shows
+	// no update ran.
+	conn.rtt.Store(-1)
+	time.Sleep(300 * time.Millisecond)
+	if conn.rtt.Load() != -1 {
+		t.Fatal("idle connection woke without anything due")
+	}
+}

@@ -74,8 +74,8 @@ const (
 	// bounds a burst even when the congestion window is far larger.
 	resendBufferSize = 512
 
-	// updateInterval is the longest the send loop sleeps between updates.
-	// Network activity wakes it sooner, as it does on the client.
+	// updateInterval is how soon the send loop retries work it could not finish,
+	// such as data held back by the congestion window: the client's update rate.
 	updateInterval = 10 * time.Millisecond
 	// reliableTimeout is how long reliable traffic may go unacknowledged,
 	// counted from the last datagram received, before the peer is taken as gone.
@@ -174,9 +174,6 @@ type Conn struct {
 	// ackedAny records whether any ACK has been received. Until one has, ACKs
 	// are flushed without delay, as the peer's retransmission timer is unknown.
 	ackedAny atomic.Bool
-	// ackTimer wakes the send loop once a batch has been held for ackDelay, so
-	// a batch that no further traffic follows is not left until the next tick.
-	ackTimer *time.Timer
 
 	// packetQueue is an ordered queue containing packets indexed by their order
 	// index.
@@ -254,18 +251,19 @@ func (conn *Conn) effectiveMTU() uint16 {
 	return conn.mtu - 28
 }
 
-// startTicking runs the connection's send loop: every wakeup sends due ACKs,
-// retransmissions and queued data, then checks whether the connection ended.
+// startTicking runs the connection's send loop. It wakes on network activity
+// or when the next timed event is due (ACK flush, resend, ping or receive
+// timeout), sends what is due, then checks whether the connection ended.
 func (conn *Conn) startTicking() {
-	ticker := time.NewTicker(updateInterval)
-	defer ticker.Stop()
+	timer := time.NewTimer(updateInterval)
+	defer timer.Stop()
 	var nextPing time.Time
 	for {
 		var now time.Time
 		select {
 		case <-conn.sendSignal:
 			now = time.Now()
-		case now = <-ticker.C:
+		case now = <-timer.C:
 		case <-conn.ctx.Done():
 			return
 		}
@@ -279,15 +277,65 @@ func (conn *Conn) startTicking() {
 			conn.once.Do(conn.release)
 			return
 		}
-		if !now.Before(nextPing) {
+		established := false
+		select {
+		case <-conn.connected:
+			established = conn.state.Load() == stateOpen
+		default:
+		}
+		if established && !now.Before(nextPing) {
+			nextPing = now.Add(pingInterval)
+			_ = conn.sendUnreliable(&message.ConnectedPing{PingTime: timestamp()})
+		}
+		if !timer.Stop() {
 			select {
-			case <-conn.connected:
-				nextPing = now.Add(pingInterval)
-				_ = conn.sendUnreliable(&message.ConnectedPing{PingTime: timestamp()})
+			case <-timer.C:
 			default:
 			}
 		}
+		if next, ok := conn.nextDue(now, nextPing, established); ok {
+			timer.Reset(next.Sub(now))
+		}
 	}
+}
+
+// nextDue returns when the send loop next has timed work, if it has any.
+// Work still due after an update is blocked and retried at the update rate.
+func (conn *Conn) nextDue(now, nextPing time.Time, established bool) (time.Time, bool) {
+	var next time.Time
+	consider := func(t time.Time) {
+		if next.IsZero() || t.Before(next) {
+			next = t
+		}
+	}
+	if established {
+		consider(nextPing)
+	}
+	conn.ackMu.Lock()
+	if len(conn.ackSlice) != 0 {
+		consider(conn.oldestUnsentAck.Add(ackDelay))
+	}
+	conn.ackMu.Unlock()
+
+	conn.mu.Lock()
+	if len(conn.sendQueue) != 0 || len(conn.controlQueue) != 0 {
+		consider(now)
+	}
+	if !conn.retransmission.deadline.IsZero() {
+		consider(conn.retransmission.deadline)
+	}
+	if len(conn.retransmission.unacknowledged) != 0 {
+		consider(conn.lastActivity.Load().Add(reliableTimeout + time.Millisecond))
+	}
+	conn.mu.Unlock()
+
+	if next.IsZero() {
+		return next, false
+	}
+	if !next.After(now) {
+		next = now.Add(updateInterval)
+	}
+	return next, true
 }
 
 // dead reports whether reliable traffic is outstanding and nothing has been
@@ -727,11 +775,6 @@ func (conn *Conn) receiveDatagram(b []byte) error {
 	// included in an ACK.
 	if len(conn.ackSlice) == 0 {
 		conn.oldestUnsentAck = time.Now()
-		if conn.ackTimer == nil {
-			conn.ackTimer = time.AfterFunc(ackDelay, conn.signalSend)
-		} else {
-			conn.ackTimer.Reset(ackDelay)
-		}
 	}
 	conn.ackSlice = append(conn.ackSlice, seq)
 	conn.ackMu.Unlock()
