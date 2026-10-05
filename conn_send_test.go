@@ -57,6 +57,7 @@ func newSendTestConn() (*Conn, *recordingPacketConn, context.CancelFunc) {
 	}
 	now := time.Now()
 	conn.lastActivity.Store(&now)
+	conn.lastReliableSend = now
 	return conn, packetConn, cancel
 }
 

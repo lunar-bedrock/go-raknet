@@ -15,6 +15,9 @@ import (
 
 type connectionHandler interface {
 	handle(conn *Conn, b []byte) (handled bool, err error)
+	// admit returns errDropConnection-wrapped errors for messages the
+	// connection's state does not accept at all.
+	admit(conn *Conn, b []byte) error
 	close(conn *Conn)
 	log() *slog.Logger
 }
@@ -183,12 +186,16 @@ func (h listenerConnectionHandler) handleOpenConnectionRequest2(b []byte, addr n
 // open connection request before it is dropped silently, as on the client.
 var pendingConnectionTimeout = 10 * time.Second
 
-func (h listenerConnectionHandler) handle(conn *Conn, b []byte) (handled bool, err error) {
+// admit drops a new connection whose first message is not a connection
+// request, as the client drops and bans it.
+func (h listenerConnectionHandler) admit(conn *Conn, b []byte) error {
 	if b[0] != message.IDConnectionRequest && !conn.requested.Load() && conn.state.Load() == stateOpen {
-		// The client drops and bans a new connection whose first message is
-		// anything else.
-		return true, errUnverifiedSender
+		return errUnverifiedSender
 	}
+	return nil
+}
+
+func (h listenerConnectionHandler) handle(conn *Conn, b []byte) (handled bool, err error) {
 	switch b[0] {
 	case message.IDConnectionRequest:
 		return true, acceptConnectionRequest(conn, b[1:])
@@ -236,6 +243,7 @@ func handleNewIncomingConnection(conn *Conn, b []byte) error {
 	case <-conn.connected:
 	default:
 		close(conn.connected)
+		_ = conn.sendUnreliable(&message.ConnectedPing{PingTime: timestamp()})
 	}
 	return nil
 }
@@ -249,6 +257,8 @@ func (h dialerConnectionHandler) log() *slog.Logger {
 func (h dialerConnectionHandler) close(conn *Conn) {
 	_ = conn.conn.Close()
 }
+
+func (h dialerConnectionHandler) admit(*Conn, []byte) error { return nil }
 
 func (h dialerConnectionHandler) handle(conn *Conn, b []byte) (handled bool, err error) {
 	switch b[0] {
@@ -293,6 +303,7 @@ func completeHandshake(conn *Conn, b []byte) error {
 			PingTime:        pk.PongTime,
 			PongTime:        timestamp(),
 		})
+		_ = conn.sendUnreliable(&message.ConnectedPing{PingTime: timestamp()})
 		close(conn.connected)
 		return err
 	}

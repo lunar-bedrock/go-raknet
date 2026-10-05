@@ -206,6 +206,11 @@ type Conn struct {
 	sendSignal chan struct{}
 
 	lastActivity atomic.Pointer[time.Time]
+	// lastReliableSend is when reliable data was last queued; guarded by mu.
+	lastReliableSend time.Time
+	// recvMu serialises dispatching a received datagram with the send loop's
+	// cycles, so the loop judges state only between whole datagrams.
+	recvMu sync.Mutex
 }
 
 // newConn constructs a new connection specifically dedicated to the address
@@ -235,6 +240,7 @@ func newConn(conn net.PacketConn, raddr net.Addr, mtu uint16, h connectionHandle
 	c.ctx, c.cancelFunc = context.WithCancel(context.Background())
 	t := time.Now()
 	c.lastActivity.Store(&t)
+	c.lastReliableSend = t
 	registerMetricsConnection(c)
 	go c.startTicking()
 	return c
@@ -270,25 +276,9 @@ func (conn *Conn) startTicking() {
 		case <-conn.ctx.Done():
 			return
 		}
-		if conn.dead(now) {
-			conn.drop()
+		next, ok, ended := conn.cycle(now, &nextPing)
+		if ended {
 			return
-		}
-		conn.flushACKs()
-		conn.update(now)
-		if conn.closed(now) {
-			conn.drop()
-			return
-		}
-		established := false
-		select {
-		case <-conn.connected:
-			established = conn.state.Load() == stateOpen
-		default:
-		}
-		if established && !now.Before(nextPing) {
-			nextPing = now.Add(pingInterval)
-			_ = conn.sendUnreliable(&message.ConnectedPing{PingTime: timestamp()})
 		}
 		if !timer.Stop() {
 			select {
@@ -296,9 +286,54 @@ func (conn *Conn) startTicking() {
 			default:
 			}
 		}
-		if next, ok := conn.nextDue(now, nextPing, established); ok {
+		if ok {
 			timer.Reset(next.Sub(now))
 		}
+	}
+}
+
+// cycle runs one update of the send loop, serialised with received datagrams,
+// and returns when the next one is due. It reports whether the connection
+// ended.
+func (conn *Conn) cycle(now time.Time, nextPing *time.Time) (next time.Time, ok, ended bool) {
+	conn.recvMu.Lock()
+	defer conn.recvMu.Unlock()
+	if conn.dead(now) {
+		conn.drop()
+		return next, false, true
+	}
+	established := false
+	select {
+	case <-conn.connected:
+		established = conn.state.Load() == stateOpen
+	default:
+	}
+	if established {
+		conn.probe(now)
+	}
+	conn.flushACKs()
+	conn.update(now)
+	if conn.closed(now) {
+		conn.drop()
+		return next, false, true
+	}
+	if established && !now.Before(*nextPing) {
+		*nextPing = now.Add(pingInterval)
+		_ = conn.sendUnreliable(&message.ConnectedPing{PingTime: timestamp()})
+	}
+	next, ok = conn.nextDue(now, *nextPing, established)
+	return next, ok, false
+}
+
+// probe sends a reliable ping when nothing reliable awaits an ACK and none has
+// been sent for half the receive timeout, so a silent peer is still detected.
+func (conn *Conn) probe(now time.Time) {
+	conn.mu.Lock()
+	due := len(conn.retransmission.unacknowledged) == 0 && now.Sub(conn.lastReliableSend) > reliableTimeout/2
+	conn.mu.Unlock()
+	if due {
+		b, _ := (&message.ConnectedPing{PingTime: timestamp()}).MarshalBinary()
+		_ = conn.writeControl(b, reliabilityReliable)
 	}
 }
 
@@ -329,6 +364,8 @@ func (conn *Conn) nextDue(now, nextPing time.Time, established bool) (time.Time,
 	}
 	if len(conn.retransmission.unacknowledged) != 0 {
 		consider(conn.lastActivity.Load().Add(reliableTimeout + time.Millisecond))
+	} else if established {
+		consider(conn.lastReliableSend.Add(reliableTimeout/2 + time.Millisecond))
 	}
 	conn.mu.Unlock()
 
@@ -541,6 +578,7 @@ func (conn *Conn) write(b []byte, rel reliability, control bool) (n int, err err
 		pk.reliability = rel
 		if rel.reliable() {
 			pk.messageIndex = conn.messageIndex.Inc()
+			conn.lastReliableSend = time.Now()
 		}
 		if pk.split = len(fragments) > 1; pk.split {
 			// If there were more than one fragment, the pk was split, so we
@@ -724,6 +762,12 @@ var packetPool = sync.Pool{New: func() any { return &packet{reliability: reliabi
 // receive receives a packet from the connection, handling it as appropriate.
 // If not successful, an error is returned.
 func (conn *Conn) receive(b []byte) error {
+	if len(b) < 3 {
+		// Too short to be anything: ignored, and not counted as activity.
+		return nil
+	}
+	conn.recvMu.Lock()
+	defer conn.recvMu.Unlock()
 	t := time.Now()
 	conn.lastActivity.Store(&t)
 	if len(conn.splits) != 0 && t.Sub(conn.lastSplitSweep) >= splitSweepInterval {
@@ -831,6 +875,14 @@ func (conn *Conn) handlePacket(b []byte) error {
 	if len(b) == 0 {
 		// Empty packets can safely be ignored.
 		return nil
+	}
+	if b[0] == message.IDConnectionAttemptFailed {
+		// Discarded in every state, ahead of the first-message check, as on
+		// the client.
+		return nil
+	}
+	if err := conn.handler.admit(conn, b); err != nil {
+		return err
 	}
 	// Packets keep being handled and delivered while closing, as on the
 	// client; anything a handler sends in reply is refused.

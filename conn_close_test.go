@@ -583,6 +583,7 @@ func TestHandshakeMessagesIgnoredWhileClosing(t *testing.T) {
 		for _, peer := range []bool{false, true} {
 			conn, _, cancel := newCloseTestConn()
 			conn.handler = listenerConnectionHandler{}
+			conn.requested.Store(true)
 			if connected {
 				close(conn.connected)
 			}
@@ -824,5 +825,119 @@ func TestMessageBeforeRequestDropsAndBlocks(t *testing.T) {
 	}
 	if rec.notified.Load() {
 		t.Fatal("drop sent a disconnect notification")
+	}
+}
+
+// An established connection with nothing reliable awaiting an ACK sends a
+// reliable ping once half the receive timeout passes without a reliable send.
+func TestReliableLivenessProbe(t *testing.T) {
+	conn, socket, cancel := newCloseTestConn()
+	close(conn.connected)
+	runSendLoop(t, conn, cancel)
+	time.Sleep(reliableTimeout/2 + 400*time.Millisecond)
+	for _, pk := range sentPacketHeaders(t, socket) {
+		if pk.content[0] == message.IDConnectedPing && pk.reliability == reliabilityReliable {
+			return
+		}
+	}
+	t.Fatal("no reliable ping after half the receive timeout without a reliable send")
+}
+
+// Completing a handshake on either end queues an unreliable ping at once,
+// besides the periodic one.
+func TestHandshakeCompletionPings(t *testing.T) {
+	cra, _ := (&message.ConnectionRequestAccepted{ClientAddress: netip.MustParseAddrPort("127.0.0.1:1")}).MarshalBinary()
+	nic, _ := (&message.NewIncomingConnection{ServerAddress: netip.MustParseAddrPort("127.0.0.1:1")}).MarshalBinary()
+	for _, server := range []bool{false, true} {
+		conn, _, cancel := newCloseTestConn()
+		conn.conn = &recordingPacketConn{}
+		b := cra
+		if server {
+			conn.handler = listenerConnectionHandler{}
+			conn.requested.Store(true)
+			b = nic
+		}
+		if err := conn.handlePacket(b); err != nil {
+			t.Fatal(err)
+		}
+		if !queuedPacket(conn, message.IDConnectedPing) {
+			t.Fatalf("server=%v: completing the handshake queued no ping", server)
+		}
+		cancel()
+	}
+}
+
+// A disconnect notification as a new connection's first message is gated like
+// any other: the connection is dropped silently and the address blocked. A
+// connection attempt failed message bypasses the gate and is discarded.
+func TestFirstMessageGate(t *testing.T) {
+	for _, tc := range []struct {
+		id      byte
+		dropped bool
+	}{{message.IDDisconnectNotification, true}, {message.IDConnectionAttemptFailed, false}} {
+		l, raw, rec := rawListener(t)
+		if _, err := raw.Write(orderedDatagram(0, []byte{tc.id})); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(200 * time.Millisecond)
+		_, kept := l.connections.Load(resolve(raw.LocalAddr()))
+		blocked := l.sec.blocked(raw.LocalAddr())
+		if kept == tc.dropped || blocked != tc.dropped {
+			t.Fatalf("first message %#x: kept=%v blocked=%v, want dropped and blocked=%v", tc.id, kept, blocked, tc.dropped)
+		}
+		if rec.notified.Load() {
+			t.Fatalf("first message %#x: sent a disconnect notification", tc.id)
+		}
+	}
+}
+
+// slowHandler delivers application packets slowly and records whether the
+// connection had already been dropped once delivery finished.
+type slowHandler struct {
+	dialerConnectionHandler
+	droppedMidDatagram *atomic.Bool
+}
+
+func (h slowHandler) handle(conn *Conn, b []byte) (bool, error) {
+	if b[0] != 0xfe {
+		return h.dialerConnectionHandler.handle(conn, b)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if conn.ctx.Err() != nil {
+		h.droppedMidDatagram.Store(true)
+	}
+	return true, nil
+}
+
+// Received packets are dispatched before the send loop judges the state they
+// lead to, so a drop never races the rest of a datagram.
+func TestDispatchSerialisedWithDrop(t *testing.T) {
+	conn, _, cancel := newCloseTestConn()
+	var dropped atomic.Bool
+	conn.handler = slowHandler{dialerConnectionHandler{l: slog.New(internal.DiscardHandler{})}, &dropped}
+	done := runSendLoop(t, conn, cancel)
+	buf := bytes.NewBuffer([]byte{bitFlagDatagram})
+	writeUint24(buf, 0)
+	(&packet{reliability: reliabilityReliableOrdered, orderIndex: 0, content: []byte{message.IDDisconnectNotification}}).write(buf)
+	(&packet{reliability: reliabilityReliableOrdered, orderIndex: 1, content: []byte{0xfe}}).write(buf)
+	if err := conn.receive(buf.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	waitDone(t, done, time.Second, "connection did not close after the notification")
+	if dropped.Load() {
+		t.Fatal("connection was dropped while its datagram was still being dispatched")
+	}
+}
+
+// Buffers too short to be a datagram are ignored outright and do not count as
+// activity from the peer.
+func TestShortBufferIsNotActivity(t *testing.T) {
+	conn, _, cancel := newCloseTestConn()
+	defer cancel()
+	setLastActivity(conn, time.Hour)
+	before := *conn.lastActivity.Load()
+	_ = conn.receive([]byte{bitFlagDatagram | bitFlagACK, 0})
+	if !conn.lastActivity.Load().Equal(before) {
+		t.Fatal("a two-byte buffer refreshed the last receive time")
 	}
 }
