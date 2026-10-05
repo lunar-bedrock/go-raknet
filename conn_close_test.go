@@ -483,3 +483,52 @@ func TestDetectLostConnectionsIgnored(t *testing.T) {
 		cancel()
 	}
 }
+
+// A handshake that never completes is dropped silently on its timeout.
+func TestPendingHandshakeTimeoutDropsSilently(t *testing.T) {
+	defer func(d time.Duration) { pendingConnectionTimeout = d }(pendingConnectionTimeout)
+	pendingConnectionTimeout = 200 * time.Millisecond
+
+	l, err := ListenConfig{DisableCookies: true}.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	raw, err := net.Dial("udp", l.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	req, _ := (&message.OpenConnectionRequest2{ServerAddress: resolve(l.Addr()), MTU: 1400, ClientGUID: -1}).MarshalBinary()
+	if _, err := raw.Write(req); err != nil {
+		t.Fatal(err)
+	}
+
+	b := make([]byte, 2048)
+	notified := false
+	for end := time.Now().Add(pendingConnectionTimeout + time.Second); time.Now().Before(end); {
+		_ = raw.SetReadDeadline(end)
+		n, err := raw.Read(b)
+		if err != nil {
+			break
+		}
+		if b[0]&bitFlagDatagram == 0 || b[0]&(bitFlagACK|bitFlagNACK) != 0 {
+			continue
+		}
+		pk := new(packet)
+		for rest := b[4:n]; len(rest) > 0; {
+			m, err := pk.read(rest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			notified = notified || pk.content[0] == message.IDDisconnectNotification
+			rest = rest[m:]
+		}
+	}
+	if notified {
+		t.Fatal("timed-out handshake sent a disconnect notification")
+	}
+	if _, ok := l.connections.Load(resolve(raw.LocalAddr())); ok {
+		t.Fatal("timed-out handshake was not dropped")
+	}
+}

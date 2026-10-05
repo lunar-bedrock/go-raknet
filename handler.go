@@ -159,7 +159,7 @@ func (h listenerConnectionHandler) handleOpenConnectionRequest2(b []byte, addr n
 		conn := newConn(h.l.conn, addr, mtuSize, h)
 		h.l.connections.Store(resolve(addr), conn)
 
-		t := time.NewTimer(time.Second * 10)
+		t := time.NewTimer(pendingConnectionTimeout)
 		defer t.Stop()
 		select {
 		case <-conn.connected:
@@ -174,13 +174,15 @@ func (h listenerConnectionHandler) handleOpenConnectionRequest2(b []byte, addr n
 		case <-h.l.closed:
 			_ = conn.Close()
 		case <-t.C:
-			// It took too long to complete this connection. We close it and go
-			// back to accepting.
-			_ = conn.Close()
+			conn.once.Do(conn.release)
 		}
 	}()
 	return nil
 }
+
+// pendingConnectionTimeout is how long a handshake may take after the second
+// open connection request before it is dropped silently, as on the client.
+var pendingConnectionTimeout = 10 * time.Second
 
 func (h listenerConnectionHandler) handle(conn *Conn, b []byte) (handled bool, err error) {
 	switch b[0] {
