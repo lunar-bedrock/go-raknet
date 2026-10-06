@@ -513,3 +513,23 @@ func TestCloseNotificationACKTimeout(t *testing.T) {
 		t.Fatal("notification ACK timeout did not close the connection")
 	}
 }
+
+// A packet needing more fragments than a peer reassembles is refused before
+// it takes an order index or any queue space.
+func TestWriteRefusesPacketsPastSplitLimit(t *testing.T) {
+	conn, _, cancel := newSendTestConn()
+	defer cancel()
+	limit := maxSplitCount * fragmentSize(1<<20, conn.effectiveMTU())
+	if _, err := conn.Write(make([]byte, limit+1)); err == nil {
+		t.Fatal("packet past the split limit was accepted")
+	}
+	if conn.orderIndex != 0 || conn.splitID != 0 || len(conn.sendQueue) != 0 || conn.sendQueueBytes != 0 {
+		t.Fatal("refused packet left state behind")
+	}
+	if n, err := conn.Write(make([]byte, limit)); err != nil || n != limit {
+		t.Fatalf("packet at the split limit: n=%d err=%v", n, err)
+	}
+	if len(conn.sendQueue) != maxSplitCount {
+		t.Fatalf("queued %d fragments, want %d", len(conn.sendQueue), maxSplitCount)
+	}
+}

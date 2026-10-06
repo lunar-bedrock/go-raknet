@@ -152,7 +152,7 @@ func (pk *packet) read(b []byte) (int, error) {
 	if bits == 0 {
 		return 0, errors.New("read packet: zero length")
 	}
-	n := (bits + 7) >> 3
+	n := (int(bits) + 7) >> 3 // Widened: rounding 65529 and up overflows uint16.
 	offset := 3
 
 	if pk.reliability.reliable() {
@@ -198,10 +198,10 @@ func (pk *packet) read(b []byte) (int, error) {
 	}
 
 	pk.content = make([]byte, n)
-	if got := copy(pk.content, b[offset:]); got != int(n) {
+	if got := copy(pk.content, b[offset:]); got != n {
 		return 0, io.ErrUnexpectedEOF
 	}
-	return offset + int(n), nil
+	return offset + n, nil
 }
 
 const (

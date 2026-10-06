@@ -44,6 +44,8 @@ const (
 	maxWindowSize = 2048
 
 	// maxSplitCount is the most fragments the client accepts for one packet.
+	// Write refuses larger packets, which the peer would drop and so stall
+	// its ordered delivery.
 	maxSplitCount = 2048
 	// maxConcurrentSplits bounds packets part way through reassembly, matching
 	// the client, which drops fragments that would start a further one.
@@ -505,6 +507,9 @@ func (conn *Conn) writeWithReliability(b []byte, rel reliability) (n int, err er
 	default:
 		if len(b) == 0 {
 			return 0, nil
+		}
+		if count := splitCount(len(b), conn.effectiveMTU()); count > maxSplitCount {
+			return 0, conn.error(fmt.Errorf("packet needs %d fragments, more than %d", count, maxSplitCount), "write")
 		}
 		required := conn.queuedSize(b, rel)
 		if required > maxSendQueueBytes-sendQueueReserve {

@@ -146,6 +146,8 @@ func TestEncapsulationValidation(t *testing.T) {
 		"split count 2049": {encapsulated(0x10, 8, split(2049, 0), []byte{1}), false, 0},
 		"split index past": {encapsulated(0x10, 8, split(2, 2), []byte{1}), false, 0},
 		"bits round up":    {encapsulated(0x00, 9, nil, []byte{1, 2}), true, 2},
+		"max bits short":   {encapsulated(0x00, 65535, nil, []byte{1}), false, 0},
+		"max bits":         {encapsulated(0x00, 65535, nil, make([]byte, 8192)), true, 8192},
 	} {
 		pk := new(packet)
 		_, err := pk.read(tc.b)
