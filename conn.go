@@ -85,8 +85,9 @@ const (
 	pingInterval = 5 * time.Second
 )
 
-// Connection states. A connection leaves stateOpen for good; the two closing
-// states can replace each other, as on the client.
+// Connection states. A connection leaves stateOpen for good. The peer's
+// notification moves stateClosing on to statePeerDisconnected, which a later
+// Close leaves alone so the notification is still acknowledged.
 const (
 	stateOpen int32 = iota
 	// stateClosing: Close queued the notification. Ends once nothing is left
@@ -642,16 +643,16 @@ func (conn *Conn) Close() error {
 	return nil
 }
 
-// startClose queues the disconnect notification if the connection is still
-// open, and enters stateClosing. It must be called with conn.mu held.
+// startClose queues the disconnect notification and enters stateClosing if
+// the connection is still open. It must be called with conn.mu held.
 func (conn *Conn) startClose() {
 	if conn.ctx.Err() != nil {
 		return
 	}
 	if conn.state.Load() == stateOpen {
 		_, _ = conn.write([]byte{message.IDDisconnectNotification}, reliabilityReliableOrdered, false)
+		conn.state.Store(stateClosing)
 	}
-	conn.state.Store(stateClosing)
 }
 
 // Context returns the connection's context. The context is canceled when
