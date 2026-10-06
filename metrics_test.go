@@ -171,7 +171,7 @@ func TestMetricsSnapshotTracksConnectionLifecycle(t *testing.T) {
 		t.Fatalf("connections after open = %d, want %d", got, before+1)
 	}
 
-	conn.closeImmediately()
+	conn.drop()
 	if got := MetricsSnapshot().Connections; got != before {
 		t.Fatalf("connections after close = %d, want %d", got, before)
 	}

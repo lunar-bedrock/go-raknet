@@ -55,6 +55,9 @@ func newSendTestConn() (*Conn, *recordingPacketConn, context.CancelFunc) {
 		sendSignal:     make(chan struct{}, 1),
 		sendBudget:     maxMTUSize - 28,
 	}
+	now := time.Now()
+	conn.lastActivity.Store(&now)
+	conn.lastReliableSend = now
 	return conn, packetConn, cancel
 }
 
@@ -315,48 +318,8 @@ func TestContinuousSendUsesPreviousTick(t *testing.T) {
 	}
 }
 
-// closingPacketConn rejects writes once closed, as a real socket does.
-type closingPacketConn struct{ recordingPacketConn }
-
-func (c *closingPacketConn) Close() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.err = net.ErrClosed
-	return nil
-}
-
-// TestCloseImmediatelyFlushesDisconnect: a dialer's socket is closed by its
-// handler, so the queued disconnect must be flushed first, and neither a shut
-// window nor a full resend buffer may hold it back at that point.
-func TestCloseImmediatelyFlushesDisconnect(t *testing.T) {
-	for _, outstanding := range []int{0, resendBufferSize} {
-		conn, _, cancel := newSendTestConn()
-		packetConn := &closingPacketConn{}
-		conn.conn = packetConn
-		conn.sendBudget = 0
-		for i := range outstanding {
-			conn.retransmission.add(uint24(i), packetPool.Get().(*packet), 1)
-		}
-
-		conn.closeImmediately()
-		cancel()
-
-		packetConn.mu.Lock()
-		sent := false
-		for _, b := range packetConn.writes {
-			if bytes.Contains(b, []byte{message.IDDisconnectNotification}) {
-				sent = true
-			}
-		}
-		packetConn.mu.Unlock()
-		if !sent {
-			t.Fatalf("outstanding=%d: disconnect notification never reached the socket", outstanding)
-		}
-	}
-}
-
-// The ticker must close an empty connection without waiting for the timeout,
-// and keep queued or unacknowledged work alive until it drains.
+// The send loop must close an empty connection once its notification is
+// acknowledged, and keep queued or unacknowledged work alive until it drains.
 func TestCloseThroughTicker(t *testing.T) {
 	for _, queues := range []struct {
 		name                 string
@@ -391,9 +354,6 @@ func TestCloseThroughTicker(t *testing.T) {
 			if err := conn.Close(); err != nil {
 				t.Fatal(err)
 			}
-			// Keep the old whole-second timeout out of the assertion window,
-			// independent of where the test starts within a wall-clock second.
-			conn.closing.Store(time.Now().Add(time.Second).Unix())
 			done := make(chan struct{})
 			go func() { defer close(done); conn.startTicking() }()
 			defer func() { cancel(); <-done }()
@@ -432,16 +392,11 @@ func TestCloseThroughTicker(t *testing.T) {
 					t.Fatal("closed before application/control ACKs")
 				case <-time.After(150 * time.Millisecond):
 				}
-				conn.mu.Lock()
-				var sequences []uint24
-				for seq := range conn.retransmission.unacknowledged {
-					sequences = append(sequences, seq)
-				}
-				conn.mu.Unlock()
-				ack := bytes.NewBuffer(nil)
-				(&acknowledgement{packets: sequences}).write(ack, conn.effectiveMTU())
-				if err := conn.handleACK(ack.Bytes()); err != nil {
-					t.Fatal(err)
+				// The notification went out behind the payloads; acknowledge
+				// those alone.
+				waitForCloseDatagrams(t, socket, len(payloads)+1)
+				for i := range payloads {
+					ackCloseDatagram(t, conn, socket, i)
 				}
 			}
 			waitForCloseDatagrams(t, socket, len(payloads)+1)
@@ -549,7 +504,9 @@ func TestCloseNotificationACKTimeout(t *testing.T) {
 	defer func() { cancel(); <-done }()
 	waitForCloseDatagrams(t, socket, 1)
 	// A peer that never acknowledges must not keep the transport alive forever.
-	conn.closing.Store(time.Now().Add(-6 * time.Second).Unix())
+	stale := time.Now().Add(-reliableTimeout - time.Second)
+	conn.lastActivity.Store(&stale)
+	conn.signalSend()
 	select {
 	case <-done:
 	case <-time.After(500 * time.Millisecond):

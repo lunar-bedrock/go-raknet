@@ -2,7 +2,6 @@ package raknet
 
 import (
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"hash/crc32"
 	"log/slog"
@@ -16,6 +15,9 @@ import (
 
 type connectionHandler interface {
 	handle(conn *Conn, b []byte) (handled bool, err error)
+	// admit returns errDropConnection-wrapped errors for messages the
+	// connection's state does not accept at all.
+	admit(conn *Conn, b []byte) error
 	close(conn *Conn)
 	log() *slog.Logger
 }
@@ -27,7 +29,7 @@ type listenerConnectionHandler struct {
 }
 
 var (
-	errUnexpectedCRA = errors.New("unexpected CONNECTION_REQUEST_ACCEPTED packet")
+	errUnverifiedSender = fmt.Errorf("message before a connection request: %w", errDropConnection)
 )
 
 func (h listenerConnectionHandler) log() *slog.Logger {
@@ -159,7 +161,7 @@ func (h listenerConnectionHandler) handleOpenConnectionRequest2(b []byte, addr n
 		conn := newConn(h.l.conn, addr, mtuSize, h)
 		h.l.connections.Store(resolve(addr), conn)
 
-		t := time.NewTimer(time.Second * 10)
+		t := time.NewTimer(pendingConnectionTimeout)
 		defer t.Stop()
 		select {
 		case <-conn.connected:
@@ -174,44 +176,54 @@ func (h listenerConnectionHandler) handleOpenConnectionRequest2(b []byte, addr n
 		case <-h.l.closed:
 			_ = conn.Close()
 		case <-t.C:
-			// It took too long to complete this connection. We close it and go
-			// back to accepting.
-			_ = conn.Close()
+			conn.drop()
 		}
 	}()
+	return nil
+}
+
+// pendingConnectionTimeout is how long a handshake may take after the second
+// open connection request before it is dropped silently, as on the client.
+var pendingConnectionTimeout = 10 * time.Second
+
+// admit drops a new connection whose first message is not a connection
+// request, as the client drops and bans it.
+func (h listenerConnectionHandler) admit(conn *Conn, b []byte) error {
+	if b[0] != message.IDConnectionRequest && !conn.requested.Load() && conn.state.Load() == stateOpen {
+		return errUnverifiedSender
+	}
 	return nil
 }
 
 func (h listenerConnectionHandler) handle(conn *Conn, b []byte) (handled bool, err error) {
 	switch b[0] {
 	case message.IDConnectionRequest:
-		return true, h.handleConnectionRequest(conn, b[1:])
+		return true, acceptConnectionRequest(conn, b[1:])
 	case message.IDConnectionRequestAccepted:
-		return true, errUnexpectedCRA
+		return true, completeHandshake(conn, b)
 	case message.IDNewIncomingConnection:
-		return true, h.handleNewIncomingConnection(conn)
+		return true, handleNewIncomingConnection(conn, b)
 	case message.IDConnectedPing:
 		return true, handleConnectedPing(conn, b[1:])
 	case message.IDConnectedPong:
 		return true, handleConnectedPong(b[1:])
-	case message.IDDisconnectNotification:
-		conn.closeImmediately()
-		return true, nil
 	case message.IDDetectLostConnections:
-		// Let the other end know the connection is still alive.
-		return true, conn.send(&message.ConnectedPing{PingTime: timestamp()})
+		// The client ignores these.
+		return true, nil
 	default:
 		return false, nil
 	}
 }
 
-// handleConnectionRequest handles a connection request packet inside of buffer
-// b. An error is returned if the packet was invalid.
-func (h listenerConnectionHandler) handleConnectionRequest(conn *Conn, b []byte) error {
+// acceptConnectionRequest answers a connection request with an accepted reply,
+// on either end and in any open state, as the client does. The request puts
+// this end on the server's side of the handshake.
+func acceptConnectionRequest(conn *Conn, b []byte) error {
 	pk := &message.ConnectionRequest{}
 	if err := pk.UnmarshalBinary(b); err != nil {
 		return fmt.Errorf("read CONNECTION_REQUEST: %w", err)
 	}
+	conn.requested.Store(true)
 	return conn.send(&message.ConnectionRequestAccepted{
 		ClientAddress:   resolve(conn.raddr),
 		SystemAddresses: message.NewLocalSystemAddresses(resolve(conn.conn.LocalAddr())),
@@ -220,14 +232,18 @@ func (h listenerConnectionHandler) handleConnectionRequest(conn *Conn, b []byte)
 	})
 }
 
-// handleNewIncomingConnection handles an incoming connection packet from the
-// client, finalising the Conn.
-func (h listenerConnectionHandler) handleNewIncomingConnection(conn *Conn) error {
+// handleNewIncomingConnection completes the server's side of the handshake.
+// The client ignores one shorter than 24 bytes, or outside that side of the
+// handshake.
+func handleNewIncomingConnection(conn *Conn, b []byte) error {
+	if len(b) < 24 || !conn.requested.Load() {
+		return nil
+	}
 	select {
 	case <-conn.connected:
-		return nil
 	default:
 		close(conn.connected)
+		_ = conn.sendUnreliable(&message.ConnectedPing{PingTime: timestamp()})
 	}
 	return nil
 }
@@ -242,34 +258,38 @@ func (h dialerConnectionHandler) close(conn *Conn) {
 	_ = conn.conn.Close()
 }
 
+func (h dialerConnectionHandler) admit(*Conn, []byte) error { return nil }
+
 func (h dialerConnectionHandler) handle(conn *Conn, b []byte) (handled bool, err error) {
 	switch b[0] {
 	case message.IDConnectionRequest:
-		return true, nil
+		return true, acceptConnectionRequest(conn, b[1:])
 	case message.IDConnectionRequestAccepted:
-		return true, h.handleConnectionRequestAccepted(conn, b[1:])
+		return true, completeHandshake(conn, b)
 	case message.IDNewIncomingConnection:
-		return true, nil
+		return true, handleNewIncomingConnection(conn, b)
 	case message.IDConnectedPing:
 		return true, handleConnectedPing(conn, b[1:])
 	case message.IDConnectedPong:
 		return true, handleConnectedPong(b[1:])
-	case message.IDDisconnectNotification:
-		conn.closeImmediately()
-		return true, nil
 	case message.IDDetectLostConnections:
-		// Let the other end know the connection is still alive.
-		return true, conn.send(&message.ConnectedPing{PingTime: timestamp()})
+		// The client ignores these.
+		return true, nil
 	default:
 		return false, nil
 	}
 }
 
-// handleConnectionRequestAccepted handles a serialised connection request
-// accepted packet in b, and returns an error if not successful.
-func (h dialerConnectionHandler) handleConnectionRequestAccepted(conn *Conn, b []byte) error {
+// completeHandshake completes a handshake still in progress on either end
+// with an accepted reply, answering with a new incoming connection, as the
+// client does. It ignores one shorter than 26 bytes or on a connection already
+// established.
+func completeHandshake(conn *Conn, b []byte) error {
+	if len(b) < 26 {
+		return nil
+	}
 	pk := &message.ConnectionRequestAccepted{}
-	if err := pk.UnmarshalBinary(b); err != nil {
+	if err := pk.UnmarshalBinary(b[1:]); err != nil {
 		return fmt.Errorf("read CONNECTION_REQUEST_ACCEPTED: %w", err)
 	}
 	select {
@@ -283,6 +303,7 @@ func (h dialerConnectionHandler) handleConnectionRequestAccepted(conn *Conn, b [
 			PingTime:        pk.PongTime,
 			PongTime:        timestamp(),
 		})
+		_ = conn.sendUnreliable(&message.ConnectedPing{PingTime: timestamp()})
 		close(conn.connected)
 		return err
 	}

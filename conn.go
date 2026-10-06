@@ -73,6 +73,32 @@ const (
 	// reliable data while the slot for the next message number is taken, which
 	// bounds a burst even when the congestion window is far larger.
 	resendBufferSize = 512
+
+	// updateInterval is how soon the send loop retries work it could not finish,
+	// such as data held back by the congestion window: the client's update rate.
+	updateInterval = 10 * time.Millisecond
+	// reliableTimeout is how long reliable traffic may go unacknowledged,
+	// counted from the last datagram received, before the peer is taken as gone.
+	reliableTimeout = 10 * time.Second
+	// pingInterval spaces the unreliable pings an established connection
+	// sends, the first as soon as it is established.
+	pingInterval = 5 * time.Second
+)
+
+// Connection states. A connection leaves stateOpen for good. The peer's
+// notification moves either local closing state on to statePeerDisconnected,
+// which a later Close leaves alone so the notification is still acknowledged.
+const (
+	stateOpen int32 = iota
+	// stateCloseRequested: Close was called; the send loop queues the
+	// notification next and moves on to stateClosing.
+	stateCloseRequested
+	// stateClosing: the notification is queued. Ends once nothing is left to
+	// send or resend.
+	stateClosing
+	// statePeerDisconnected: the peer's notification arrived. Ends once every
+	// received datagram has been acknowledged.
+	statePeerDisconnected
 )
 
 // splitEntry retains only fragments that have arrived, indexed by split index.
@@ -102,8 +128,12 @@ type Conn struct {
 	// connection. The rtt is measured in nanoseconds.
 	rtt atomic.Int64
 
-	closing        atomic.Int64
-	disconnectSent atomic.Bool
+	// state is checked by writers under mu. Close leaves stateOpen without
+	// mu, so the notification the send loop then queues follows their data.
+	state atomic.Int32
+	// requested is set once a connection request has been answered: this end
+	// holds the server's side of the handshake.
+	requested atomic.Bool
 
 	ctx        context.Context
 	cancelFunc context.CancelFunc
@@ -153,9 +183,6 @@ type Conn struct {
 	// ackedAny records whether any ACK has been received. Until one has, ACKs
 	// are flushed without delay, as the peer's retransmission timer is unknown.
 	ackedAny atomic.Bool
-	// ackTimer wakes the send loop once a batch has been held for ackDelay, so
-	// a batch that no further traffic follows is not left until the next tick.
-	ackTimer *time.Timer
 
 	// packetQueue is an ordered queue containing packets indexed by their order
 	// index.
@@ -163,6 +190,9 @@ type Conn struct {
 	// packets is a channel containing content of packets that were fully
 	// processed. Calling Conn.Read() consumes a value from this channel.
 	packets *internal.ElasticChan[[]byte]
+	// undelivered holds, in order, packets the full packets queue refused, for
+	// receive to deliver outside recvMu. Owned by the one receiving goroutine.
+	undelivered [][]byte
 
 	// retransmission is a queue filled with packets that were sent with a given
 	// datagram sequence number.
@@ -185,6 +215,11 @@ type Conn struct {
 	sendSignal chan struct{}
 
 	lastActivity atomic.Pointer[time.Time]
+	// lastReliableSend is when reliable data was last queued; guarded by mu.
+	lastReliableSend time.Time
+	// recvMu serialises dispatching a received datagram with the send loop's
+	// cycles, so the loop judges state only between whole datagrams.
+	recvMu sync.Mutex
 }
 
 // newConn constructs a new connection specifically dedicated to the address
@@ -214,6 +249,7 @@ func newConn(conn net.PacketConn, raddr net.Addr, mtu uint16, h connectionHandle
 	c.ctx, c.cancelFunc = context.WithCancel(context.Background())
 	t := time.Now()
 	c.lastActivity.Store(&t)
+	c.lastReliableSend = t
 	registerMetricsConnection(c)
 	go c.startTicking()
 	return c
@@ -233,63 +269,158 @@ func (conn *Conn) effectiveMTU() uint16 {
 	return conn.mtu - 28
 }
 
-// startTicking makes the connection start ticking, sending ACKs and pings to
-// the other end where necessary and checking if the connection should be timed
-// out.
+// startTicking runs the connection's send loop. It wakes on network activity
+// or when the next timed event is due (ACK flush, resend, ping or receive
+// timeout), sends what is due, then checks whether the connection ended.
 func (conn *Conn) startTicking() {
-	var (
-		interval = time.Second / 10
-		ticker   = time.NewTicker(interval)
-		i        int64
-	)
-	defer ticker.Stop()
+	timer := time.NewTimer(updateInterval)
+	defer timer.Stop()
+	var nextPing time.Time
 	for {
+		var now time.Time
 		select {
 		case <-conn.sendSignal:
-			// Protocol activity opened the window, queued data or made a
-			// retransmission due. The client runs the same update on a 10ms
-			// timer that network activity signals early.
-			conn.flushACKs()
-			conn.update(time.Now())
-		case t := <-ticker.C:
-			i++
-			conn.flushACKs()
-			conn.update(t)
-			if unix := conn.closing.Load(); unix != 0 {
-				conn.mu.Lock()
-				acksLeft := len(conn.retransmission.unacknowledged) + len(conn.sendQueue) + len(conn.controlQueue)
-				conn.mu.Unlock()
-
-				since := t.Sub(time.Unix(unix, 0))
-				if since > time.Second*5 {
-					conn.closeImmediately()
-				} else if acksLeft == 0 {
-					if conn.disconnectSent.Load() {
-						conn.closeImmediately()
-					} else {
-						// Keep ticking so the final notification is retransmitted
-						// until acknowledged, just like the application data.
-						_ = conn.sendDisconnect()
-					}
-				}
-				continue
-			}
-			if i%5 == 0 {
-				_ = conn.send(&message.ConnectedPing{PingTime: timestamp()})
-
-				conn.mu.Lock()
-				timedOut := t.Sub(*conn.lastActivity.Load()) > time.Second*5+conn.retransmission.rtt()*2
-				conn.mu.Unlock()
-				if timedOut {
-					// Close sends a disconnect through Write, which takes conn.mu.
-					// Do not call it while holding the same non-reentrant mutex.
-					_ = conn.Close()
-				}
-			}
+			now = time.Now()
+		case now = <-timer.C:
 		case <-conn.ctx.Done():
 			return
 		}
+		next, ok, ended := conn.cycle(now, &nextPing)
+		if ended {
+			return
+		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		if ok {
+			timer.Reset(next.Sub(now))
+		}
 	}
+}
+
+// cycle runs one update of the send loop and returns when the next one is
+// due. It reports whether the connection ended.
+func (conn *Conn) cycle(now time.Time, nextPing *time.Time) (next time.Time, ok, ended bool) {
+	if conn.dropIf(func() bool { return conn.dead(now) }) {
+		return next, false, true
+	}
+	established := false
+	select {
+	case <-conn.connected:
+		established = conn.state.Load() == stateOpen
+	default:
+	}
+	if established {
+		conn.probe(now)
+	}
+	conn.flushACKs()
+	conn.update(now)
+	if conn.dropIf(func() bool { return conn.closed(now) }) {
+		return next, false, true
+	}
+	if established && !now.Before(*nextPing) {
+		*nextPing = now.Add(pingInterval)
+		_ = conn.sendUnreliable(&message.ConnectedPing{PingTime: timestamp()})
+	}
+	next, ok = conn.nextDue(now, *nextPing, established)
+	return next, ok, false
+}
+
+// dropIf drops the connection if end reports it should. It holds recvMu, so
+// the state is judged only between whole received datagrams, but never across
+// the socket writes of an update.
+func (conn *Conn) dropIf(end func() bool) bool {
+	conn.recvMu.Lock()
+	defer conn.recvMu.Unlock()
+	if !end() {
+		return false
+	}
+	conn.drop()
+	return true
+}
+
+// probe sends a reliable ping when nothing reliable awaits an ACK and none has
+// been sent for half the receive timeout, so a silent peer is still detected.
+func (conn *Conn) probe(now time.Time) {
+	conn.mu.Lock()
+	due := len(conn.retransmission.unacknowledged) == 0 && now.Sub(conn.lastReliableSend) > reliableTimeout/2
+	conn.mu.Unlock()
+	if due {
+		b, _ := (&message.ConnectedPing{PingTime: timestamp()}).MarshalBinary()
+		_ = conn.writeControl(b, reliabilityReliable)
+	}
+}
+
+// nextDue returns when the send loop next has timed work, if it has any.
+// Work still due after an update is blocked and retried at the update rate.
+func (conn *Conn) nextDue(now, nextPing time.Time, established bool) (time.Time, bool) {
+	var next time.Time
+	consider := func(t time.Time) {
+		if next.IsZero() || t.Before(next) {
+			next = t
+		}
+	}
+	if established {
+		consider(nextPing)
+	}
+	conn.ackMu.Lock()
+	if len(conn.ackSlice) != 0 {
+		consider(conn.oldestUnsentAck.Add(ackDelay))
+	}
+	conn.ackMu.Unlock()
+
+	conn.mu.Lock()
+	if len(conn.sendQueue) != 0 || len(conn.controlQueue) != 0 {
+		consider(now)
+	}
+	if !conn.retransmission.deadline.IsZero() {
+		consider(conn.retransmission.deadline)
+	}
+	if len(conn.retransmission.unacknowledged) != 0 {
+		consider(conn.lastActivity.Load().Add(reliableTimeout + time.Millisecond))
+	} else if established {
+		consider(conn.lastReliableSend.Add(reliableTimeout/2 + time.Millisecond))
+	}
+	conn.mu.Unlock()
+
+	if next.IsZero() {
+		return next, false
+	}
+	if !next.After(now) {
+		next = now.Add(updateInterval)
+	}
+	return next, true
+}
+
+// dead reports whether reliable traffic is outstanding and nothing has been
+// received for reliableTimeout. Such a connection is dropped without sending
+// anything further.
+func (conn *Conn) dead(now time.Time) bool {
+	conn.mu.Lock()
+	outstanding := len(conn.retransmission.unacknowledged) != 0
+	conn.mu.Unlock()
+	return outstanding && now.Sub(*conn.lastActivity.Load()) > reliableTimeout
+}
+
+// closed reports whether a closing connection has finished: locally closed
+// once nothing is left to send or resend, closed by the peer once every
+// received datagram is acknowledged, or nothing received for reliableTimeout.
+func (conn *Conn) closed(now time.Time) bool {
+	switch conn.state.Load() {
+	case stateClosing:
+		conn.mu.Lock()
+		defer conn.mu.Unlock()
+		return len(conn.sendQueue) == 0 && len(conn.controlQueue) == 0 && len(conn.retransmission.unacknowledged) == 0
+	case statePeerDisconnected:
+		conn.ackMu.Lock()
+		pending := len(conn.ackSlice) != 0
+		conn.ackMu.Unlock()
+		return !pending || now.Sub(*conn.lastActivity.Load()) > reliableTimeout
+	}
+	return false
 }
 
 // flushACKs flushes pending datagram acknowledgements once they have been held
@@ -328,6 +459,12 @@ func (conn *Conn) ackDue(now time.Time) bool {
 func (conn *Conn) update(now time.Time) {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
+
+	if conn.state.CompareAndSwap(stateCloseRequested, stateClosing) {
+		_, _ = conn.write([]byte{message.IDDisconnectNotification}, reliabilityReliableOrdered, false)
+		// Writers waiting for queue space must see the refusal.
+		conn.signalSendQueueFreed()
+	}
 
 	conn.congestion.continuous = conn.continuousSend
 	conn.wireContinuous = conn.continuousSend
@@ -398,6 +535,10 @@ func (conn *Conn) writeWithReliability(b []byte, rel reliability) (n int, err er
 				return 0, conn.error(net.ErrClosed, "write")
 			default:
 			}
+			if conn.state.Load() != stateOpen {
+				conn.mu.Unlock()
+				return 0, conn.error(net.ErrClosed, "write")
+			}
 			if conn.sendQueueBytes+required <= maxSendQueueBytes-sendQueueReserve {
 				n, err = conn.write(b, rel, false)
 				conn.mu.Unlock()
@@ -460,6 +601,7 @@ func (conn *Conn) write(b []byte, rel reliability, control bool) (n int, err err
 		pk.reliability = rel
 		if rel.reliable() {
 			pk.messageIndex = conn.messageIndex.Inc()
+			conn.lastReliableSend = time.Now()
 		}
 		if pk.split = len(fragments) > 1; pk.split {
 			// If there were more than one fragment, the pk was split, so we
@@ -508,13 +650,15 @@ func (conn *Conn) ReadPacket() (b []byte, err error) {
 	return pk, err
 }
 
-// Close closes the connection. All blocking Read or Write actions are
-// cancelled and will return an error, as soon as the closing of the connection
-// is acknowledged by the client.
+// Close starts closing the connection and returns at once, without waiting on
+// a stalled socket write. The disconnect notification is queued behind data
+// already written, and Write fails from now on. The context is cancelled once
+// nothing is left to send or resend, or the peer stops responding.
 func (conn *Conn) Close() error {
-	// Let queued application packets reach the peer before sending the transport
-	// notification. Bedrock otherwise discards its final disconnect message.
-	conn.closing.CompareAndSwap(0, time.Now().Unix())
+	if conn.ctx.Err() == nil {
+		conn.state.CompareAndSwap(stateOpen, stateCloseRequested)
+	}
+	conn.signalSend()
 	return nil
 }
 
@@ -525,44 +669,34 @@ func (conn *Conn) Context() context.Context {
 	return conn.ctx
 }
 
-// closeImmediately sends a Disconnect notification to the other end of the
-// connection and closes the underlying UDP connection immediately.
-func (conn *Conn) closeImmediately() {
-	conn.once.Do(func() {
-		_ = conn.sendDisconnect()
+// drop ends the connection without sending anything further, which is how
+// the client ends every connection it drops on its own.
+func (conn *Conn) drop() {
+	conn.once.Do(conn.release)
+}
 
-		conn.mu.Lock()
-		// Sends belong to the send loop, which is about to stop. Flush here so
-		// the disconnect notification still reaches the peer, before the
-		// handler closes a dialer's socket. Nothing outstanding will be
-		// acknowledged now, so release it first: that opens the resend buffer
-		// for the flush.
-		conn.releaseUnacknowledged()
-		conn.sendBudget = max(conn.sendBudget, uint32(conn.effectiveMTU()))
-		_ = conn.drainSendQueue()
-		conn.mu.Unlock()
+// release stops the connection and returns everything still queued or
+// awaiting acknowledgement to the pool. Only for use inside conn.once.
+func (conn *Conn) release() {
+	conn.handler.close(conn)
+	conn.cancelFunc()
+	unregisterMetricsConnection(conn)
 
-		conn.handler.close(conn)
-		conn.cancelFunc()
-		unregisterMetricsConnection(conn)
-
-		conn.mu.Lock()
-		defer conn.mu.Unlock()
-		// The flush re-added whatever it sent.
-		conn.releaseUnacknowledged()
-		for _, datagram := range conn.sendQueue {
-			datagram.pk.content = datagram.pk.content[:0]
-			packetPool.Put(datagram.pk)
-		}
-		for _, datagram := range conn.controlQueue {
-			datagram.pk.content = datagram.pk.content[:0]
-			packetPool.Put(datagram.pk)
-		}
-		conn.controlQueue = nil
-		conn.sendQueue = nil
-		conn.sendQueueBytes = 0
-		conn.signalSendQueueFreed()
-	})
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	conn.releaseUnacknowledged()
+	for _, datagram := range conn.sendQueue {
+		datagram.pk.content = datagram.pk.content[:0]
+		packetPool.Put(datagram.pk)
+	}
+	for _, datagram := range conn.controlQueue {
+		datagram.pk.content = datagram.pk.content[:0]
+		packetPool.Put(datagram.pk)
+	}
+	conn.controlQueue = nil
+	conn.sendQueue = nil
+	conn.sendQueueBytes = 0
+	conn.signalSendQueueFreed()
 }
 
 // releaseUnacknowledged returns every packet awaiting acknowledgement to the
@@ -573,19 +707,6 @@ func (conn *Conn) releaseUnacknowledged() {
 		packetPool.Put(record.pk)
 	}
 	clear(conn.retransmission.unacknowledged)
-}
-
-func (conn *Conn) sendDisconnect() error {
-	if !conn.disconnectSent.CompareAndSwap(false, true) {
-		return nil
-	}
-	if err := conn.writeControl([]byte{message.IDDisconnectNotification}, reliabilityReliableOrdered); err != nil {
-		// Queueing failed. Release the flag so a later attempt can retry rather
-		// than never telling the peer at all.
-		conn.disconnectSent.Store(false)
-		return err
-	}
-	return nil
 }
 
 // RemoteAddr returns the remote address of the connection, meaning the address
@@ -629,12 +750,16 @@ func (conn *Conn) sendUnreliable(pk encoding.BinaryMarshaler) error {
 	return conn.writeControl(b, reliabilityUnreliable)
 }
 
-// writeControl queues an internal packet (ping, disconnect) ahead of application
-// data. It fails rather than blocks when the queue is full.
+// writeControl queues an internal packet (ping, pong) ahead of application
+// data. It fails rather than blocks when the queue is full, and is silently
+// refused once the connection is closing, as on the client.
 func (conn *Conn) writeControl(b []byte, rel reliability) error {
 	required := conn.queuedSize(b, rel)
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
+	if conn.state.Load() != stateOpen {
+		return nil
+	}
 	if conn.sendQueueBytes+required > maxSendQueueBytes {
 		return conn.error(errors.New("send queue is full"), "write")
 	}
@@ -648,6 +773,25 @@ var packetPool = sync.Pool{New: func() any { return &packet{reliability: reliabi
 // receive receives a packet from the connection, handling it as appropriate.
 // If not successful, an error is returned.
 func (conn *Conn) receive(b []byte) error {
+	if len(b) < 3 {
+		// Too short to be anything: ignored, and not counted as activity.
+		return nil
+	}
+	err := conn.dispatch(b)
+	// Waiting on a non-reading application holds up only this goroutine; the
+	// send loop keeps acknowledging, resending and timing out the peer.
+	for i, pk := range conn.undelivered {
+		conn.packets.Send(conn.ctx, pk)
+		conn.undelivered[i] = nil
+	}
+	conn.undelivered = conn.undelivered[:0]
+	return err
+}
+
+// dispatch handles a received buffer under recvMu.
+func (conn *Conn) dispatch(b []byte) error {
+	conn.recvMu.Lock()
+	defer conn.recvMu.Unlock()
 	t := time.Now()
 	conn.lastActivity.Store(&t)
 	if len(conn.splits) != 0 && t.Sub(conn.lastSplitSweep) >= splitSweepInterval {
@@ -688,11 +832,6 @@ func (conn *Conn) receiveDatagram(b []byte) error {
 	// included in an ACK.
 	if len(conn.ackSlice) == 0 {
 		conn.oldestUnsentAck = time.Now()
-		if conn.ackTimer == nil {
-			conn.ackTimer = time.AfterFunc(ackDelay, conn.signalSend)
-		} else {
-			conn.ackTimer.Reset(ackDelay)
-		}
 	}
 	conn.ackSlice = append(conn.ackSlice, seq)
 	conn.ackMu.Unlock()
@@ -743,7 +882,7 @@ func (conn *Conn) receivePacket(packet *packet) error {
 	if conn.packetQueue.WindowSize() > maxWindowSize {
 		// An acknowledged ordered packet can't be dropped without a gap, so an
 		// overflowing ordered window closes the connection instead of trimming.
-		return fmt.Errorf("packet queue window size is too big (%v-%v)", conn.packetQueue.lowest, conn.packetQueue.highest)
+		return fmt.Errorf("packet queue window size is too big (%v-%v): %w", conn.packetQueue.lowest, conn.packetQueue.highest, errDropConnection)
 	}
 	for _, content := range conn.packetQueue.fetch() {
 		if err := conn.handlePacket(content); err != nil {
@@ -761,16 +900,43 @@ func (conn *Conn) handlePacket(b []byte) error {
 		// Empty packets can safely be ignored.
 		return nil
 	}
-	if conn.closing.Load() != 0 {
-		// Don't continue handling packets if the connection is being closed.
+	if b[0] == message.IDConnectionAttemptFailed {
+		// Discarded in every state, ahead of the first-message check, as on
+		// the client.
 		return nil
 	}
-	handled, err := conn.handler.handle(conn, b)
-	if err != nil {
-		return fmt.Errorf("handle packet: %w", err)
+	if err := conn.handler.admit(conn, b); err != nil {
+		return err
 	}
-	if !handled {
-		conn.packets.Send(b)
+	// Packets keep being handled and delivered while closing, as on the
+	// client; anything a handler sends in reply is refused.
+	if b[0] == message.IDDisconnectNotification {
+		conn.mu.Lock()
+		conn.state.Store(statePeerDisconnected)
+		// Writers waiting for queue space must see the refusal.
+		conn.signalSendQueueFreed()
+		conn.mu.Unlock()
+		conn.signalSend()
+		return nil
+	}
+	if conn.state.Load() != stateOpen {
+		switch b[0] {
+		case message.IDConnectionRequest, message.IDConnectionRequestAccepted, message.IDNewIncomingConnection:
+			// The client ignores handshake messages in its closing states.
+			return nil
+		}
+	}
+	handled, err := conn.handler.handle(conn, b)
+	if errors.Is(err, errDropConnection) {
+		return err
+	}
+	if err != nil {
+		// A bad internal message is discarded; the rest are still handled.
+		conn.handler.log().Debug("discarded packet: "+err.Error(), "raddr", conn.raddr.String())
+		return nil
+	}
+	if !handled && (len(conn.undelivered) != 0 || !conn.packets.TrySend(b)) {
+		conn.undelivered = append(conn.undelivered, b)
 	}
 	return nil
 }
@@ -787,7 +953,13 @@ func resolve(addr net.Addr) netip.AddrPort {
 	return netip.AddrPort{}
 }
 
-var errSplitBudget = errors.New("split packet: reassembly memory limit reached")
+// errDropConnection marks input that ends the connection: a first message
+// other than a connection request, as on the client, or a break of a bound on
+// what a peer may make us hold. Such a connection is dropped silently; other
+// bad input is discarded and the connection kept, as on the client.
+var errDropConnection = errors.New("connection dropped")
+
+var errSplitBudget = fmt.Errorf("split packet: reassembly memory limit reached: %w", errDropConnection)
 
 // receiveSplitPacket handles a passed split packet. If it is the last split
 // packet of its sequence, it will continue handling the full packet as it

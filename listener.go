@@ -232,15 +232,74 @@ func (listener *Listener) BlockFor(addr net.Addr, duration time.Duration) {
 	listener.sec.blockFor(addr, duration)
 }
 
-// Close closes the listener so that it may be cleaned up. It makes sure the
-// goroutine handling incoming packets is able to be freed.
+// shutdownBlock bounds how long Close keeps serving connections it is closing,
+// polled every shutdownPoll, as the client does when it shuts down.
+const (
+	shutdownBlock = 100 * time.Millisecond
+	shutdownPoll  = 15 * time.Millisecond
+)
+
+// Close closes every connection and then the listener's socket. Connections
+// are notified and given up to shutdownBlock to finish; any left are dropped.
 func (listener *Listener) Close() error {
 	var err error
 	listener.once.Do(func() {
 		close(listener.closed)
+		listener.shutdown()
+		// Closing the socket first returns any write a connection is stuck in
+		// while holding its lock, which the drops need.
 		err = listener.conn.Close()
+		listener.dropRemaining()
 	})
 	return err
+}
+
+// shutdown starts a graceful close on every connection and waits for them to
+// finish, for at most shutdownBlock.
+func (listener *Listener) shutdown() {
+	timer := time.NewTimer(shutdownBlock)
+	defer timer.Stop()
+	listener.connections.Range(func(_, value any) bool {
+		_ = value.(*Conn).Close()
+		return true
+	})
+	poll := time.NewTicker(shutdownPoll)
+	defer poll.Stop()
+	for {
+		remaining := false
+		listener.connections.Range(func(any, any) bool {
+			remaining = true
+			return false
+		})
+		if !remaining {
+			return
+		}
+		select {
+		case <-poll.C:
+		case <-timer.C:
+			return
+		}
+	}
+}
+
+// dropRemaining drops every connection still open, waiting at most
+// shutdownBlock for a drop held up by a write the socket has yet to return.
+func (listener *Listener) dropRemaining() {
+	var wg sync.WaitGroup
+	listener.connections.Range(func(_, value any) bool {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			value.(*Conn).drop()
+		}()
+		return true
+	})
+	dropped := make(chan struct{})
+	go func() { wg.Wait(); close(dropped) }()
+	select {
+	case <-dropped:
+	case <-time.After(shutdownBlock):
+	}
 }
 
 // PongData sets the pong data that is used to respond with when a client sends
@@ -334,8 +393,12 @@ func (listener *Listener) handle(b []byte, addr net.Addr) error {
 		return nil
 	default:
 		if err := conn.receive(b); err != nil {
-			conn.closeImmediately()
-			return err
+			if errors.Is(err, errDropConnection) {
+				conn.drop()
+				return err
+			}
+			// Bad input is discarded and the connection kept, as on the client.
+			listener.conf.ErrorLog.Debug("discarded packet: "+err.Error(), "raddr", addrToStr(addr))
 		}
 		return nil
 	}
