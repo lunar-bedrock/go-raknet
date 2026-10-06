@@ -1106,3 +1106,72 @@ func TestCloseAfterPeerDisconnectStillACKs(t *testing.T) {
 	}
 	t.Fatal("dropped without acknowledging the peer's notification")
 }
+
+// stalledConn returns a connection whose send loop is stuck in a socket write.
+func stalledConn(t *testing.T) *Conn {
+	t.Helper()
+	conn, _, cancel := newCloseTestConn()
+	socket := newBlockingPacketConn(0)
+	conn.conn = socket
+	runSendLoop(t, conn, cancel)
+	t.Cleanup(func() { _ = socket.Close() })
+	if _, err := conn.Write([]byte{0xfe}); err != nil {
+		t.Fatal(err)
+	}
+	waitDone(t, socket.writing, time.Second, "send loop never wrote")
+	return conn
+}
+
+// A send loop stuck in a socket write holds up neither receiving nor Close.
+func TestStalledWriteBlocksNeitherReceiveNorClose(t *testing.T) {
+	conn := stalledConn(t)
+	received := make(chan struct{})
+	go func() {
+		defer close(received)
+		_ = conn.receive(orderedDatagram(0, []byte{0xfe}))
+	}()
+	waitDone(t, received, time.Second, "receive waited on a stalled socket write")
+	closed := make(chan struct{})
+	go func() {
+		defer close(closed)
+		_ = conn.Close()
+	}()
+	waitDone(t, closed, time.Second, "Close waited on a stalled socket write")
+}
+
+// Writers waiting for queue space are refused as soon as the connection
+// starts closing, locally or by the peer.
+func TestClosingWakesWaitingWriters(t *testing.T) {
+	for _, peer := range []bool{false, true} {
+		conn, _, cancel := newCloseTestConn()
+		conn.congestion.window = 0 // Nothing drains to wake writers instead.
+		conn.sendQueueBytes = maxSendQueueBytes - sendQueueReserve
+		done := make(chan error, 1)
+		go func() {
+			_, err := conn.Write([]byte{1})
+			done <- err
+		}()
+		select {
+		case err := <-done:
+			t.Fatalf("peer=%v: write returned before closing: %v", peer, err)
+		case <-time.After(20 * time.Millisecond):
+		}
+		if peer {
+			if err := conn.receive(disconnectDatagram(0)); err != nil {
+				t.Fatal(err)
+			}
+		} else {
+			_ = conn.Close()
+			conn.update(time.Now()) // The send loop's next update.
+		}
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Fatalf("peer=%v: write accepted while closing", peer)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("peer=%v: writer stayed blocked after closing began", peer)
+		}
+		cancel()
+	}
+}

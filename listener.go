@@ -255,28 +255,14 @@ func (listener *Listener) Close() error {
 }
 
 // shutdown starts a graceful close on every connection and waits for them to
-// finish, for at most shutdownBlock even if a close is stuck behind a write.
+// finish, for at most shutdownBlock.
 func (listener *Listener) shutdown() {
 	timer := time.NewTimer(shutdownBlock)
 	defer timer.Stop()
-	// Each close runs on its own, so one stuck behind a write delays no other
-	// connection's notification.
-	var wg sync.WaitGroup
 	listener.connections.Range(func(_, value any) bool {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			_ = value.(*Conn).Close()
-		}()
+		_ = value.(*Conn).Close()
 		return true
 	})
-	notified := make(chan struct{})
-	go func() { wg.Wait(); close(notified) }()
-	select {
-	case <-notified:
-	case <-timer.C:
-		return
-	}
 	poll := time.NewTicker(shutdownPoll)
 	defer poll.Stop()
 	for {
