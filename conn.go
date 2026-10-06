@@ -91,12 +91,15 @@ const (
 )
 
 // Connection states. A connection leaves stateOpen for good. The peer's
-// notification moves stateClosing on to statePeerDisconnected, which a later
-// Close leaves alone so the notification is still acknowledged.
+// notification moves either local closing state on to statePeerDisconnected,
+// which a later Close leaves alone so the notification is still acknowledged.
 const (
 	stateOpen int32 = iota
-	// stateClosing: Close queued the notification. Ends once nothing is left
-	// to send or resend.
+	// stateCloseRequested: Close was called; the send loop queues the
+	// notification next and moves on to stateClosing.
+	stateCloseRequested
+	// stateClosing: the notification is queued. Ends once nothing is left to
+	// send or resend.
 	stateClosing
 	// statePeerDisconnected: the peer's notification arrived. Ends once every
 	// received datagram has been acknowledged.
@@ -130,7 +133,9 @@ type Conn struct {
 	// connection. The rtt is measured in nanoseconds.
 	rtt atomic.Int64
 
-	state atomic.Int32 // Changed only with mu held.
+	// state is checked by writers under mu. Close leaves stateOpen without
+	// mu, so the notification the send loop then queues follows their data.
+	state atomic.Int32
 	// requested is set once a connection request has been answered: this end
 	// holds the server's side of the handshake.
 	requested atomic.Bool
@@ -301,14 +306,10 @@ func (conn *Conn) startTicking() {
 	}
 }
 
-// cycle runs one update of the send loop, serialised with received datagrams,
-// and returns when the next one is due. It reports whether the connection
-// ended.
+// cycle runs one update of the send loop and returns when the next one is
+// due. It reports whether the connection ended.
 func (conn *Conn) cycle(now time.Time, nextPing *time.Time) (next time.Time, ok, ended bool) {
-	conn.recvMu.Lock()
-	defer conn.recvMu.Unlock()
-	if conn.dead(now) {
-		conn.drop()
+	if conn.dropIf(func() bool { return conn.dead(now) }) {
 		return next, false, true
 	}
 	established := false
@@ -322,8 +323,7 @@ func (conn *Conn) cycle(now time.Time, nextPing *time.Time) (next time.Time, ok,
 	}
 	conn.flushACKs()
 	conn.update(now)
-	if conn.closed(now) {
-		conn.drop()
+	if conn.dropIf(func() bool { return conn.closed(now) }) {
 		return next, false, true
 	}
 	if established && !now.Before(*nextPing) {
@@ -332,6 +332,19 @@ func (conn *Conn) cycle(now time.Time, nextPing *time.Time) (next time.Time, ok,
 	}
 	next, ok = conn.nextDue(now, *nextPing, established)
 	return next, ok, false
+}
+
+// dropIf drops the connection if end reports it should. It holds recvMu, so
+// the state is judged only between whole received datagrams, but never across
+// the socket writes of an update.
+func (conn *Conn) dropIf(end func() bool) bool {
+	conn.recvMu.Lock()
+	defer conn.recvMu.Unlock()
+	if !end() {
+		return false
+	}
+	conn.drop()
+	return true
 }
 
 // probe sends a reliable ping when nothing reliable awaits an ACK and none has
@@ -451,6 +464,12 @@ func (conn *Conn) ackDue(now time.Time) bool {
 func (conn *Conn) update(now time.Time) {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
+
+	if conn.state.CompareAndSwap(stateCloseRequested, stateClosing) {
+		_, _ = conn.write([]byte{message.IDDisconnectNotification}, reliabilityReliableOrdered, false)
+		// Writers waiting for queue space must see the refusal.
+		conn.signalSendQueueFreed()
+	}
 
 	conn.congestion.continuous = conn.continuousSend
 	conn.wireContinuous = conn.continuousSend
@@ -639,28 +658,16 @@ func (conn *Conn) ReadPacket() (b []byte, err error) {
 	return pk, err
 }
 
-// Close starts closing the connection and returns at once. The disconnect
-// notification is queued behind data already written, and Write fails from
-// now on. The context is cancelled once nothing is left to send or resend, or
-// the peer stops responding.
+// Close starts closing the connection and returns at once, without waiting on
+// a stalled socket write. The disconnect notification is queued behind data
+// already written, and Write fails from now on. The context is cancelled once
+// nothing is left to send or resend, or the peer stops responding.
 func (conn *Conn) Close() error {
-	conn.mu.Lock()
-	conn.startClose()
-	conn.mu.Unlock()
+	if conn.ctx.Err() == nil {
+		conn.state.CompareAndSwap(stateOpen, stateCloseRequested)
+	}
 	conn.signalSend()
 	return nil
-}
-
-// startClose queues the disconnect notification and enters stateClosing if
-// the connection is still open. It must be called with conn.mu held.
-func (conn *Conn) startClose() {
-	if conn.ctx.Err() != nil {
-		return
-	}
-	if conn.state.Load() == stateOpen {
-		_, _ = conn.write([]byte{message.IDDisconnectNotification}, reliabilityReliableOrdered, false)
-		conn.state.Store(stateClosing)
-	}
 }
 
 // established reports whether the handshake has completed.
@@ -676,11 +683,9 @@ func (conn *Conn) established() bool {
 // closeQuietly enters stateClosing from stateOpen without a notification, as
 // the client does after refusing a connection request or being refused.
 func (conn *Conn) closeQuietly() {
-	conn.mu.Lock()
-	if conn.ctx.Err() == nil && conn.state.Load() == stateOpen {
-		conn.state.Store(stateClosing)
+	if conn.ctx.Err() == nil {
+		conn.state.CompareAndSwap(stateOpen, stateClosing)
 	}
-	conn.mu.Unlock()
 	conn.signalSend()
 }
 
@@ -935,6 +940,8 @@ func (conn *Conn) handlePacket(b []byte) error {
 	if b[0] == message.IDDisconnectNotification {
 		conn.mu.Lock()
 		conn.state.Store(statePeerDisconnected)
+		// Writers waiting for queue space must see the refusal.
+		conn.signalSendQueueFreed()
 		conn.mu.Unlock()
 		conn.signalSend()
 		return nil
