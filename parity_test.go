@@ -208,3 +208,27 @@ func TestInternalMessageFiltering(t *testing.T) {
 		}
 	}
 }
+
+// A refusal arriving after the peer's notification leaves the connection
+// peer-disconnected, so the notification is still acknowledged.
+func TestRefusalAfterPeerDisconnectStillACKs(t *testing.T) {
+	conn, socket, cancel := newCloseTestConn()
+	conn.ackedAny.Store(true) // ACKs are held for ackDelay.
+	buf := bytes.NewBuffer([]byte{bitFlagDatagram, 0, 0, 0})
+	(&packet{reliability: reliabilityReliableOrdered, orderIndex: 0, content: []byte{message.IDDisconnectNotification}}).write(buf)
+	(&packet{reliability: reliabilityReliableOrdered, orderIndex: 1, content: make([]byte, 9)}).write(buf)
+	buf.Bytes()[len(buf.Bytes())-9] = message.IDInvalidPassword
+	if err := conn.receive(buf.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	done := runSendLoop(t, conn, cancel)
+	waitDone(t, done, time.Second, "connection did not close")
+	socket.mu.Lock()
+	defer socket.mu.Unlock()
+	for _, b := range socket.writes {
+		if b[0]&bitFlagACK != 0 {
+			return
+		}
+	}
+	t.Fatal("dropped without acknowledging the peer's notification")
+}

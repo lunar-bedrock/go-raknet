@@ -673,11 +673,11 @@ func (conn *Conn) established() bool {
 	}
 }
 
-// closeQuietly enters stateClosing without a notification, as the client does
-// after refusing a connection request or being refused.
+// closeQuietly enters stateClosing from stateOpen without a notification, as
+// the client does after refusing a connection request or being refused.
 func (conn *Conn) closeQuietly() {
 	conn.mu.Lock()
-	if conn.ctx.Err() == nil {
+	if conn.ctx.Err() == nil && conn.state.Load() == stateOpen {
 		conn.state.Store(stateClosing)
 	}
 	conn.mu.Unlock()
