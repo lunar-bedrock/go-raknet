@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -940,4 +941,100 @@ func TestShortBufferIsNotActivity(t *testing.T) {
 	if !conn.lastActivity.Load().Equal(before) {
 		t.Fatal("a two-byte buffer refreshed the last receive time")
 	}
+}
+
+// An application that stops reading holds up only receiving: the send loop
+// still acknowledges and times out a vanished peer, releasing the receiver.
+func TestFullReceiveQueueKeepsSendLoop(t *testing.T) {
+	conn, socket, cancel := newCloseTestConn()
+	conn.packets = internal.Chan[[]byte](1, 1)
+	done := runSendLoop(t, conn, cancel)
+	if err := conn.receive(orderedDatagram(0, []byte{0xfe})); err != nil {
+		t.Fatal(err)
+	}
+	received := make(chan struct{})
+	go func() {
+		defer close(received)
+		buf := bytes.NewBuffer([]byte{bitFlagDatagram})
+		writeUint24(buf, 1)
+		(&packet{reliability: reliabilityReliableOrdered, orderIndex: 1, content: []byte{0xfe}}).write(buf)
+		_ = conn.receive(buf.Bytes())
+	}()
+	acked := func() bool {
+		socket.mu.Lock()
+		defer socket.mu.Unlock()
+		for _, b := range socket.writes {
+			if b[0]&bitFlagACK != 0 {
+				ack := &acknowledgement{}
+				if ack.read(b[1:]) == nil && slices.Contains(ack.packets, 1) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	for deadline := time.Now().Add(time.Second); !acked(); time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("datagram waiting on a full receive queue was never acknowledged")
+		}
+	}
+	select {
+	case <-received:
+		t.Fatal("receive did not wait for the application")
+	default:
+	}
+	addOutstanding(conn)
+	setLastActivity(conn, reliableTimeout+time.Second)
+	conn.signalSend()
+	waitDone(t, done, time.Second, "vanished peer was not timed out while the receive queue was full")
+	waitDone(t, received, time.Second, "receive stayed blocked after the connection dropped")
+}
+
+// blockingPacketConn blocks every read and write until it is closed.
+type blockingPacketConn struct {
+	writing   chan struct{}
+	closed    chan struct{}
+	writeOnce sync.Once
+	closeOnce sync.Once
+}
+
+func (c *blockingPacketConn) ListenPacket(string, string) (net.PacketConn, error) { return c, nil }
+func (c *blockingPacketConn) ReadFrom([]byte) (int, net.Addr, error) {
+	<-c.closed
+	return 0, nil, net.ErrClosed
+}
+func (c *blockingPacketConn) WriteTo([]byte, net.Addr) (int, error) {
+	c.writeOnce.Do(func() { close(c.writing) })
+	<-c.closed
+	return 0, net.ErrClosed
+}
+func (c *blockingPacketConn) Close() error {
+	c.closeOnce.Do(func() { close(c.closed) })
+	return nil
+}
+func (c *blockingPacketConn) LocalAddr() net.Addr              { return &net.UDPAddr{} }
+func (c *blockingPacketConn) SetDeadline(time.Time) error      { return nil }
+func (c *blockingPacketConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *blockingPacketConn) SetWriteDeadline(time.Time) error { return nil }
+
+// A connection stuck in a socket write while holding its lock cannot hold up
+// Listener.Close past its bound.
+func TestListenerCloseBoundedByBlockedWrite(t *testing.T) {
+	socket := &blockingPacketConn{writing: make(chan struct{}), closed: make(chan struct{})}
+	l, err := ListenConfig{UpstreamPacketListener: socket}.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}
+	conn := newConn(socket, raddr, 1400, l.handler)
+	l.connections.Store(resolve(raddr), conn)
+	if _, err := conn.Write([]byte{0xfe}); err != nil {
+		t.Fatal(err)
+	}
+	waitDone(t, socket.writing, time.Second, "send loop never wrote")
+
+	closed := make(chan struct{})
+	go func() { defer close(closed); _ = l.Close() }()
+	waitDone(t, closed, 2*shutdownBlock+500*time.Millisecond, "listener close hung on a blocked write")
+	waitDone(t, conn.ctx.Done(), time.Second, "connection was not dropped by listener close")
 }

@@ -246,19 +246,35 @@ func (listener *Listener) Close() error {
 	listener.once.Do(func() {
 		close(listener.closed)
 		listener.shutdown()
+		// Closing the socket first returns any write a connection is stuck in
+		// while holding its lock, which the drops need.
 		err = listener.conn.Close()
+		listener.dropRemaining()
 	})
 	return err
 }
 
 // shutdown starts a graceful close on every connection and waits for them to
-// finish, for at most shutdownBlock, then drops the rest.
+// finish, for at most shutdownBlock even if a close is stuck behind a write.
 func (listener *Listener) shutdown() {
-	listener.connections.Range(func(_, value any) bool {
-		_ = value.(*Conn).Close()
-		return true
-	})
-	for end := time.Now().Add(shutdownBlock); time.Now().Before(end); time.Sleep(shutdownPoll) {
+	timer := time.NewTimer(shutdownBlock)
+	defer timer.Stop()
+	notified := make(chan struct{})
+	go func() {
+		defer close(notified)
+		listener.connections.Range(func(_, value any) bool {
+			_ = value.(*Conn).Close()
+			return true
+		})
+	}()
+	select {
+	case <-notified:
+	case <-timer.C:
+		return
+	}
+	poll := time.NewTicker(shutdownPoll)
+	defer poll.Stop()
+	for {
 		remaining := false
 		listener.connections.Range(func(any, any) bool {
 			remaining = true
@@ -267,12 +283,32 @@ func (listener *Listener) shutdown() {
 		if !remaining {
 			return
 		}
+		select {
+		case <-poll.C:
+		case <-timer.C:
+			return
+		}
 	}
+}
+
+// dropRemaining drops every connection still open, waiting at most
+// shutdownBlock for a drop held up by a write the socket has yet to return.
+func (listener *Listener) dropRemaining() {
+	var wg sync.WaitGroup
 	listener.connections.Range(func(_, value any) bool {
-		conn := value.(*Conn)
-		conn.drop()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			value.(*Conn).drop()
+		}()
 		return true
 	})
+	dropped := make(chan struct{})
+	go func() { wg.Wait(); close(dropped) }()
+	select {
+	case <-dropped:
+	case <-time.After(shutdownBlock):
+	}
 }
 
 // PongData sets the pong data that is used to respond with when a client sends

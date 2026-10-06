@@ -184,6 +184,9 @@ type Conn struct {
 	// packets is a channel containing content of packets that were fully
 	// processed. Calling Conn.Read() consumes a value from this channel.
 	packets *internal.ElasticChan[[]byte]
+	// undelivered holds, in order, packets the full packets queue refused, for
+	// receive to deliver outside recvMu. Owned by the one receiving goroutine.
+	undelivered [][]byte
 
 	// retransmission is a queue filled with packets that were sent with a given
 	// datagram sequence number.
@@ -766,6 +769,19 @@ func (conn *Conn) receive(b []byte) error {
 		// Too short to be anything: ignored, and not counted as activity.
 		return nil
 	}
+	err := conn.dispatch(b)
+	// Waiting on a non-reading application holds up only this goroutine; the
+	// send loop keeps acknowledging, resending and timing out the peer.
+	for i, pk := range conn.undelivered {
+		conn.packets.Send(conn.ctx, pk)
+		conn.undelivered[i] = nil
+	}
+	conn.undelivered = conn.undelivered[:0]
+	return err
+}
+
+// dispatch handles a received buffer under recvMu.
+func (conn *Conn) dispatch(b []byte) error {
 	conn.recvMu.Lock()
 	defer conn.recvMu.Unlock()
 	t := time.Now()
@@ -909,8 +925,8 @@ func (conn *Conn) handlePacket(b []byte) error {
 		conn.handler.log().Debug("discarded packet: "+err.Error(), "raddr", conn.raddr.String())
 		return nil
 	}
-	if !handled {
-		conn.packets.Send(b)
+	if !handled && (len(conn.undelivered) != 0 || !conn.packets.TrySend(b)) {
+		conn.undelivered = append(conn.undelivered, b)
 	}
 	return nil
 }

@@ -41,18 +41,49 @@ func (c *ElasticChan[T]) Recv(ctx context.Context) (val T, ok bool) {
 	}
 }
 
-// Send sends a value to the channel. Send never blocks, because if the maximum
-// capacity of the underlying channel is reached, a larger one is created.
-func (c *ElasticChan[T]) Send(val T) {
-	if ccap := int64(cap(c.ch)); c.len.Add(1) >= ccap && ccap < c.lim {
-		// This check happens outside a lock, meaning in the meantime, a call to
-		// Recv could cause the length to decrease, technically meaning growing
-		// is then unnecessary. That isn't a major issue though, as in most
-		// cases growing would still be necessary later.
+// TrySend sends val unless the channel is full at its maximum capacity, and
+// reports whether it did.
+func (c *ElasticChan[T]) TrySend(val T) bool {
+	if c.grows() {
 		c.growSend(val)
-		return
+		return true
 	}
-	c.ch <- val
+	select {
+	case c.ch <- val:
+		return true
+	default:
+		c.len.Add(-1)
+		return false
+	}
+}
+
+// Send sends val, waiting while the channel is full at its maximum capacity.
+// It gives up once ctx is done and reports whether val was sent.
+func (c *ElasticChan[T]) Send(ctx context.Context, val T) bool {
+	if c.grows() {
+		c.growSend(val)
+		return true
+	}
+	select {
+	case c.ch <- val:
+		return true
+	default:
+	}
+	select {
+	case c.ch <- val:
+		return true
+	case <-ctx.Done():
+		c.len.Add(-1)
+		return false
+	}
+}
+
+// grows counts a value about to be sent and reports whether the channel must
+// grow to hold it. The check happens outside a lock, so a concurrent Recv may
+// make growing unnecessary; it is then merely early.
+func (c *ElasticChan[T]) grows() bool {
+	ccap := int64(cap(c.ch))
+	return c.len.Add(1) >= ccap && ccap < c.lim
 }
 
 // growSend grows the channel to double the capacity, capped by the configured
