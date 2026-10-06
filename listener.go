@@ -259,14 +259,19 @@ func (listener *Listener) Close() error {
 func (listener *Listener) shutdown() {
 	timer := time.NewTimer(shutdownBlock)
 	defer timer.Stop()
-	notified := make(chan struct{})
-	go func() {
-		defer close(notified)
-		listener.connections.Range(func(_, value any) bool {
+	// Each close runs on its own, so one stuck behind a write delays no other
+	// connection's notification.
+	var wg sync.WaitGroup
+	listener.connections.Range(func(_, value any) bool {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
 			_ = value.(*Conn).Close()
-			return true
-		})
-	}()
+		}()
+		return true
+	})
+	notified := make(chan struct{})
+	go func() { wg.Wait(); close(notified) }()
 	select {
 	case <-notified:
 	case <-timer.C:

@@ -995,12 +995,21 @@ func TestFullReceiveQueueKeepsSendLoop(t *testing.T) {
 	waitDone(t, received, time.Second, "receive stayed blocked after the connection dropped")
 }
 
-// blockingPacketConn blocks every read and write until it is closed.
+// blockingPacketConn blocks reads, and writes to stallPort (any port if 0),
+// until it is closed. It counts the datagrams written to every other port.
 type blockingPacketConn struct {
+	stallPort int
 	writing   chan struct{}
 	closed    chan struct{}
 	writeOnce sync.Once
 	closeOnce sync.Once
+
+	mu     sync.Mutex
+	writes map[int]int
+}
+
+func newBlockingPacketConn(stallPort int) *blockingPacketConn {
+	return &blockingPacketConn{stallPort: stallPort, writing: make(chan struct{}), closed: make(chan struct{}), writes: map[int]int{}}
 }
 
 func (c *blockingPacketConn) ListenPacket(string, string) (net.PacketConn, error) { return c, nil }
@@ -1008,7 +1017,13 @@ func (c *blockingPacketConn) ReadFrom([]byte) (int, net.Addr, error) {
 	<-c.closed
 	return 0, nil, net.ErrClosed
 }
-func (c *blockingPacketConn) WriteTo([]byte, net.Addr) (int, error) {
+func (c *blockingPacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
+	if port := addr.(*net.UDPAddr).Port; c.stallPort != 0 && port != c.stallPort {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		c.writes[port]++
+		return len(b), nil
+	}
 	c.writeOnce.Do(func() { close(c.writing) })
 	<-c.closed
 	return 0, net.ErrClosed
@@ -1022,17 +1037,23 @@ func (c *blockingPacketConn) SetDeadline(time.Time) error      { return nil }
 func (c *blockingPacketConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *blockingPacketConn) SetWriteDeadline(time.Time) error { return nil }
 
+// listenerConn adds a connection from 127.0.0.1:port to l.
+func listenerConn(l *Listener, socket net.PacketConn, port int) *Conn {
+	raddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port}
+	conn := newConn(socket, raddr, 1400, l.handler)
+	l.connections.Store(resolve(raddr), conn)
+	return conn
+}
+
 // A connection stuck in a socket write while holding its lock cannot hold up
 // Listener.Close past its bound.
 func TestListenerCloseBoundedByBlockedWrite(t *testing.T) {
-	socket := &blockingPacketConn{writing: make(chan struct{}), closed: make(chan struct{})}
+	socket := newBlockingPacketConn(0)
 	l, err := ListenConfig{UpstreamPacketListener: socket}.Listen("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	raddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}
-	conn := newConn(socket, raddr, 1400, l.handler)
-	l.connections.Store(resolve(raddr), conn)
+	conn := listenerConn(l, socket, 1)
 	if _, err := conn.Write([]byte{0xfe}); err != nil {
 		t.Fatal(err)
 	}
@@ -1042,4 +1063,51 @@ func TestListenerCloseBoundedByBlockedWrite(t *testing.T) {
 	go func() { defer close(closed); _ = l.Close() }()
 	waitDone(t, closed, 2*shutdownBlock+500*time.Millisecond, "listener close hung on a blocked write")
 	waitDone(t, conn.ctx.Done(), time.Second, "connection was not dropped by listener close")
+}
+
+// One connection stuck in a socket write does not keep the others from being
+// notified when the listener closes.
+func TestListenerCloseNotifiesPastBlockedConnection(t *testing.T) {
+	socket := newBlockingPacketConn(1)
+	l, err := ListenConfig{UpstreamPacketListener: socket}.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := listenerConn(l, socket, 1).Write([]byte{0xfe}); err != nil {
+		t.Fatal(err)
+	}
+	waitDone(t, socket.writing, time.Second, "send loop never wrote")
+	const others = 8
+	for port := 2; port < 2+others; port++ {
+		listenerConn(l, socket, port)
+	}
+	_ = l.Close()
+	socket.mu.Lock()
+	defer socket.mu.Unlock()
+	for port := 2; port < 2+others; port++ {
+		if socket.writes[port] == 0 {
+			t.Fatalf("connection on port %d was never notified", port)
+		}
+	}
+}
+
+// Closing after the peer's notification still acknowledges it before the
+// connection drops.
+func TestCloseAfterPeerDisconnectStillACKs(t *testing.T) {
+	conn, socket, cancel := newCloseTestConn()
+	conn.ackedAny.Store(true) // ACKs are held for ackDelay.
+	if err := conn.receive(disconnectDatagram(0)); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Close()
+	done := runSendLoop(t, conn, cancel)
+	waitDone(t, done, time.Second, "connection did not close")
+	socket.mu.Lock()
+	defer socket.mu.Unlock()
+	for _, b := range socket.writes {
+		if b[0]&bitFlagACK != 0 {
+			return
+		}
+	}
+	t.Fatal("dropped without acknowledging the peer's notification")
 }
