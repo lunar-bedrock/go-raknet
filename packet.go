@@ -3,6 +3,8 @@ package raknet
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"io"
 )
 
@@ -146,7 +148,11 @@ func (pk *packet) read(b []byte) (int, error) {
 	pk.split = (header & splitFlag) != 0
 	pk.reliability = reliability((header & 224) >> 5)
 
-	n := binary.BigEndian.Uint16(b[1:]) >> 3
+	bits := binary.BigEndian.Uint16(b[1:])
+	if bits == 0 {
+		return 0, errors.New("read packet: zero length")
+	}
+	n := (int(bits) + 7) >> 3 // Widened: rounding 65529 and up overflows uint16.
 	offset := 3
 
 	if pk.reliability.reliable() {
@@ -165,12 +171,16 @@ func (pk *packet) read(b []byte) (int, error) {
 		offset += 3
 	}
 
-	if pk.reliability.sequencedOrOrdered() {
+	// The client also reads ordering for reliable ordered with ack receipt,
+	// which never appears on the wire otherwise.
+	if pk.reliability.sequencedOrOrdered() || pk.reliability == 7 {
 		if len(b)-offset < 4 {
 			return 0, io.ErrUnexpectedEOF
 		}
 		pk.orderIndex = loadUint24(b[offset:])
-		// Order channel (byte)
+		if channel := b[offset+3]; channel >= 32 {
+			return 0, fmt.Errorf("read packet: ordering channel %v out of range", channel)
+		}
 		offset += 4
 	}
 
@@ -182,13 +192,16 @@ func (pk *packet) read(b []byte) (int, error) {
 		pk.splitID = binary.BigEndian.Uint16(b[offset+4:])
 		pk.splitIndex = binary.BigEndian.Uint32(b[offset+6:])
 		offset += 10
+		if pk.splitCount > maxSplitCount || pk.splitIndex >= pk.splitCount {
+			return 0, fmt.Errorf("read packet: split index %v of %v out of range", pk.splitIndex, pk.splitCount)
+		}
 	}
 
 	pk.content = make([]byte, n)
-	if got := copy(pk.content, b[offset:]); got != int(n) {
+	if got := copy(pk.content, b[offset:]); got != n {
 		return 0, io.ErrUnexpectedEOF
 	}
-	return offset + int(n), nil
+	return offset + n, nil
 }
 
 const (

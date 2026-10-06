@@ -144,7 +144,9 @@ func testTransferLossyLink(t *testing.T, drop, dup float64) {
 
 	send := func(conn *Conn) error {
 		for off := 0; off < payloadSize; off += chunkSize {
-			if _, err := conn.Write(payload[off:min(off+chunkSize, payloadSize)]); err != nil {
+			// Lead with an application ID: reserved IDs never reach the reader.
+			chunk := append([]byte{0xfe}, payload[off:min(off+chunkSize, payloadSize)]...)
+			if _, err := conn.Write(chunk); err != nil {
 				return err
 			}
 		}
@@ -156,7 +158,7 @@ func testTransferLossyLink(t *testing.T, drop, dup float64) {
 			if err != nil {
 				return err
 			}
-			*got = append(*got, pk...)
+			*got = append(*got, pk[1:]...)
 		}
 		return nil
 	}

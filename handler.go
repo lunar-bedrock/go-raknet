@@ -182,8 +182,9 @@ func (h listenerConnectionHandler) handleOpenConnectionRequest2(b []byte, addr n
 	return nil
 }
 
-// pendingConnectionTimeout is how long a handshake may take after the second
-// open connection request before it is dropped silently, as on the client.
+// pendingConnectionTimeout is how long a handshake may take on either end,
+// from the second open connection request, before it is dropped silently, as
+// on the client.
 var pendingConnectionTimeout = 10 * time.Second
 
 // admit drops a new connection whose first message is not a connection
@@ -198,16 +199,25 @@ func (h listenerConnectionHandler) admit(conn *Conn, b []byte) error {
 func (h listenerConnectionHandler) handle(conn *Conn, b []byte) (handled bool, err error) {
 	switch b[0] {
 	case message.IDConnectionRequest:
-		return true, acceptConnectionRequest(conn, b[1:])
-	case message.IDConnectionRequestAccepted:
+		return true, handleConnectionRequest(conn, b, h.l.id)
+	default:
+		return handleCommon(conn, b)
+	}
+}
+
+// handleCommon handles the messages both ends treat alike. Connected pings and
+// pongs are recognised only at their exact lengths, as on the client.
+func handleCommon(conn *Conn, b []byte) (handled bool, err error) {
+	switch {
+	case b[0] == message.IDConnectionRequestAccepted:
 		return true, completeHandshake(conn, b)
-	case message.IDNewIncomingConnection:
+	case b[0] == message.IDNewIncomingConnection:
 		return true, handleNewIncomingConnection(conn, b)
-	case message.IDConnectedPing:
+	case b[0] == message.IDConnectedPing && len(b) == 9:
 		return true, handleConnectedPing(conn, b[1:])
-	case message.IDConnectedPong:
+	case b[0] == message.IDConnectedPong && len(b) == 17:
 		return true, handleConnectedPong(b[1:])
-	case message.IDDetectLostConnections:
+	case b[0] == message.IDDetectLostConnections && len(b) == 1:
 		// The client ignores these.
 		return true, nil
 	default:
@@ -215,19 +225,46 @@ func (h listenerConnectionHandler) handle(conn *Conn, b []byte) (handled bool, e
 	}
 }
 
-// acceptConnectionRequest answers a connection request with an accepted reply,
-// on either end and in any open state, as the client does. The request puts
-// this end on the server's side of the handshake.
-func acceptConnectionRequest(conn *Conn, b []byte) error {
-	pk := &message.ConnectionRequest{}
-	if err := pk.UnmarshalBinary(b); err != nil {
-		return fmt.Errorf("read CONNECTION_REQUEST: %w", err)
+// parseConnectionRequest reads a connection request as the client does: a
+// field that does not fit is skipped, and the request is accepted only if no
+// bytes are left after the fields, as no password is set.
+func parseConnectionRequest(b []byte) (requestTime int64, ok bool) {
+	offset := 1
+	if len(b) >= offset+8 {
+		offset += 8 // Client GUID.
 	}
-	conn.requested.Store(true)
+	if len(b) >= offset+8 {
+		requestTime = int64(binary.BigEndian.Uint64(b[offset:]))
+		offset += 8
+	}
+	if len(b) >= offset+1 {
+		offset++ // Security flag.
+	}
+	return requestTime, offset == len(b)
+}
+
+// handleConnectionRequest answers a connection request with an accepted reply,
+// on either end and in any open state, as the client does. One that starts a
+// handshake is validated first and puts this end on the server's side of it;
+// an invalid one is refused with an invalid password reply carrying guid, and
+// the connection then closes without a notification.
+func handleConnectionRequest(conn *Conn, b []byte, guid int64) error {
+	requestTime, ok := parseConnectionRequest(b)
+	if !conn.requested.Load() && !conn.established() {
+		if !ok {
+			refusal := make([]byte, 9)
+			refusal[0] = message.IDInvalidPassword
+			binary.BigEndian.PutUint64(refusal[1:], uint64(guid))
+			err := conn.writeControl(refusal, reliabilityReliable)
+			conn.closeQuietly()
+			return err
+		}
+		conn.requested.Store(true)
+	}
 	return conn.send(&message.ConnectionRequestAccepted{
 		ClientAddress:   resolve(conn.raddr),
 		SystemAddresses: message.NewLocalSystemAddresses(resolve(conn.conn.LocalAddr())),
-		PingTime:        pk.RequestTime,
+		PingTime:        requestTime,
 		PongTime:        timestamp(),
 	})
 }
@@ -248,7 +285,10 @@ func handleNewIncomingConnection(conn *Conn, b []byte) error {
 	return nil
 }
 
-type dialerConnectionHandler struct{ l *slog.Logger }
+type dialerConnectionHandler struct {
+	l  *slog.Logger
+	id int64 // The client GUID sent in the connection request.
+}
 
 func (h dialerConnectionHandler) log() *slog.Logger {
 	return h.l
@@ -263,20 +303,16 @@ func (h dialerConnectionHandler) admit(*Conn, []byte) error { return nil }
 func (h dialerConnectionHandler) handle(conn *Conn, b []byte) (handled bool, err error) {
 	switch b[0] {
 	case message.IDConnectionRequest:
-		return true, acceptConnectionRequest(conn, b[1:])
-	case message.IDConnectionRequestAccepted:
-		return true, completeHandshake(conn, b)
-	case message.IDNewIncomingConnection:
-		return true, handleNewIncomingConnection(conn, b)
-	case message.IDConnectedPing:
-		return true, handleConnectedPing(conn, b[1:])
-	case message.IDConnectedPong:
-		return true, handleConnectedPong(b[1:])
-	case message.IDDetectLostConnections:
-		// The client ignores these.
+		return true, handleConnectionRequest(conn, b, h.id)
+	case message.IDInvalidPassword:
+		if !conn.requested.Load() && !conn.established() {
+			// The server refused our connection request: close without a
+			// notification once queued traffic drains, as the client does.
+			conn.closeQuietly()
+		}
 		return true, nil
 	default:
-		return false, nil
+		return handleCommon(conn, b)
 	}
 }
 

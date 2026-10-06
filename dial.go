@@ -263,7 +263,7 @@ func (dialer Dialer) DialContext(ctx context.Context, address string) (*Conn, er
 // dial finishes the RakNet connection sequence and returns a Conn if
 // successful.
 func (dialer Dialer) connect(ctx context.Context, state *connState) (*Conn, error) {
-	conn := newConn(internal.ConnToPacketConn(state.conn), state.raddr, state.mtu, dialerConnectionHandler{l: dialer.ErrorLog})
+	conn := newConn(internal.ConnToPacketConn(state.conn), state.raddr, state.mtu, dialerConnectionHandler{l: dialer.ErrorLog, id: state.id})
 	if err := conn.send((&message.ConnectionRequest{ClientGUID: state.id, RequestTime: timestamp()})); err != nil {
 		return nil, dialer.error("dial", fmt.Errorf("send connection request: %w", err))
 	}
@@ -273,7 +273,16 @@ func (dialer Dialer) connect(ctx context.Context, state *connState) (*Conn, erro
 
 	go dialer.clientListen(conn, state.conn)
 
+	// Like the listener's pending handshakes, the attempt is dropped silently
+	// if it has not completed 10 s after it began, as on the client.
+	deadline := time.NewTimer(pendingConnectionTimeout)
+	defer deadline.Stop()
 	select {
+	case <-deadline.C:
+		conn.drop()
+		return nil, dialer.error("dial", errConnectionAttemptFailed)
+	case <-conn.ctx.Done():
+		return nil, dialer.error("dial", errConnectionClosed)
 	case <-conn.connected:
 		// Remove connection deadline.
 		_ = conn.conn.SetDeadline(time.Time{})
@@ -380,11 +389,14 @@ func mtuSizesFor(maxMTU uint16) []uint16 {
 // negotiate keeps MTU probes running until Reply 2 completes the offline handshake.
 // All senders stop before the connected packet reader takes over the socket.
 func (state *connState) negotiate(ctx context.Context) error {
-	ctx, cancel := context.WithCancel(ctx)
+	ctx, cancel := context.WithCancelCause(ctx)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		state.request1(ctx, mtuSizesFor(state.maxMTU))
+		// The probes are the client's connection attempts: once the last has
+		// waited out its interval unanswered, the attempt fails.
+		cancel(errConnectionAttemptFailed)
 	}()
 	closed := make(chan struct{})
 	stopClose := context.AfterFunc(ctx, func() {
@@ -395,18 +407,27 @@ func (state *connState) negotiate(ctx context.Context) error {
 		if !stopClose() {
 			<-closed
 		}
-		cancel()
+		cancel(nil)
 		<-done
 	}()
 	if err := state.discoverMTU(); err != nil {
 		state.close()
-		return fmt.Errorf("discover mtu: %w", err)
+		return fmt.Errorf("discover mtu: %w", attemptError(ctx, err))
 	}
 	if err := state.openConnection(ctx); err != nil {
 		state.close()
-		return fmt.Errorf("open connection: %w", err)
+		return fmt.Errorf("open connection: %w", attemptError(ctx, err))
 	}
 	return nil
+}
+
+// attemptError reports a spent attempt budget in place of the read error it
+// caused.
+func attemptError(ctx context.Context, err error) error {
+	if cause := context.Cause(ctx); errors.Is(cause, errConnectionAttemptFailed) {
+		return cause
+	}
+	return err
 }
 
 // discoverMTU reads the initial MTU grant while negotiate runs the probe ladder.
