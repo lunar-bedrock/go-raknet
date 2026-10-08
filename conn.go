@@ -202,15 +202,15 @@ func newConn(conn net.PacketConn, raddr net.Addr, mtu uint16, h connectionHandle
 		splits:         make(map[uint16]splitEntry),
 		win:            newDatagramWindow(),
 		packetQueue:    newPacketQueue(),
-		retransmission: newRecoveryQueue(),
 		congestion:     newCongestionWindow(mtu - 28),
 		sendQueueFreed: make(chan struct{}),
 		sendSignal:     make(chan struct{}, 1),
-		sendBudget:     uint32(mtu - 28),
 		buf:            bytes.NewBuffer(make([]byte, 0, mtu-28)), // - headers.
 		ackBuf:         bytes.NewBuffer(make([]byte, 0, 128)),
 		nackBuf:        bytes.NewBuffer(make([]byte, 0, 64)),
 	}
+	c.retransmission = newRecoveryQueue(c.signalSend)
+	c.sendBudget = c.congestion.transmissionBandwidth()
 	c.ctx, c.cancelFunc = context.WithCancel(context.Background())
 	t := time.Now()
 	c.lastActivity.Store(&t)
@@ -338,6 +338,8 @@ func (conn *Conn) update(now time.Time) {
 
 	if conn.retransmission.due(now) {
 		conn.resendExpired(now)
+	} else {
+		conn.retransmission.armTimer()
 	}
 	_ = conn.drainSendQueue()
 	conn.continuousSend = len(conn.controlQueue) != 0 || len(conn.sendQueue) != 0
@@ -355,7 +357,7 @@ func (conn *Conn) resendExpired(now time.Time) {
 			deadline = record.nextSend
 		}
 	}
-	conn.retransmission.deadline = deadline
+	conn.retransmission.setDeadline(deadline)
 	slices.SortFunc(resend, func(a, b uint24) int {
 		return conn.retransmission.unacknowledged[a].nextSend.Compare(
 			conn.retransmission.unacknowledged[b].nextSend,
