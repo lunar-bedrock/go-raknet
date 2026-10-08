@@ -16,8 +16,12 @@ type congestionWindow struct {
 	continuous bool   // data still queued last tick; the window only grows then
 }
 
+// initialWindowMTUs sizes the starting window. The client starts at one MTU;
+// four saves round trips on a join's Login burst, as TCP's initial window does.
+const initialWindowMTUs = 4
+
 func newCongestionWindow(mtu uint16) congestionWindow {
-	return congestionWindow{mtu: uint32(mtu), window: float64(mtu)}
+	return congestionWindow{mtu: uint32(mtu), window: float64(mtu) * initialWindowMTUs}
 }
 
 // transmissionBandwidth returns the unused room in the window, in bytes.

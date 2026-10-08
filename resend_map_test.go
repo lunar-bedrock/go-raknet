@@ -6,7 +6,7 @@ import (
 )
 
 func TestResendMapRTO(t *testing.T) {
-	m := newRecoveryQueue()
+	m := newRecoveryQueue(nil)
 	if got := m.rto(); got != 2*time.Second {
 		t.Fatalf("initial RTO: got %v, want 2s", got)
 	}

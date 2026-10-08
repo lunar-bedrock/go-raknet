@@ -49,7 +49,7 @@ func newSendTestConn() (*Conn, *recordingPacketConn, context.CancelFunc) {
 		buf:            bytes.NewBuffer(make([]byte, 0, maxMTUSize-28)),
 		ackBuf:         bytes.NewBuffer(make([]byte, 0, 128)),
 		nackBuf:        bytes.NewBuffer(make([]byte, 0, 64)),
-		retransmission: newRecoveryQueue(),
+		retransmission: newRecoveryQueue(nil),
 		congestion:     newCongestionWindow(maxMTUSize - 28),
 		sendQueueFreed: make(chan struct{}),
 		sendSignal:     make(chan struct{}, 1),
@@ -295,7 +295,7 @@ func TestUnreliableDatagramsConsumeSendBudget(t *testing.T) {
 func TestContinuousSendUsesPreviousTick(t *testing.T) {
 	conn, _, cancel := newSendTestConn()
 	defer cancel()
-	conn.congestion.inFlight = uint32(conn.effectiveMTU())
+	conn.congestion.inFlight = uint32(conn.congestion.window)
 	conn.sendBudget = 0
 
 	conn.mu.Lock()
