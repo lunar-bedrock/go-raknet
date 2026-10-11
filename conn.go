@@ -761,50 +761,6 @@ func (conn *Conn) handleDatagram(b []byte) error {
 	return nil
 }
 
-// receivePacket handles the receiving of a packet. It puts the packet in the
-// queue and takes out all packets that were obtainable after that, and handles
-// them.
-func (conn *Conn) receivePacket(packet *packet) error {
-	if packet.reliability != reliabilityReliableOrdered {
-		// If it isn't a reliable ordered packet, handle it immediately.
-		return conn.handlePacket(packet.content)
-	}
-	if packet.orderChannel >= orderChannelCount {
-		return fmt.Errorf("packet order channel %d is out of range", packet.orderChannel)
-	}
-	queue := conn.packetQueues[packet.orderChannel]
-	if queue == nil {
-		queue = newPacketQueue()
-		conn.packetQueues[packet.orderChannel] = queue
-	}
-	if sequenceGreaterThan(queue.lowest, packet.orderIndex) {
-		return nil
-	}
-	if _, exists := queue.queue[packet.orderIndex]; exists {
-		return nil
-	}
-	if (packet.orderIndex-queue.lowest)&0xffffff >= maxWindowSize {
-		return fmt.Errorf("packet queue window is too big on channel %d", packet.orderChannel)
-	}
-	if conn.orderedQueueBytes+len(packet.content) > maxOrderedQueueBytes {
-		return fmt.Errorf("ordered packet queues exceed %d bytes", maxOrderedQueueBytes)
-	}
-	if !queue.put(packet.orderIndex, packet.content) {
-		return nil
-	}
-	conn.orderedQueueBytes += len(packet.content)
-	contents := queue.fetch()
-	for _, content := range contents {
-		conn.orderedQueueBytes -= len(content)
-	}
-	for _, content := range contents {
-		if err := conn.handlePacket(content); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 // handlePacket handles a packet serialised in byte slice b. If not successful,
 // an error is returned. If the packet was not handled by RakNet, it is sent to
 // the packet channel.
