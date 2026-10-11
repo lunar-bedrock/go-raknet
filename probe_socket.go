@@ -17,7 +17,7 @@ func writeMTUProbe(conn net.Conn, data []byte) (n int, err error) {
 		SyscallConn() (syscall.RawConn, error)
 	})
 	remote, udp := conn.RemoteAddr().(*net.UDPAddr)
-	if !ok || !udp {
+	if !ok || !udp || remote == nil || len(remote.IP) == 0 {
 		return conn.Write(data)
 	}
 	raw, err := socket.SyscallConn()

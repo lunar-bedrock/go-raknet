@@ -174,3 +174,31 @@ func TestMTUProbePreservesOpaqueUpstreamWrite(t *testing.T) {
 		t.Fatalf("custom upstream n=%d err=%v payload=%v", n, err, conn.written)
 	}
 }
+
+type unspecifiedProbeAddrConn struct {
+	*observingProbeConn
+	address *net.UDPAddr
+}
+
+// RemoteAddr preserves a custom upstream's absent UDP endpoint description.
+func (conn *unspecifiedProbeAddrConn) RemoteAddr() net.Addr { return conn.address }
+
+func TestMTUProbePreservesUnspecifiedCustomUDPAddress(t *testing.T) {
+	udp, _ := openProbeSocket(t, "udp4", "127.0.0.1")
+	setProbeSocketValue(t, udp, 0)
+	for _, address := range []*net.UDPAddr{nil, {}} {
+		writes := 0
+		conn := &unspecifiedProbeAddrConn{observingProbeConn: &observingProbeConn{UDPConn: udp, inspect: func([]byte) {
+			writes++
+			if probeSocketValue(t, udp) != 0 {
+				t.Fatal("unspecified upstream address changed socket policy")
+			}
+		}}, address: address}
+		if _, err := writeMTUProbe(conn, []byte{1}); err != nil {
+			t.Fatal(err)
+		}
+		if writes != 1 {
+			t.Fatal("unspecified upstream was not written")
+		}
+	}
+}
