@@ -276,16 +276,37 @@ func TestUnreliableDatagramsConsumeSendBudget(t *testing.T) {
 	conn, packetConn, cancel := newSendTestConn()
 	defer cancel()
 
-	payload := make([]byte, int(conn.effectiveMTU())*2)
-	writeQueued(t, conn, payload, reliabilityUnreliable)
+	// Split messages gain reliable delivery, so fill the queue with small
+	// independent messages to exercise the unreliable send budget.
+	payload := make([]byte, 128)
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	for range 32 {
+		if _, err := conn.write(payload, reliabilityUnreliable, false); err != nil {
+			t.Fatalf("queue unreliable packet: %v", err)
+		}
+	}
+	if err := conn.drainSendQueue(time.Now()); err != nil {
+		t.Fatalf("drain send queue: %v", err)
+	}
 	if got := len(packetConn.writes); got != 2 {
 		t.Fatalf("initial datagrams: got %d, want 2", got)
+	}
+	for _, datagram := range packetConn.writes {
+		for _, frame := range decodeBatchFrames(t, datagram) {
+			if frame.reliability != reliabilityUnreliable || frame.split {
+				t.Fatal("unreliable budget test sent a reliable or split frame")
+			}
+		}
 	}
 	if conn.sendBudget != 0 {
 		t.Fatalf("send budget: got %d, want 0", conn.sendBudget)
 	}
 	if conn.congestion.inFlight != 0 {
 		t.Fatalf("unreliable bytes counted in flight: %d", conn.congestion.inFlight)
+	}
+	if len(conn.retransmission.unacknowledged) != 0 {
+		t.Fatal("unreliable frames retained recovery records")
 	}
 	if len(conn.sendQueue) == 0 {
 		t.Fatal("unreliable tail was not queued")
