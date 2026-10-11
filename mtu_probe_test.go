@@ -14,7 +14,7 @@ func TestMTUProbesAdvanceImmediatelyWhenDatagramTooLarge(t *testing.T) {
 	sendMTUProbes(context.Background(), []uint16{1492, 1200, 576}, func(size uint16) error {
 		sent = append(sent, size)
 		if size == 1492 {
-			return fmt.Errorf("probe write: %w", syscall.EMSGSIZE)
+			return fmt.Errorf("probe write: %w", mtuProbeSizeError)
 		}
 		return nil
 	}, func() bool { waits++; return false })
@@ -40,7 +40,7 @@ func TestMTUProbesStopOnCancellationOrExhaustedSizes(t *testing.T) {
 	cancel()
 	sendMTUProbes(ctx, []uint16{1492}, func(uint16) error { t.Fatal("send after cancellation"); return nil }, func() bool { t.Fatal("wait after cancellation"); return true })
 	sends := 0
-	sendMTUProbes(context.Background(), []uint16{1492, 1200, 576}, func(uint16) error { sends++; return syscall.EMSGSIZE }, func() bool { t.Fatal("wait after rejected size"); return true })
+	sendMTUProbes(context.Background(), []uint16{1492, 1200, 576}, func(uint16) error { sends++; return mtuProbeSizeError }, func() bool { t.Fatal("wait after rejected size"); return true })
 	if sends != 3 {
 		t.Fatalf("rejected-size sends=%d", sends)
 	}
