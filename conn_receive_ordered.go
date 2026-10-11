@@ -76,6 +76,9 @@ func (conn *Conn) flushOrderingStream(queue *packetQueue) error {
 			return nil
 		}
 		conn.orderedQueueBytes -= len(frame.content)
+		if frame.obsolete {
+			continue
+		}
 		if err := conn.handlePacket(frame.content); err != nil {
 			return err
 		}

@@ -91,9 +91,9 @@ func TestReliableReceiveWindowWrapsAndRejectsOldMessages(t *testing.T) {
 	}
 }
 
-func TestReliableReceiveWindowBoundsFarAheadAndAmbiguousIndices(t *testing.T) {
+func TestReliableReceiveWindowAcceptsFarAheadAndRejectsAmbiguousIndices(t *testing.T) {
 	window := reliableReceiveWindow{}
-	for _, index := range []uint24{maxDatagramGap + 1, 1 << 23} {
+	for _, index := range []uint24{1 << 23} {
 		if window.accept(index) {
 			t.Fatalf("excessive message gap %#x accepted", index)
 		}

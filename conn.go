@@ -751,11 +751,6 @@ func (conn *Conn) handleDatagram(b []byte) error {
 		}
 		b = b[n:]
 		if conn.pk.reliability.reliable() && !conn.reliableWindow.accept(conn.pk.messageIndex) {
-			distance := (conn.pk.messageIndex - conn.reliableWindow.next) & 0xffffff
-			if distance > maxDatagramGap && distance < 1<<23 {
-				metricsReliableWindowDrops.Add(1)
-				conn.handler.log().Debug("drop reliable message outside receive window", "message_index", conn.pk.messageIndex)
-			}
 			continue
 		}
 

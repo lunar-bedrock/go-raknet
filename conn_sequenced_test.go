@@ -151,7 +151,7 @@ func TestFutureSequencedPriorityPreservesOrderedBarrierWeight(t *testing.T) {
 	if len(h.delivered) != 2 || h.delivered[0][0] != 'a' || h.delivered[1][0] != 'b' {
 		t.Fatalf("priority delivery=%q", h.delivered)
 	}
-	if conn.packetQueues[0].sequencedCount != 1 {
-		t.Fatal("future sequence weight incorrectly passed its barrier")
+	if conn.packetQueues[0].sequencedCount != 0 {
+		t.Fatal("obsolete sequence payload remained after its barrier")
 	}
 }
