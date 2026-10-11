@@ -318,11 +318,21 @@ func (conn *Conn) ackDue(now time.Time) bool {
 // of the send queue as the budget allows. Only the connection's own goroutine
 // may call it. It reports a timeout so the caller can close outside mu.
 func (conn *Conn) update(now time.Time) bool {
+	timedOut, err := conn.sendCycle(now)
+	if err != nil {
+		conn.closeImmediately()
+	}
+	return timedOut
+}
+
+// sendCycle updates the send queues under mu and returns timeout or fatal I/O
+// errors for the caller to close without holding the connection mutex.
+func (conn *Conn) sendCycle(now time.Time) (bool, error) {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
 
 	if conn.updateKeepalive(now) {
-		return true
+		return true, nil
 	}
 	conn.congestion.continuous = conn.continuousSend
 	conn.wireContinuous = conn.continuousSend
@@ -332,16 +342,20 @@ func (conn *Conn) update(now time.Time) bool {
 	conn.rtt.Store(int64(rtt))
 
 	if conn.retransmission.due(now) {
-		conn.resendExpired(now)
+		if err := conn.resendExpired(now); err != nil {
+			return false, err
+		}
 	}
-	_ = conn.drainSendQueue(now)
+	if err := conn.drainSendQueue(now); err != nil {
+		return false, err
+	}
 	conn.continuousSend = len(conn.controlQueue) != 0 || len(conn.sendQueue) != 0
-	return false
+	return false, nil
 }
 
 // resendExpired retransmits every record whose send timer expired, oldest
 // first, and recomputes the earliest remaining timer.
-func (conn *Conn) resendExpired(now time.Time) {
+func (conn *Conn) resendExpired(now time.Time) error {
 	var resend []uint24
 	deadline := time.Time{}
 	for seq, record := range conn.retransmission.unacknowledged {
@@ -357,7 +371,7 @@ func (conn *Conn) resendExpired(now time.Time) {
 			conn.retransmission.unacknowledged[b].nextSend,
 		)
 	})
-	_ = conn.resend(resend, now)
+	return conn.resend(resend, now)
 }
 
 // Write writes a buffer b over the RakNet connection. The amount of bytes

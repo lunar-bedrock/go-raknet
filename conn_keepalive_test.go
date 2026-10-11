@@ -3,6 +3,7 @@ package raknet
 import (
 	"bytes"
 	"github.com/sandertv/go-raknet/internal/message"
+	"net"
 	"testing"
 	"time"
 )
@@ -234,5 +235,31 @@ func TestKeepaliveReliableApplicationTrafficDelaysIdleProbe(t *testing.T) {
 	packets := keepalivePackets(t, wire)
 	if len(packets) != 2 || packets[1].reliability != reliabilityReliable {
 		t.Fatal("idle probe missing after reliable send")
+	}
+}
+
+func TestKeepaliveFatalProbeFailureClosesPeer(t *testing.T) {
+	start := time.Unix(100, 0)
+	conn, wire := newKeepaliveTestConn(t, start)
+	conn.keepalive.nextLatencyPing = start.Add(time.Hour)
+	wire.err = net.ErrClosed
+	conn.update(start.Add(6 * time.Second))
+	if conn.ctx.Err() == nil {
+		t.Fatal("fatal probe failure left the connection open")
+	}
+	if len(conn.retransmission.unacknowledged) != 0 {
+		t.Fatal("failed probe retained a resend record")
+	}
+}
+
+func TestKeepaliveFatalRetransmissionFailureClosesPeer(t *testing.T) {
+	start := time.Unix(100, 0)
+	conn, wire := newKeepaliveTestConn(t, start)
+	conn.keepalive.nextLatencyPing = start.Add(time.Hour)
+	conn.update(start.Add(6 * time.Second))
+	wire.err = net.ErrClosed
+	conn.update(start.Add(9 * time.Second))
+	if conn.ctx.Err() == nil {
+		t.Fatal("fatal retransmission failure left the connection open")
 	}
 }
