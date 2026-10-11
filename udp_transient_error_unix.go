@@ -23,3 +23,6 @@ func isTransientUDPReadError(err error) bool {
 	}
 	return false
 }
+
+// isMTUProbeSizeError recognizes an oversized UDP write through socket wrappers.
+func isMTUProbeSizeError(err error) bool { return errors.Is(err, syscall.EMSGSIZE) }
