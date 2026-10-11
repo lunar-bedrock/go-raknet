@@ -69,6 +69,9 @@ const (
 	// duplicated.
 	reliabilityReliableSequenced
 
+	// reliabilityReceiptOrdered carries an ordering header on the wire.
+	reliabilityReceiptOrdered reliability = 7
+
 	// splitFlag is set in the header if the packet was split. If so, the
 	// encapsulation contains additional data about the fragment.
 	splitFlag = 0x10
@@ -96,6 +99,11 @@ func (r reliability) sequenced() bool {
 // order index, meaning packets are always received in correct order.
 func (r reliability) sequencedOrOrdered() bool {
 	return r.sequenced() || r == reliabilityReliableOrdered
+}
+
+// hasOrderingHeader distinguishes wire framing from receive-delivery semantics.
+func (r reliability) hasOrderingHeader() bool {
+	return r.sequencedOrOrdered() || r == reliabilityReceiptOrdered
 }
 
 // packet is an encapsulation around every packet sent after the connection is
@@ -177,7 +185,7 @@ func (pk *packet) read(b []byte) (int, error) {
 		offset += 3
 	}
 
-	if pk.reliability.sequencedOrOrdered() {
+	if pk.reliability.hasOrderingHeader() {
 		if len(b)-offset < 4 {
 			return 0, io.ErrUnexpectedEOF
 		}
