@@ -212,6 +212,8 @@ func (h listenerConnectionHandler) handleConnectionRequest(conn *Conn, b []byte)
 	if err := pk.UnmarshalBinary(b); err != nil {
 		return fmt.Errorf("read CONNECTION_REQUEST: %w", err)
 	}
+	start := time.Now().Add(-time.Millisecond * time.Duration(pk.RequestTime))
+	conn.systemStart.Store(&start)
 	return conn.send(&message.ConnectionRequestAccepted{
 		ClientAddress:   resolve(conn.raddr),
 		SystemAddresses: message.NewLocalSystemAddresses(resolve(conn.conn.LocalAddr())),
