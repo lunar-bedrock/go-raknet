@@ -54,7 +54,7 @@ func TestResendBufferCapsOutstanding(t *testing.T) {
 		conn.mu.Unlock()
 	}
 	conn.mu.Lock()
-	err := conn.drainSendQueue()
+	err := conn.drainSendQueue(time.Now())
 	conn.mu.Unlock()
 	if err != nil {
 		t.Fatalf("drain: %v", err)
@@ -77,12 +77,12 @@ func TestUnreliableIgnoresResendBuffer(t *testing.T) {
 	defer cancel()
 	conn.sendBudget = 1 << 20
 	for i := range resendBufferSize {
-		conn.retransmission.add(uint24(i), &packet{reliability: reliabilityReliableOrdered}, 1)
+		conn.retransmission.add(uint24(i), &packet{reliability: reliabilityReliableOrdered}, 1, time.Now())
 	}
 	conn.mu.Lock()
 	_, err := conn.write([]byte{1}, reliabilityUnreliable, false)
 	if err == nil {
-		err = conn.drainSendQueue()
+		err = conn.drainSendQueue(time.Now())
 	}
 	conn.mu.Unlock()
 	if err != nil {
@@ -99,7 +99,7 @@ func TestNACKDefersToUpdate(t *testing.T) {
 	conn, packetConn, cancel := newSendTestConn()
 	defer cancel()
 	conn.congestion.inFlight = 100
-	conn.retransmission.add(7, &packet{reliability: reliabilityReliableOrdered, content: []byte{1}}, 100)
+	conn.retransmission.add(7, &packet{reliability: reliabilityReliableOrdered, content: []byte{1}}, 100, time.Now())
 	conn.retransmission.unacknowledged[7] = resendRecord{
 		pk:            conn.retransmission.unacknowledged[7].pk,
 		inFlightBytes: 100,
@@ -137,7 +137,7 @@ func TestACKDefersToUpdate(t *testing.T) {
 
 	ackBuffer := bytes.NewBuffer(nil)
 	(&acknowledgement{packets: []uint24{0}}).write(ackBuffer, conn.effectiveMTU())
-	if err := conn.handleACK(ackBuffer.Bytes()); err != nil {
+	if err := conn.handleACK(ackBuffer.Bytes(), time.Now()); err != nil {
 		t.Fatalf("handle ACK: %v", err)
 	}
 	if got := len(packetConn.writes); got != sent {
@@ -162,7 +162,7 @@ func TestSendDatagramErrorRestoresAccounting(t *testing.T) {
 
 	pk := &packet{reliability: reliabilityReliableOrdered, content: []byte{1}}
 	conn.mu.Lock()
-	err := conn.sendDatagram(pk, 100, false)
+	err := conn.sendDatagram(pk, 100, false, time.Now())
 	conn.mu.Unlock()
 	if err == nil {
 		t.Fatal("expected an error from a failing packet conn")
