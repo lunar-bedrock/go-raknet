@@ -40,3 +40,22 @@ func lookupLocalAddresses(ctx context.Context, hostname func() (string, error), 
 	}
 	return lookup(ctx, "ip", name)
 }
+
+// startLocalAddressLookup prepares a cancellable, optional socket address snapshot.
+// Finishing returns addresses already available and joins the owned lookup.
+func startLocalAddressLookup(ctx context.Context, lookup func(context.Context) []netip.Addr) func() []netip.Addr {
+	ctx, cancel := context.WithCancel(ctx)
+	result := make(chan []netip.Addr, 1)
+	done := make(chan struct{})
+	go func() { defer close(done); result <- lookup(ctx) }()
+	return func() []netip.Addr {
+		var ips []netip.Addr
+		select {
+		case ips = <-result:
+		default:
+		}
+		cancel()
+		<-done
+		return ips
+	}
+}

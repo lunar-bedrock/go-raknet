@@ -267,6 +267,10 @@ func (dialer Dialer) DialContext(ctx context.Context, address string) (*Conn, er
 	}
 	dialer.ErrorLog = dialer.ErrorLog.With("src", "dialer", "raddr", conn.RemoteAddr().String())
 
+	finishAddresses := startLocalAddressLookup(ctx, func(ctx context.Context) []netip.Addr {
+		return resolveLocalAddresses(ctx, conn.LocalAddr(), dialer.ErrorLog)
+	})
+	defer finishAddresses()
 	cs := &connState{
 		conn:               conn,
 		raddr:              conn.RemoteAddr(),
@@ -274,12 +278,12 @@ func (dialer Dialer) DialContext(ctx context.Context, address string) (*Conn, er
 		ticker:             time.NewTicker(time.Second / 2),
 		maxTransientErrors: dialer.MaxTransientErrors,
 		maxMTU:             dialer.MaxMTU,
-		localAddresses:     resolveLocalAddresses(ctx, conn.LocalAddr(), dialer.ErrorLog),
 	}
 	defer cs.ticker.Stop()
 	if err = cs.negotiate(ctx); err != nil {
 		return nil, dialer.error("dial", err)
 	}
+	cs.localAddresses = finishAddresses()
 	return dialer.connect(ctx, cs)
 }
 
