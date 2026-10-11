@@ -78,6 +78,7 @@ func TestOfflineProbeSlowWriteTransitions(t *testing.T) {
 		{name: "fractional 100ms normal", elapsed: 100*time.Millisecond + 999*time.Microsecond, slowAt: 1, wantSecond: 1492, wantCount: 2},
 		{name: "101ms jump", elapsed: 101 * time.Millisecond, slowAt: 1, wantSecond: 576, wantCount: 2},
 		{name: "101ms other error jump", elapsed: 101 * time.Millisecond, err: errors.New("synthetic write failure"), slowAt: 1, wantSecond: 576, wantCount: 2},
+		{name: "eighth slow write terminates", elapsed: 101 * time.Millisecond, slowAt: 8, wantSecond: 1492, wantCount: 8},
 		{name: "final rung slow terminates", elapsed: 101 * time.Millisecond, slowAt: 9, wantSecond: 1492, wantCount: 9},
 	} {
 		t.Run(test.name, func(t *testing.T) {

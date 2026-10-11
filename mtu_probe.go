@@ -30,6 +30,7 @@ func sendMTUProbes(
 			return
 		}
 		rung := min(count/mtuProbeAttemptsPerSize, len(sizes)-1)
+		// Slow-write transitions use the completed attempt count.
 		count++
 		elapsed, err := send(sizes[rung])
 		delay := max(mtuProbeWakeInterval, mtuProbeInterval-elapsed)

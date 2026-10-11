@@ -76,17 +76,19 @@ func TestMTUProbesSlowWriteBoundary(t *testing.T) {
 	}
 }
 
-func TestMTUProbesSlowFinalWriteEndsAttempts(t *testing.T) {
-	sends := 0
-	sendMTUProbes(context.Background(), []uint16{1492, 1200, 576}, func(uint16) (time.Duration, error) {
-		sends++
-		if sends == 9 {
-			return 101 * time.Millisecond, nil
+func TestMTUProbesSlowBoundaryEndsAttempts(t *testing.T) {
+	for _, slowAt := range []int{8, 9} {
+		sends := 0
+		sendMTUProbes(context.Background(), []uint16{1492, 1200, 576}, func(uint16) (time.Duration, error) {
+			sends++
+			if sends == slowAt {
+				return 101 * time.Millisecond, nil
+			}
+			return 0, nil
+		}, func(time.Duration) bool { return true })
+		if sends != slowAt {
+			t.Fatalf("slow attempt %d emitted %d probes", slowAt, sends)
 		}
-		return 0, nil
-	}, func(time.Duration) bool { return true })
-	if sends != 9 {
-		t.Fatalf("slow final write emitted %d probes", sends)
 	}
 }
 
