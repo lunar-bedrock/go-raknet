@@ -318,9 +318,6 @@ func handleConnectedPong(conn *Conn, b []byte) error {
 	if err := pk.UnmarshalBinary(b); err != nil {
 		return fmt.Errorf("read CONNECTED_PONG: %w", err)
 	}
-	if pk.PingTime > timestamp() {
-		return fmt.Errorf("handle CONNECTED_PONG: timestamp is in the future")
-	}
 	// We don't actually use the ConnectedPong to measure rtt. It is too
 	// unreliable and doesn't give a good idea of the connection quality.
 	return nil
