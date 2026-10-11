@@ -52,45 +52,65 @@ func (conn *Conn) sendable(datagram queuedDatagram) bool {
 	if !datagram.pk.reliability.reliable() {
 		return true
 	}
-	return len(conn.retransmission.unacknowledged) < resendBufferSize
+	return conn.retransmission.pendingFrames < resendBufferSize
 }
 
-// drainSendQueue sends what the window and resend buffer allow, control queue
-// first. Only the send goroutine calls it.
+// drainSendQueue coalesces ready frames within one MTU, preserving control priority.
+// It flushes available frames immediately and never waits to fill a datagram.
 func (conn *Conn) drainSendQueue(now time.Time) error {
-	// Wake blocked writers once for the whole drain rather than per datagram:
-	// they re-check the budget anyway, and each signal costs a channel.
 	freed := false
 	defer func() {
 		if freed {
 			conn.signalSendQueueFreed()
 		}
 	}()
-	for len(conn.controlQueue) != 0 {
-		if !conn.sendable(conn.controlQueue[0]) {
+	for len(conn.controlQueue) != 0 || len(conn.sendQueue) != 0 {
+		var first, last *packet
+		var total, reliableBytes uint32
+		reliableCount := 0
+		for len(conn.controlQueue) != 0 || len(conn.sendQueue) != 0 {
+			queue := &conn.controlQueue
+			if len(*queue) == 0 {
+				queue = &conn.sendQueue
+			}
+			frame := (*queue)[0]
+			if !conn.sendable(frame) {
+				break
+			}
+			if frame.pk.reliability.reliable() && conn.retransmission.pendingFrames+reliableCount >= resendBufferSize {
+				break
+			}
+			if total+frame.inFlightBytes+4 > uint32(conn.effectiveMTU()) {
+				if first == nil {
+					return fmt.Errorf("queued frame exceeds datagram MTU")
+				}
+				break
+			}
+			if first != nil && total+frame.inFlightBytes > conn.sendBudget {
+				break
+			}
+			(*queue)[0] = queuedDatagram{}
+			*queue = (*queue)[1:]
+			conn.sendQueueBytes -= frame.wireSize
+			freed = true
+			frame.pk.next = nil
+			if first == nil {
+				first = frame.pk
+			} else {
+				last.next = frame.pk
+			}
+			last = frame.pk
+			total += frame.inFlightBytes
+			if frame.pk.reliability.reliable() {
+				reliableBytes += frame.inFlightBytes
+				reliableCount++
+			}
+		}
+		if first == nil {
 			return nil
 		}
-		datagram := conn.controlQueue[0]
-		conn.controlQueue[0] = queuedDatagram{}
-		conn.controlQueue = conn.controlQueue[1:]
-		conn.sendQueueBytes -= datagram.wireSize
-		freed = true
-		conn.consumeSendBudget(datagram.inFlightBytes)
-		if err := conn.sendDatagram(datagram.pk, datagram.inFlightBytes, false, now); err != nil {
-			return err
-		}
-	}
-	for len(conn.sendQueue) != 0 {
-		if !conn.sendable(conn.sendQueue[0]) {
-			return nil
-		}
-		datagram := conn.sendQueue[0]
-		conn.sendQueue[0] = queuedDatagram{}
-		conn.sendQueue = conn.sendQueue[1:]
-		conn.sendQueueBytes -= datagram.wireSize
-		freed = true
-		conn.consumeSendBudget(datagram.inFlightBytes)
-		if err := conn.sendDatagram(datagram.pk, datagram.inFlightBytes, false, now); err != nil {
+		conn.consumeSendBudget(total)
+		if err := conn.sendDatagram(first, reliableBytes, false, now); err != nil {
 			return err
 		}
 	}
@@ -123,8 +143,8 @@ func (conn *Conn) signalSend() {
 	}
 }
 
-// sendDatagram numbers pk and writes it, tracking a reliable packet for resend
-// and counting it in flight unless retransmit says it already was.
+// sendDatagram writes one frame chain, retaining only reliable frames for resend.
+// size counts reliable bytes; retransmissions already own their in-flight credit.
 func (conn *Conn) sendDatagram(pk *packet, size uint32, retransmit bool, now time.Time) error {
 	header := byte(bitFlagDatagram)
 	if conn.congestion.slowStart() {
@@ -139,10 +159,13 @@ func (conn *Conn) sendDatagram(pk *packet, size uint32, retransmit bool, now tim
 	conn.buf.WriteByte(header)
 	seq := conn.seq.Inc()
 	writeUint24(conn.buf, seq)
-	pk.write(conn.buf)
+	for frame := pk; frame != nil; frame = frame.next {
+		frame.write(conn.buf)
+	}
+	pk = retainReliablePackets(pk)
 	defer conn.buf.Reset()
 
-	if pk.reliability.reliable() {
+	if pk != nil {
 		conn.retransmission.add(seq, pk, size, now)
 		if !retransmit {
 			conn.congestion.sent(size)
@@ -150,15 +173,14 @@ func (conn *Conn) sendDatagram(pk *packet, size uint32, retransmit bool, now tim
 	}
 
 	if err := conn.writeTo(conn.buf.Bytes(), conn.raddr); err != nil {
-		if pk.reliability.reliable() {
-			delete(conn.retransmission.unacknowledged, seq)
+		if pk != nil {
+			conn.retransmission.remove(seq)
 			conn.congestion.acknowledged(size)
 		}
-		pk.content = pk.content[:0]
-		packetPool.Put(pk)
+		releasePacketChain(pk)
 		return fmt.Errorf("send datagram: %w", err)
 	}
-	if pk.reliability.reliable() {
+	if pk != nil {
 		if !retransmit {
 			conn.keepalive.lastReliableSend = now
 		}
@@ -167,10 +189,6 @@ func (conn *Conn) sendDatagram(pk *packet, size uint32, retransmit bool, now tim
 		if retransmit {
 			metricsRetransmits.Add(1)
 		}
-	}
-	if !pk.reliability.reliable() {
-		pk.content = pk.content[:0]
-		packetPool.Put(pk)
 	}
 	return nil
 }

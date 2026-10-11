@@ -55,11 +55,7 @@ func keepalivePackets(t *testing.T, packetConn *recordingPacketConn) []packet {
 		if data[0]&bitFlagACK != 0 {
 			continue
 		}
-		var pk packet
-		if _, err := pk.read(data[4:]); err != nil {
-			t.Fatal(err)
-		}
-		packets = append(packets, pk)
+		packets = append(packets, decodeBatchFrames(t, data)...)
 	}
 	return packets
 }
