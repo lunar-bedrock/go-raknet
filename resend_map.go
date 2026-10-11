@@ -34,8 +34,7 @@ func newRecoveryQueue() *resendMap {
 
 // add stores a packet by its sequence number and schedules the retransmit one
 // RTO out.
-func (m *resendMap) add(index uint24, pk *packet, inFlightBytes uint32) {
-	now := time.Now()
+func (m *resendMap) add(index uint24, pk *packet, inFlightBytes uint32, now time.Time) {
 	nextSend := now.Add(m.rto())
 	m.unacknowledged[index] = resendRecord{
 		pk: pk, inFlightBytes: inFlightBytes, timestamp: now, nextSend: nextSend,
@@ -57,10 +56,10 @@ func (m *resendMap) due(now time.Time) bool {
 
 // acknowledge marks a packet with the index passed as acknowledged. The packet
 // is removed from the resendMap and returned if found.
-func (m *resendMap) acknowledge(index uint24) (resendRecord, bool) {
+func (m *resendMap) acknowledge(index uint24, now time.Time) (resendRecord, bool) {
 	record, ok := m.remove(index)
 	if ok {
-		m.observeRTT(time.Since(record.timestamp))
+		m.observeRTT(now.Sub(record.timestamp))
 	}
 	return record, ok
 }

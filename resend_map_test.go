@@ -32,10 +32,10 @@ func TestRetransmissionBudgetDefendsAccountingDrift(t *testing.T) {
 		conn.retransmission.add(sequence, &packet{
 			reliability: reliabilityReliableOrdered,
 			content:     []byte{1},
-		}, 100)
+		}, 100, time.Now())
 	}
 	conn.mu.Lock()
-	err := conn.resend([]uint24{10, 11})
+	err := conn.resend([]uint24{10, 11}, time.Now())
 	conn.mu.Unlock()
 	if err != nil {
 		t.Fatalf("resend: %v", err)
@@ -56,15 +56,15 @@ func TestRetransmissionExhaustsNewDataBudget(t *testing.T) {
 	conn.retransmission.add(10, &packet{
 		reliability: reliabilityReliableOrdered,
 		content:     []byte{1},
-	}, 100)
+	}, 100, time.Now())
 	queued := &packet{reliability: reliabilityReliableOrdered, content: []byte{2}}
 	conn.sendQueue = append(conn.sendQueue, queuedDatagram{pk: queued, wireSize: 8, inFlightBytes: 4})
 	conn.sendQueueBytes = 8
 
 	conn.mu.Lock()
-	err := conn.resend([]uint24{10})
+	err := conn.resend([]uint24{10}, time.Now())
 	if err == nil {
-		err = conn.drainSendQueue()
+		err = conn.drainSendQueue(time.Now())
 	}
 	conn.mu.Unlock()
 	if err != nil {
