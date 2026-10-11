@@ -549,14 +549,18 @@ func TestOpenConnectionCapsReply2(t *testing.T) {
 		defer conn.Close()
 
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
-		state := &connState{conn: conn, raddr: conn.RemoteAddr(), mtu: safeMTUSize}
+		state := &connState{conn: conn, raddr: conn.RemoteAddr(), mtu: safeMTUSize, maxMTU: safeMTUSize}
 		err = state.openConnection(ctx)
 		cancel()
 		if err != nil {
 			t.Fatal(err)
 		}
-		if state.mtu != safeMTUSize {
-			t.Fatalf("reply granting %v: committed MTU %v, want %v", grant, state.mtu, safeMTUSize)
+		want := uint16(safeMTUSize)
+		if grant == 0 {
+			want = minSupportedMTU
+		}
+		if state.mtu != want {
+			t.Fatalf("reply granting %v: committed MTU %v, want %v", grant, state.mtu, want)
 		}
 	}
 }
