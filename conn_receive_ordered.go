@@ -27,6 +27,9 @@ func (conn *Conn) receivePacket(pk *packet) error {
 		return nil
 	}
 	if distance >= maxWindowSize {
+		if pk.reliability == reliabilityUnreliableSequenced {
+			return nil
+		}
 		return fmt.Errorf("%w: packet queue window is too big on channel %d", errOrderingBudget, pk.orderChannel)
 	}
 	if pk.reliability.sequenced() {
@@ -38,6 +41,9 @@ func (conn *Conn) receivePacket(pk *packet) error {
 			return conn.handlePacket(pk.content)
 		}
 		if err := conn.canQueueOrdered(queue, len(pk.content)); err != nil {
+			if pk.reliability == reliabilityUnreliableSequenced {
+				return nil
+			}
 			return err
 		}
 		queue.pushFrame(pk.orderIndex, pk.sequenceIndex, true, pk.content)

@@ -120,8 +120,11 @@ func TestFutureSequencedQueueSharesPayloadLimit(t *testing.T) {
 	if err := conn.receivePacket(&packet{reliability: reliabilityUnreliableSequenced, orderIndex: 1, content: content}); err != nil {
 		t.Fatal(err)
 	}
-	if err := conn.receivePacket(&packet{reliability: reliabilityUnreliableSequenced, orderChannel: 1, orderIndex: 1, content: []byte{1}}); err == nil {
-		t.Fatal("sequenced payload memory limit exceeded")
+	if err := conn.receivePacket(&packet{reliability: reliabilityUnreliableSequenced, orderChannel: 1, orderIndex: 1, content: []byte{1}}); err != nil {
+		t.Fatal(err)
+	}
+	if conn.orderedQueueBytes != maxOrderedQueueBytes || len(conn.packetQueues[1].future) != 0 {
+		t.Fatal("overflowing unreliable sequence was retained")
 	}
 }
 
