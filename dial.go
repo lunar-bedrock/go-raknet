@@ -435,6 +435,9 @@ func (state *connState) discoverMTU() error {
 		case message.IDOpenConnectionReply1:
 			response := &message.OpenConnectionReply1{}
 			if err := response.UnmarshalBinary(b[1:n]); err != nil {
+				if errors.Is(err, message.ErrOfflineMagic) {
+					continue
+				}
 				return fmt.Errorf("read open connection reply 1: %w", err)
 			}
 			state.serverSecurity, state.cookie = response.ServerHasSecurity, response.Cookie
@@ -513,6 +516,9 @@ func (state *connState) openConnection(ctx context.Context) error {
 		case message.IDOpenConnectionReply1:
 			pk := &message.OpenConnectionReply1{}
 			if err = pk.UnmarshalBinary(b[1:n]); err != nil {
+				if errors.Is(err, message.ErrOfflineMagic) {
+					continue
+				}
 				return fmt.Errorf("read repeated open connection reply 1: %w", err)
 			}
 			if pk.ServerGUID == 0 || pk.MTU < minMTUSize || pk.MTU > maxMTU {
@@ -527,6 +533,9 @@ func (state *connState) openConnection(ctx context.Context) error {
 		case message.IDOpenConnectionReply2:
 			pk := &message.OpenConnectionReply2{}
 			if err = pk.UnmarshalBinary(b[1:n]); err != nil {
+				if errors.Is(err, message.ErrOfflineMagic) {
+					continue
+				}
 				return fmt.Errorf("read open connection reply 2: %w", err)
 			}
 			if pk.MTU >= minMTUSize {

@@ -14,6 +14,9 @@ type OpenConnectionReply2 struct {
 }
 
 func (pk *OpenConnectionReply2) UnmarshalBinary(data []byte) error {
+	if err := checkOfflineMagic(data); err != nil {
+		return err
+	}
 	if len(data) < 24 || len(data) < 27+addrSize(data[24:]) {
 		return io.ErrUnexpectedEOF
 	}
