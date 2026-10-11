@@ -622,6 +622,12 @@ func (conn *Conn) send(pk encoding.BinaryMarshaler) error {
 	return conn.writeControl(b, reliabilityReliableOrdered)
 }
 
+// sendReliable encodes a control packet with reliable, unordered delivery.
+func (conn *Conn) sendReliable(pk encoding.BinaryMarshaler) error {
+	b, _ := pk.MarshalBinary()
+	return conn.writeControl(b, reliabilityReliable)
+}
+
 // sendUnreliable encodes an encoding.BinaryMarshaler and writes it to the Conn using
 // unreliable reliability.
 func (conn *Conn) sendUnreliable(pk encoding.BinaryMarshaler) error {
