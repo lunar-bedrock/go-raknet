@@ -648,6 +648,9 @@ var packetPool = sync.Pool{New: func() any { return &packet{reliability: reliabi
 // receive receives a packet from the connection, handling it as appropriate.
 // If not successful, an error is returned.
 func (conn *Conn) receive(b []byte) error {
+	if len(b) == 0 || b[0]&bitFlagDatagram == 0 {
+		return nil
+	}
 	t := time.Now()
 	conn.lastActivity.Store(&t)
 	if len(conn.splits) != 0 && t.Sub(conn.lastSplitSweep) >= splitSweepInterval {
@@ -659,7 +662,16 @@ func (conn *Conn) receive(b []byte) error {
 
 	switch {
 	case b[0]&bitFlagACK != 0:
-		return conn.handleACK(b[1:])
+		offset := 1
+		if b[0]&bitFlagACKArrivalRate != 0 {
+			// Arrival-rate feedback is optional and does not affect our
+			// congestion controller, but precedes the acknowledgement records.
+			offset += 4
+		}
+		if len(b) < offset {
+			return fmt.Errorf("read ACK header: %w", io.ErrUnexpectedEOF)
+		}
+		return conn.handleACK(b[offset:])
 	case b[0]&bitFlagNACK != 0:
 		return conn.handleNACK(b[1:])
 	case b[0]&bitFlagDatagram != 0:

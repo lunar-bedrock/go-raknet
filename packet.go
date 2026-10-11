@@ -3,6 +3,7 @@ package raknet
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"io"
 )
 
@@ -14,12 +15,17 @@ const (
 	bitFlagACK = 0x40
 	// bitFlagNACK is set for every NACK packet.
 	bitFlagNACK = 0x20
+	// bitFlagACKArrivalRate indicates a four-byte arrival-rate field before
+	// the ACK records. It shares its bit with NACK in the non-ACK header.
+	bitFlagACKArrivalRate = 0x20
 	// bitFlagContinuousSend indicates that more datagrams are immediately
 	// available to send.
 	bitFlagContinuousSend = 0x08
 	// bitFlagNeedsBAndAS is set for every datagram with packet data, but is not
 	// actually used.
 	bitFlagNeedsBAndAS = 0x04
+	// orderChannelCount is the number of ordering streams supported by RakNet.
+	orderChannelCount = 32
 )
 
 // encapsulatedPacketSize returns a packet's encoded size excluding the 4-byte
@@ -146,7 +152,11 @@ func (pk *packet) read(b []byte) (int, error) {
 	pk.split = (header & splitFlag) != 0
 	pk.reliability = reliability((header & 224) >> 5)
 
-	n := binary.BigEndian.Uint16(b[1:]) >> 3
+	bits := binary.BigEndian.Uint16(b[1:])
+	if bits == 0 {
+		return 0, fmt.Errorf("packet payload has zero bits")
+	}
+	n := (int(bits) + 7) >> 3
 	offset := 3
 
 	if pk.reliability.reliable() {
@@ -170,7 +180,9 @@ func (pk *packet) read(b []byte) (int, error) {
 			return 0, io.ErrUnexpectedEOF
 		}
 		pk.orderIndex = loadUint24(b[offset:])
-		// Order channel (byte)
+		if b[offset+3] >= orderChannelCount {
+			return 0, fmt.Errorf("packet order channel %d is out of range", b[offset+3])
+		}
 		offset += 4
 	}
 
@@ -184,11 +196,12 @@ func (pk *packet) read(b []byte) (int, error) {
 		offset += 10
 	}
 
-	pk.content = make([]byte, n)
-	if got := copy(pk.content, b[offset:]); got != int(n) {
+	if len(b)-offset < n {
 		return 0, io.ErrUnexpectedEOF
 	}
-	return offset + int(n), nil
+	pk.content = make([]byte, n)
+	copy(pk.content, b[offset:offset+n])
+	return offset + n, nil
 }
 
 const (
