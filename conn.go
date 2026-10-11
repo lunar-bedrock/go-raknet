@@ -40,6 +40,8 @@ const (
 	// maxWindowSize bounds the ordered packet queue, whose entries cannot be
 	// dropped without a delivery gap; overflowing it closes the connection.
 	maxWindowSize = 2048
+	// maxOrderedQueueBytes bounds retained payloads across all ordering streams.
+	maxOrderedQueueBytes = 16 << 20
 
 	// maxSplitCount allows large packets from third-party servers. Vanilla
 	// accepts 2048 fragments; Cloudburst's limit is 8192.
@@ -157,9 +159,9 @@ type Conn struct {
 	// a batch that no further traffic follows is not left until the next tick.
 	ackTimer *time.Timer
 
-	// packetQueue is an ordered queue containing packets indexed by their order
-	// index.
-	packetQueue *packetQueue
+	// packetQueues retain independent ordered receive streams by channel.
+	packetQueues      [orderChannelCount]*packetQueue
+	orderedQueueBytes int
 	// packets is a channel containing content of packets that were fully
 	// processed. Calling Conn.Read() consumes a value from this channel.
 	packets *internal.ElasticChan[[]byte]
@@ -202,7 +204,6 @@ func newConn(conn net.PacketConn, raddr net.Addr, mtu uint16, h connectionHandle
 		packets:        internal.Chan[[]byte](4, 4096),
 		splits:         make(map[uint16]splitEntry),
 		win:            newDatagramWindow(),
-		packetQueue:    newPacketQueue(),
 		retransmission: newRecoveryQueue(),
 		congestion:     newCongestionWindow(mtu - 28),
 		sendQueueFreed: make(chan struct{}),
@@ -768,16 +769,35 @@ func (conn *Conn) receivePacket(packet *packet) error {
 		// If it isn't a reliable ordered packet, handle it immediately.
 		return conn.handlePacket(packet.content)
 	}
-	if !conn.packetQueue.put(packet.orderIndex, packet.content) {
-		// An ordered packet arrived twice.
+	if packet.orderChannel >= orderChannelCount {
+		return fmt.Errorf("packet order channel %d is out of range", packet.orderChannel)
+	}
+	queue := conn.packetQueues[packet.orderChannel]
+	if queue == nil {
+		queue = newPacketQueue()
+		conn.packetQueues[packet.orderChannel] = queue
+	}
+	if sequenceGreaterThan(queue.lowest, packet.orderIndex) {
 		return nil
 	}
-	if conn.packetQueue.WindowSize() > maxWindowSize {
-		// An acknowledged ordered packet can't be dropped without a gap, so an
-		// overflowing ordered window closes the connection instead of trimming.
-		return fmt.Errorf("packet queue window size is too big (%v-%v)", conn.packetQueue.lowest, conn.packetQueue.highest)
+	if _, exists := queue.queue[packet.orderIndex]; exists {
+		return nil
 	}
-	for _, content := range conn.packetQueue.fetch() {
+	if (packet.orderIndex-queue.lowest)&0xffffff >= maxWindowSize {
+		return fmt.Errorf("packet queue window is too big on channel %d", packet.orderChannel)
+	}
+	if conn.orderedQueueBytes+len(packet.content) > maxOrderedQueueBytes {
+		return fmt.Errorf("ordered packet queues exceed %d bytes", maxOrderedQueueBytes)
+	}
+	if !queue.put(packet.orderIndex, packet.content) {
+		return nil
+	}
+	conn.orderedQueueBytes += len(packet.content)
+	contents := queue.fetch()
+	for _, content := range contents {
+		conn.orderedQueueBytes -= len(content)
+	}
+	for _, content := range contents {
 		if err := conn.handlePacket(content); err != nil {
 			return err
 		}
