@@ -14,19 +14,16 @@ jobs:
       - name: Check out code into the Go module directory
         uses: actions/checkout@v6
 
-      - name: Get dependencies
-        run: |
-          mkdir -p $GOPATH/bin
-          export PATH=$PATH:$GOPATH/bin
-
       - name: Vet
         run: go vet ./...
 
       - name: Staticcheck
         run: |
-          go get honnef.co/go/tools/cmd/staticcheck
-          GOBIN=$PWD/bin go install honnef.co/go/tools/cmd/staticcheck
+          GOBIN=$PWD/bin go install honnef.co/go/tools/cmd/staticcheck@2026.2.1
           ./bin/staticcheck ./...
+
+      - name: Test local transport behavior
+        run: go test -race ./... -skip '^(TestPing|TestPingWithCustomDialer|TestDial|TestDialWithCustomDialer)$'
 
       - name: Build
         run: go build -o raknet_exe -v .
