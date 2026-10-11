@@ -283,6 +283,11 @@ func (h dialerConnectionHandler) handleConnectionRequestAccepted(conn *Conn, b [
 			PingTime:        pk.PongTime,
 			PongTime:        timestamp(),
 		})
+		if err == nil {
+			// Seed the peer's latency measurement as soon as the handshake
+			// completes, without placing the ping in the ordered stream.
+			_ = conn.sendUnreliable(&message.ConnectedPing{PingTime: timestamp()})
+		}
 		close(conn.connected)
 		return err
 	}
