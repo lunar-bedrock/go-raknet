@@ -80,9 +80,10 @@ func TestResolvedSystemAddressesSortNineteenthAddress(t *testing.T) {
 			}
 			addresses := NewResolvedSystemAddresses(32123, ips)
 			for i, ip := range ips {
-				if i == SystemAddressCount-3 {
+				switch i {
+				case SystemAddressCount - 3:
 					ip = ips[SystemAddressCount-2]
-				} else if i == SystemAddressCount-2 {
+				case SystemAddressCount - 2:
 					ip = ips[SystemAddressCount-3]
 				}
 				if want := netip.AddrPortFrom(ip, 32123); addresses[i] != want {
