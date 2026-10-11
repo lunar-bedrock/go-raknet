@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/netip"
 	"testing"
+	"time"
 )
 
 func TestNewIncomingConnectionRetainsResolvedAddressesAndBoundPort(t *testing.T) {
@@ -20,7 +21,7 @@ func TestNewIncomingConnectionRetainsResolvedAddressesAndBoundPort(t *testing.T)
 		t.Fatal(err)
 	}
 	conn.mu.Lock()
-	err := conn.drainSendQueue()
+	err := conn.drainSendQueue(time.Unix(1, 0))
 	conn.mu.Unlock()
 	if err != nil {
 		t.Fatal(err)
@@ -60,7 +61,7 @@ func TestConnectionRequestAcceptedRetainsResolvedAddressesAndBoundPort(t *testin
 		t.Fatal(err)
 	}
 	conn.mu.Lock()
-	err := conn.drainSendQueue()
+	err := conn.drainSendQueue(time.Unix(1, 0))
 	conn.mu.Unlock()
 	if err != nil {
 		t.Fatal(err)

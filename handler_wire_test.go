@@ -24,13 +24,22 @@ func TestAcceptedHandshakeSendsInitialUnreliablePing(t *testing.T) {
 		t.Fatal(err)
 	}
 	conn.update(time.Unix(1, 0))
-	if len(socket.writes) != 2 {
-		t.Fatalf("got %d datagrams, want new-incoming followed by one initial ping", len(socket.writes))
+	var frames []packet
+	for _, datagram := range socket.writes {
+		for payload := datagram[4:]; len(payload) > 0; {
+			var frame packet
+			consumed, err := frame.read(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			frames = append(frames, frame)
+			payload = payload[consumed:]
+		}
 	}
-	var incomingPacket, pingPacket packet
-	if _, err := incomingPacket.read(socket.writes[0][4:]); err != nil {
-		t.Fatal(err)
+	if len(frames) != 2 {
+		t.Fatalf("got %d frames, want new-incoming followed by one initial ping", len(frames))
 	}
+	incomingPacket, pingPacket := frames[0], frames[1]
 	if incomingPacket.reliability != reliabilityReliableOrdered || incomingPacket.content[0] != message.IDNewIncomingConnection {
 		t.Fatal("first message is not a reliable-ordered new-incoming connection")
 	}
@@ -40,9 +49,6 @@ func TestAcceptedHandshakeSendsInitialUnreliablePing(t *testing.T) {
 	}
 	if incoming.PingTime != accepted.PongTime {
 		t.Fatalf("new-incoming echoed %d, want server timestamp %d", incoming.PingTime, accepted.PongTime)
-	}
-	if _, err := pingPacket.read(socket.writes[1][4:]); err != nil {
-		t.Fatal(err)
 	}
 	if pingPacket.reliability != reliabilityUnreliable || pingPacket.content[0] != message.IDConnectedPing {
 		t.Fatal("second message is not an unreliable connected ping")
