@@ -106,6 +106,7 @@ type packet struct {
 	messageIndex  uint24
 	sequenceIndex uint24
 	orderIndex    uint24
+	orderChannel  byte
 
 	content []byte
 
@@ -132,8 +133,7 @@ func (pk *packet) write(buf *bytes.Buffer) {
 	}
 	if pk.reliability.sequencedOrOrdered() {
 		writeUint24(buf, pk.orderIndex)
-		// Order channel, we don't care about this.
-		buf.WriteByte(0)
+		buf.WriteByte(pk.orderChannel)
 	}
 	if pk.split {
 		writeUint32(buf, pk.splitCount)
@@ -183,6 +183,7 @@ func (pk *packet) read(b []byte) (int, error) {
 		if b[offset+3] >= orderChannelCount {
 			return 0, fmt.Errorf("packet order channel %d is out of range", b[offset+3])
 		}
+		pk.orderChannel = b[offset+3]
 		offset += 4
 	}
 
