@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"math"
 	"net"
-	"net/netip"
 	"sync/atomic"
 	"time"
 
@@ -22,10 +21,9 @@ type connectionHandler interface {
 }
 
 type listenerConnectionHandler struct {
-	localAddresses []netip.Addr
-	l              *Listener
-	cookieSalt     *atomic.Uint64
-	previousSalt   *atomic.Uint64
+	l            *Listener
+	cookieSalt   *atomic.Uint64
+	previousSalt *atomic.Uint64
 }
 
 var (
@@ -151,7 +149,7 @@ func (h listenerConnectionHandler) handleOpenConnectionRequest2(b []byte, addr n
 	// nonsense request to the unproven maximum.
 	mtuSize := max(min(pk.MTU, h.l.maxMTU()), minMTUSize)
 
-	data, _ := (&message.OpenConnectionReply2{ServerGUID: h.l.id, ClientAddress: resolveForWire(addr), MTU: mtuSize}).MarshalBinary()
+	data, _ := (&message.OpenConnectionReply2{ServerGUID: h.l.id, ClientAddress: resolve(addr), MTU: mtuSize}).MarshalBinary()
 	if _, err := h.l.conn.WriteTo(data, addr); err != nil {
 		return fmt.Errorf("send OPEN_CONNECTION_REPLY_2: %w", err)
 	}
@@ -195,13 +193,13 @@ func (h listenerConnectionHandler) handle(conn *Conn, b []byte) (handled bool, e
 	case message.IDConnectedPing:
 		return true, handleConnectedPing(conn, b[1:])
 	case message.IDConnectedPong:
-		return true, handleConnectedPong(conn, b[1:])
+		return true, handleConnectedPong(b[1:])
 	case message.IDDisconnectNotification:
 		conn.closeImmediately()
 		return true, nil
 	case message.IDDetectLostConnections:
-		// The enclosing datagram acknowledgement answers the probe.
-		return true, nil
+		// Let the other end know the connection is still alive.
+		return true, conn.send(&message.ConnectedPing{PingTime: timestamp()})
 	default:
 		return false, nil
 	}
@@ -215,8 +213,8 @@ func (h listenerConnectionHandler) handleConnectionRequest(conn *Conn, b []byte)
 		return fmt.Errorf("read CONNECTION_REQUEST: %w", err)
 	}
 	return conn.send(&message.ConnectionRequestAccepted{
-		ClientAddress:   resolveForWire(conn.raddr),
-		SystemAddresses: message.NewResolvedSystemAddresses(resolve(conn.conn.LocalAddr()).Port(), h.localAddresses),
+		ClientAddress:   resolve(conn.raddr),
+		SystemAddresses: message.NewLocalSystemAddresses(resolve(conn.conn.LocalAddr())),
 		PingTime:        pk.RequestTime,
 		PongTime:        timestamp(),
 	})
@@ -234,10 +232,7 @@ func (h listenerConnectionHandler) handleNewIncomingConnection(conn *Conn) error
 	return nil
 }
 
-type dialerConnectionHandler struct {
-	l              *slog.Logger
-	localAddresses []netip.Addr
-}
+type dialerConnectionHandler struct{ l *slog.Logger }
 
 func (h dialerConnectionHandler) log() *slog.Logger {
 	return h.l
@@ -258,13 +253,13 @@ func (h dialerConnectionHandler) handle(conn *Conn, b []byte) (handled bool, err
 	case message.IDConnectedPing:
 		return true, handleConnectedPing(conn, b[1:])
 	case message.IDConnectedPong:
-		return true, handleConnectedPong(conn, b[1:])
+		return true, handleConnectedPong(b[1:])
 	case message.IDDisconnectNotification:
 		conn.closeImmediately()
 		return true, nil
 	case message.IDDetectLostConnections:
-		// The enclosing datagram acknowledgement answers the probe.
-		return true, nil
+		// Let the other end know the connection is still alive.
+		return true, conn.send(&message.ConnectedPing{PingTime: timestamp()})
 	default:
 		return false, nil
 	}
@@ -283,16 +278,11 @@ func (h dialerConnectionHandler) handleConnectionRequestAccepted(conn *Conn, b [
 	default:
 		// Make sure to send NewIncomingConnection before closing conn.connected.
 		err := conn.send(&message.NewIncomingConnection{
-			ServerAddress:   resolveForWire(conn.raddr),
-			SystemAddresses: message.NewResolvedSystemAddresses(resolve(conn.conn.LocalAddr()).Port(), h.localAddresses),
+			ServerAddress:   resolve(conn.raddr),
+			SystemAddresses: message.NewSystemAddresses(resolve(conn.conn.LocalAddr())),
 			PingTime:        pk.PongTime,
 			PongTime:        timestamp(),
 		})
-		if err == nil {
-			// Seed the peer's latency measurement as soon as the handshake
-			// completes, without placing the ping in the ordered stream.
-			_ = conn.sendUnreliable(&message.ConnectedPing{PingTime: timestamp()})
-		}
 		close(conn.connected)
 		return err
 	}
@@ -301,9 +291,6 @@ func (h dialerConnectionHandler) handleConnectionRequestAccepted(conn *Conn, b [
 // handleConnectedPing handles a connected ping packet inside of buffer b. An
 // error is returned if the packet was invalid.
 func handleConnectedPing(conn *Conn, b []byte) error {
-	if skipInvalidConnectedControl(conn, b, message.IDConnectedPing, message.ConnectedPingSize) {
-		return nil
-	}
 	pk := &message.ConnectedPing{}
 	if err := pk.UnmarshalBinary(b); err != nil {
 		return fmt.Errorf("read CONNECTED_PING: %w", err)
@@ -315,13 +302,13 @@ func handleConnectedPing(conn *Conn, b []byte) error {
 
 // handleConnectedPong handles a connected pong packet inside of buffer b. An
 // error is returned if the packet was invalid.
-func handleConnectedPong(conn *Conn, b []byte) error {
-	if skipInvalidConnectedControl(conn, b, message.IDConnectedPong, message.ConnectedPongSize) {
-		return nil
-	}
+func handleConnectedPong(b []byte) error {
 	pk := &message.ConnectedPong{}
 	if err := pk.UnmarshalBinary(b); err != nil {
 		return fmt.Errorf("read CONNECTED_PONG: %w", err)
+	}
+	if pk.PingTime > timestamp() {
+		return fmt.Errorf("handle CONNECTED_PONG: timestamp is in the future")
 	}
 	// We don't actually use the ConnectedPong to measure rtt. It is too
 	// unreliable and doesn't give a good idea of the connection quality.

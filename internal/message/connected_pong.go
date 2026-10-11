@@ -5,9 +5,6 @@ import (
 	"io"
 )
 
-// ConnectedPongSize is the complete wire size, including the message ID.
-const ConnectedPongSize = 17
-
 type ConnectedPong struct {
 	// PingTime represents the duration in milliseconds since the system or client was started.
 	PingTime int64
@@ -16,7 +13,7 @@ type ConnectedPong struct {
 }
 
 func (pk *ConnectedPong) UnmarshalBinary(data []byte) error {
-	if len(data) < ConnectedPongSize-1 {
+	if len(data) < 16 {
 		return io.ErrUnexpectedEOF
 	}
 	pk.PingTime = int64(binary.BigEndian.Uint64(data))
@@ -25,7 +22,7 @@ func (pk *ConnectedPong) UnmarshalBinary(data []byte) error {
 }
 
 func (pk *ConnectedPong) MarshalBinary() (data []byte, err error) {
-	b := make([]byte, ConnectedPongSize)
+	b := make([]byte, 17)
 	b[0] = IDConnectedPong
 	binary.BigEndian.PutUint64(b[1:], uint64(pk.PingTime))
 	binary.BigEndian.PutUint64(b[9:], uint64(pk.PongTime))

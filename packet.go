@@ -3,7 +3,6 @@ package raknet
 import (
 	"bytes"
 	"encoding/binary"
-	"fmt"
 	"io"
 )
 
@@ -15,17 +14,12 @@ const (
 	bitFlagACK = 0x40
 	// bitFlagNACK is set for every NACK packet.
 	bitFlagNACK = 0x20
-	// bitFlagACKArrivalRate indicates a four-byte arrival-rate field before
-	// the ACK records. It shares its bit with NACK in the non-ACK header.
-	bitFlagACKArrivalRate = 0x20
 	// bitFlagContinuousSend indicates that more datagrams are immediately
 	// available to send.
 	bitFlagContinuousSend = 0x08
 	// bitFlagNeedsBAndAS is set for every datagram with packet data, but is not
 	// actually used.
 	bitFlagNeedsBAndAS = 0x04
-	// orderChannelCount is the number of ordering streams supported by RakNet.
-	orderChannelCount = 32
 )
 
 // encapsulatedPacketSize returns a packet's encoded size excluding the 4-byte
@@ -69,9 +63,6 @@ const (
 	// duplicated.
 	reliabilityReliableSequenced
 
-	// reliabilityReceiptOrdered carries an ordering header on the wire.
-	reliabilityReceiptOrdered reliability = 7
-
 	// splitFlag is set in the header if the packet was split. If so, the
 	// encapsulation contains additional data about the fragment.
 	splitFlag = 0x10
@@ -101,22 +92,14 @@ func (r reliability) sequencedOrOrdered() bool {
 	return r.sequenced() || r == reliabilityReliableOrdered
 }
 
-// hasOrderingHeader distinguishes wire framing from receive-delivery semantics.
-func (r reliability) hasOrderingHeader() bool {
-	return r.sequencedOrOrdered() || r == reliabilityReceiptOrdered
-}
-
 // packet is an encapsulation around every packet sent after the connection is
 // established.
 type packet struct {
-	// next links frames sharing one outbound datagram or recovery record.
-	next        *packet
 	reliability reliability
 
 	messageIndex  uint24
 	sequenceIndex uint24
 	orderIndex    uint24
-	orderChannel  byte
 
 	content []byte
 
@@ -143,7 +126,8 @@ func (pk *packet) write(buf *bytes.Buffer) {
 	}
 	if pk.reliability.sequencedOrOrdered() {
 		writeUint24(buf, pk.orderIndex)
-		buf.WriteByte(pk.orderChannel)
+		// Order channel, we don't care about this.
+		buf.WriteByte(0)
 	}
 	if pk.split {
 		writeUint32(buf, pk.splitCount)
@@ -162,11 +146,7 @@ func (pk *packet) read(b []byte) (int, error) {
 	pk.split = (header & splitFlag) != 0
 	pk.reliability = reliability((header & 224) >> 5)
 
-	bits := binary.BigEndian.Uint16(b[1:])
-	if bits == 0 {
-		return 0, fmt.Errorf("packet payload has zero bits")
-	}
-	n := (int(bits) + 7) >> 3
+	n := binary.BigEndian.Uint16(b[1:]) >> 3
 	offset := 3
 
 	if pk.reliability.reliable() {
@@ -185,15 +165,12 @@ func (pk *packet) read(b []byte) (int, error) {
 		offset += 3
 	}
 
-	if pk.reliability.hasOrderingHeader() {
+	if pk.reliability.sequencedOrOrdered() {
 		if len(b)-offset < 4 {
 			return 0, io.ErrUnexpectedEOF
 		}
 		pk.orderIndex = loadUint24(b[offset:])
-		if b[offset+3] >= orderChannelCount {
-			return 0, fmt.Errorf("packet order channel %d is out of range", b[offset+3])
-		}
-		pk.orderChannel = b[offset+3]
+		// Order channel (byte)
 		offset += 4
 	}
 
@@ -207,56 +184,53 @@ func (pk *packet) read(b []byte) (int, error) {
 		offset += 10
 	}
 
-	if len(b)-offset < n {
+	pk.content = make([]byte, n)
+	if got := copy(pk.content, b[offset:]); got != int(n) {
 		return 0, io.ErrUnexpectedEOF
 	}
-	pk.content = make([]byte, n)
-	copy(pk.content, b[offset:offset+n])
-	return offset + n, nil
+	return offset + int(n), nil
 }
 
 const (
-	// splitHeaderBudget reserves framing space from the negotiated UDP budget.
-	splitHeaderBudget = 32
-	// splitAdditionalSize covers the split count, ID and index on the wire.
+	// Datagram header +
+	// Datagram sequence number +
+	// Packet header +
+	// Packet content length +
+	// Packet message index +
+	// Packet order index +
+	// Packet order channel
+	packetAdditionalSize = 1 + 3 + 1 + 2 + 3 + 3 + 1
+	// Packet split count +
+	// Packet split ID +
+	// Packet split index
 	splitAdditionalSize = 4 + 2 + 4
 )
 
-// packetNeedsSplit compares payload bits, including byte rounding, with the
-// remaining byte budget. This also admits single-fragment split envelopes.
-func packetNeedsSplit(n int, mtu uint16) bool {
-	return n > (int(mtu)-splitHeaderBudget-7)/8
-}
-
-// fragmentSize returns the payload ceiling within the negotiated UDP budget.
-func fragmentSize(mtu uint16) int {
-	return int(mtu) - splitHeaderBudget
-}
-
-// splitCount returns the number of payload fragments, including a single split.
-func splitCount(n int, mtu uint16) int {
-	maxSize := fragmentSize(mtu)
-	return n/maxSize + min(n%maxSize, 1)
-}
-
-// splitReliability ensures that split fragments have reliable delivery.
-func splitReliability(rel reliability, split bool) reliability {
-	if split {
-		switch rel {
-		case reliabilityUnreliable:
-			return reliabilityReliable
-		case reliabilityUnreliableSequenced:
-			return reliabilityReliableSequenced
-		}
+// fragmentSize returns the payload each fragment of an n byte packet carries.
+func fragmentSize(n int, mtu uint16) int {
+	maxSize := int(mtu - packetAdditionalSize)
+	if n > maxSize {
+		// If the content size is bigger than the maximum size here, it means
+		// the packet will get split. This means that the packet will get even
+		// bigger because a split packet uses 4 + 2 + 4 more bytes.
+		maxSize -= splitAdditionalSize
 	}
-	return rel
+	return maxSize
+}
+
+// splitCount returns how many fragments an n byte packet is split into.
+func splitCount(n int, mtu uint16) int {
+	maxSize := fragmentSize(n, mtu)
+	// If the content length can't be divided by maxSize perfectly, we need
+	// to reserve another fragment for the last bit of the packet.
+	return n/maxSize + min(n%maxSize, 1)
 }
 
 // split splits a content buffer in smaller buffers so that they do not exceed
 // the MTU size that the connection holds.
 func split(b []byte, mtu uint16) [][]byte {
 	n := len(b)
-	maxSize := fragmentSize(mtu)
+	maxSize := fragmentSize(n, mtu)
 	fragmentCount := splitCount(n, mtu)
 	fragments := make([][]byte, fragmentCount)
 	for i := range fragmentCount - 1 {

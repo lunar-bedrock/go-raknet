@@ -7,7 +7,6 @@ import (
 
 // Metrics is a process-wide snapshot of RakNet transport state.
 type Metrics struct {
-	IgnoredConnectedControls  uint64
 	Connections               uint64
 	SendQueueBytes            uint64
 	InFlightBytes             uint64
@@ -24,15 +23,14 @@ type Metrics struct {
 }
 
 var (
-	metricsMu                       sync.RWMutex
-	metricsConnections              = make(map[*Conn]struct{})
-	metricsACKs                     atomic.Uint64
-	metricsNACKs                    atomic.Uint64
-	metricsIgnoredConnectedControls atomic.Uint64
-	metricsDatagrams                atomic.Uint64
-	metricsRetransmits              atomic.Uint64
-	metricsBytesSent                atomic.Uint64
-	metricsBytesACKed               atomic.Uint64
+	metricsMu          sync.RWMutex
+	metricsConnections = make(map[*Conn]struct{})
+	metricsACKs        atomic.Uint64
+	metricsNACKs       atomic.Uint64
+	metricsDatagrams   atomic.Uint64
+	metricsRetransmits atomic.Uint64
+	metricsBytesSent   atomic.Uint64
+	metricsBytesACKed  atomic.Uint64
 )
 
 // registerMetricsConnection includes conn in process-wide metric snapshots.
@@ -61,7 +59,6 @@ func MetricsSnapshot() Metrics {
 	snapshot := snapshotMetrics(connections)
 	snapshot.ACKsReceived = metricsACKs.Load()
 	snapshot.NACKsReceived = metricsNACKs.Load()
-	snapshot.IgnoredConnectedControls = metricsIgnoredConnectedControls.Load()
 	snapshot.ReliableDatagramsSent = metricsDatagrams.Load()
 	snapshot.Retransmits = metricsRetransmits.Load()
 	snapshot.ReliableBytesSent = metricsBytesSent.Load()

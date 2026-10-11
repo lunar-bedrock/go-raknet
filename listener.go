@@ -1,7 +1,6 @@
 package raknet
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -185,7 +184,7 @@ func (conf ListenConfig) Listen(address string) (*Listener, error) {
 		closed:   make(chan struct{}),
 		id:       serverID,
 	}
-	listener.handler = &listenerConnectionHandler{l: listener, cookieSalt: &atomic.Uint64{}, previousSalt: &atomic.Uint64{}, localAddresses: resolveLocalAddresses(context.Background(), conn.LocalAddr(), conf.ErrorLog)}
+	listener.handler = &listenerConnectionHandler{l: listener, cookieSalt: &atomic.Uint64{}, previousSalt: &atomic.Uint64{}}
 	listener.sec = newSecurity(conf, listener.handler)
 	listener.pongData.Store(new([]byte))
 

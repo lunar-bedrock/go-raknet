@@ -68,7 +68,7 @@ func writeQueued(t *testing.T, conn *Conn, b []byte, rel reliability) int {
 	if err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	if err := conn.drainSendQueue(time.Now()); err != nil {
+	if err := conn.drainSendQueue(); err != nil {
 		t.Fatalf("drain send queue: %v", err)
 	}
 	return n
@@ -100,7 +100,7 @@ func TestSendQueueDrainsOnACK(t *testing.T) {
 
 	ackBuffer := bytes.NewBuffer(nil)
 	(&acknowledgement{packets: []uint24{0}}).write(ackBuffer, conn.effectiveMTU())
-	if err := conn.handleACK(ackBuffer.Bytes(), time.Now()); err != nil {
+	if err := conn.handleACK(ackBuffer.Bytes()); err != nil {
 		t.Fatalf("handle ACK: %v", err)
 	}
 	conn.update(time.Now())
@@ -335,7 +335,7 @@ func TestCloseImmediatelyFlushesDisconnect(t *testing.T) {
 		conn.conn = packetConn
 		conn.sendBudget = 0
 		for i := range outstanding {
-			conn.retransmission.add(uint24(i), packetPool.Get().(*packet), 1, time.Now())
+			conn.retransmission.add(uint24(i), packetPool.Get().(*packet), 1)
 		}
 
 		conn.closeImmediately()
@@ -440,7 +440,7 @@ func TestCloseThroughTicker(t *testing.T) {
 				conn.mu.Unlock()
 				ack := bytes.NewBuffer(nil)
 				(&acknowledgement{packets: sequences}).write(ack, conn.effectiveMTU())
-				if err := conn.handleACK(ack.Bytes(), time.Now()); err != nil {
+				if err := conn.handleACK(ack.Bytes()); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -501,7 +501,7 @@ func ackCloseDatagram(t *testing.T, conn *Conn, socket *recordingPacketConn, ind
 	socket.mu.Unlock()
 	ack := bytes.NewBuffer(nil)
 	(&acknowledgement{packets: []uint24{seq}}).write(ack, conn.effectiveMTU())
-	if err := conn.handleACK(ack.Bytes(), time.Now()); err != nil {
+	if err := conn.handleACK(ack.Bytes()); err != nil {
 		t.Fatal(err)
 	}
 }

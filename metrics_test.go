@@ -60,7 +60,7 @@ func TestMetricsSnapshotRetainsAcknowledgementCounters(t *testing.T) {
 	buf := new(bytes.Buffer)
 	ack := &acknowledgement{packets: []uint24{1}}
 	ack.write(buf, maxMTUSize)
-	if err := conn.handleACK(buf.Bytes(), time.Now()); err != nil {
+	if err := conn.handleACK(buf.Bytes()); err != nil {
 		t.Fatalf("handle ACK: %v", err)
 	}
 
@@ -115,7 +115,7 @@ func TestMetricsSnapshotRetainsReliableSendCounters(t *testing.T) {
 	pk := &packet{content: []byte{1, 2, 3}, reliability: reliabilityReliableOrdered}
 	size := uint32(encapsulatedPacketSize(len(pk.content), pk.reliability, false))
 	before := MetricsSnapshot()
-	if err := conn.sendDatagram(pk, size, false, time.Now()); err != nil {
+	if err := conn.sendDatagram(pk, size, false); err != nil {
 		t.Fatalf("send datagram: %v", err)
 	}
 
@@ -146,7 +146,7 @@ func TestMetricsSnapshotRetainsRetransmitCounters(t *testing.T) {
 	pk := &packet{content: []byte{1, 2, 3}, reliability: reliabilityReliableOrdered}
 	size := uint32(encapsulatedPacketSize(len(pk.content), pk.reliability, false))
 	before := MetricsSnapshot().Retransmits
-	if err := conn.sendDatagram(pk, size, true, time.Now()); err != nil {
+	if err := conn.sendDatagram(pk, size, true); err != nil {
 		t.Fatalf("send retransmit: %v", err)
 	}
 
