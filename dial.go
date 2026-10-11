@@ -2,13 +2,12 @@ package raknet
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"log/slog"
-	"math/rand/v2"
 	"net"
 	"os"
-	"sync/atomic"
 	"time"
 
 	"github.com/sandertv/go-raknet/internal"
@@ -157,7 +156,11 @@ func (dialer Dialer) PingContext(ctx context.Context, address string) (response 
 	}
 	defer conn.Close()
 
-	data, _ := (&message.UnconnectedPing{PingTime: timestamp(), ClientGUID: atomic.AddInt64(&dialerID, 1)}).MarshalBinary()
+	id, err := newClientGUID(rand.Reader)
+	if err != nil {
+		return nil, dialer.error("ping", err)
+	}
+	data, _ := (&message.UnconnectedPing{PingTime: timestamp(), ClientGUID: id}).MarshalBinary()
 	if _, err := conn.Write(data); err != nil {
 		return nil, dialer.error("ping", err)
 	}
@@ -199,10 +202,6 @@ func (dialer Dialer) dial(ctx context.Context, address string) (net.Conn, error)
 	return conn, nil
 }
 
-// dialerID is a counter used to produce an ID for the client.
-// This should always be negative as per the vanilla client implementation.
-var dialerID = -rand.Int64()
-
 // Dial attempts to dial a RakNet connection to the address passed. The address
 // may be either an IP address or a hostname, combined with a port that is
 // separated with ':'. Dial will attempt to dial a connection within 10
@@ -243,12 +242,17 @@ func (dialer Dialer) DialContext(ctx context.Context, address string) (*Conn, er
 	if err != nil {
 		return nil, dialer.error("dial", err)
 	}
+	id, err := newClientGUID(rand.Reader)
+	if err != nil {
+		_ = conn.Close()
+		return nil, dialer.error("dial", err)
+	}
 	dialer.ErrorLog = dialer.ErrorLog.With("src", "dialer", "raddr", conn.RemoteAddr().String())
 
 	cs := &connState{
 		conn:               conn,
 		raddr:              conn.RemoteAddr(),
-		id:                 atomic.AddInt64(&dialerID, 1),
+		id:                 id,
 		ticker:             time.NewTicker(time.Second / 2),
 		maxTransientErrors: dialer.MaxTransientErrors,
 		maxMTU:             dialer.MaxMTU,
