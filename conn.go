@@ -434,9 +434,12 @@ func (conn *Conn) writeWithReliability(b []byte, rel reliability) (n int, err er
 // queuedSize returns the wire bytes b occupies in the send queue, headers and
 // fragmentation included.
 func (conn *Conn) queuedSize(b []byte, rel reliability) uint32 {
-	count := splitCount(len(b), conn.effectiveMTU())
+	mtu := conn.effectiveMTU()
+	count := splitCount(len(b), mtu)
+	isSplit := packetNeedsSplit(len(b), mtu)
+	rel = splitReliability(rel, isSplit)
 	// Fragment payloads sum to len(b), and every fragment costs the same header.
-	return uint32(len(b) + count*(encapsulatedPacketSize(0, rel, count > 1)+4))
+	return uint32(len(b) + count*(encapsulatedPacketSize(0, rel, isSplit)+4))
 }
 
 // write writes a buffer b over the RakNet connection. The amount of bytes
@@ -445,14 +448,17 @@ func (conn *Conn) queuedSize(b []byte, rel reliability) uint32 {
 // simultaneously from multiple goroutines, but will write one by one. Unlike
 // Write, write will not lock.
 func (conn *Conn) write(b []byte, rel reliability, control bool) (n int, err error) {
-	fragments := split(b, conn.effectiveMTU())
+	mtu := conn.effectiveMTU()
+	isSplit := packetNeedsSplit(len(b), mtu)
+	rel = splitReliability(rel, isSplit)
+	fragments := split(b, mtu)
 	var orderIndex uint24
 	if rel.sequencedOrOrdered() {
 		orderIndex = conn.orderIndex.Inc()
 	}
 
 	splitID := uint16(conn.splitID)
-	if len(fragments) > 1 {
+	if isSplit {
 		conn.splitID++
 	}
 	for splitIndex, content := range fragments {
@@ -472,9 +478,7 @@ func (conn *Conn) write(b []byte, rel reliability, control bool) (n int, err err
 		if rel.reliable() {
 			pk.messageIndex = conn.messageIndex.Inc()
 		}
-		if pk.split = len(fragments) > 1; pk.split {
-			// If there were more than one fragment, the pk was split, so we
-			// need to make sure we set the appropriate fields.
+		if pk.split = isSplit; pk.split {
 			pk.splitCount = uint32(len(fragments))
 			pk.splitIndex = uint32(splitIndex)
 			pk.splitID = splitID
