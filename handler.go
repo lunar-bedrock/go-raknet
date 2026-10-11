@@ -193,7 +193,7 @@ func (h listenerConnectionHandler) handle(conn *Conn, b []byte) (handled bool, e
 	case message.IDConnectedPing:
 		return true, handleConnectedPing(conn, b[1:])
 	case message.IDConnectedPong:
-		return true, handleConnectedPong(b[1:])
+		return true, handleConnectedPong(conn, b[1:])
 	case message.IDDisconnectNotification:
 		conn.closeImmediately()
 		return true, nil
@@ -253,7 +253,7 @@ func (h dialerConnectionHandler) handle(conn *Conn, b []byte) (handled bool, err
 	case message.IDConnectedPing:
 		return true, handleConnectedPing(conn, b[1:])
 	case message.IDConnectedPong:
-		return true, handleConnectedPong(b[1:])
+		return true, handleConnectedPong(conn, b[1:])
 	case message.IDDisconnectNotification:
 		conn.closeImmediately()
 		return true, nil
@@ -296,6 +296,9 @@ func (h dialerConnectionHandler) handleConnectionRequestAccepted(conn *Conn, b [
 // handleConnectedPing handles a connected ping packet inside of buffer b. An
 // error is returned if the packet was invalid.
 func handleConnectedPing(conn *Conn, b []byte) error {
+	if skipInvalidConnectedControl(conn, b, message.IDConnectedPing, message.ConnectedPingSize) {
+		return nil
+	}
 	pk := &message.ConnectedPing{}
 	if err := pk.UnmarshalBinary(b); err != nil {
 		return fmt.Errorf("read CONNECTED_PING: %w", err)
@@ -307,7 +310,10 @@ func handleConnectedPing(conn *Conn, b []byte) error {
 
 // handleConnectedPong handles a connected pong packet inside of buffer b. An
 // error is returned if the packet was invalid.
-func handleConnectedPong(b []byte) error {
+func handleConnectedPong(conn *Conn, b []byte) error {
+	if skipInvalidConnectedControl(conn, b, message.IDConnectedPong, message.ConnectedPongSize) {
+		return nil
+	}
 	pk := &message.ConnectedPong{}
 	if err := pk.UnmarshalBinary(b); err != nil {
 		return fmt.Errorf("read CONNECTED_PONG: %w", err)
