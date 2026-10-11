@@ -68,10 +68,8 @@ const (
 	// bounds how far the peer's round trip estimate can be inflated by us.
 	ackDelay = time.Millisecond * 10
 
-	// resendBufferSize caps reliable datagrams awaiting acknowledgement. The
-	// client indexes a fixed 512 slot resend buffer and refuses to send new
-	// reliable data while the slot for the next message number is taken, which
-	// bounds a burst even when the congestion window is far larger.
+	// resendBufferSize bounds reliable frames retained for acknowledgement,
+	// independent of how many frames share a datagram.
 	resendBufferSize = 512
 )
 
@@ -457,6 +455,7 @@ func (conn *Conn) write(b []byte, rel reliability, control bool) (n int, err err
 	}
 	for splitIndex, content := range fragments {
 		pk := packetPool.Get().(*packet)
+		pk.next = nil
 		if cap(pk.content) < len(content) {
 			pk.content = make([]byte, len(content))
 		}
@@ -561,12 +560,10 @@ func (conn *Conn) closeImmediately() {
 		// The flush re-added whatever it sent.
 		conn.releaseUnacknowledged()
 		for _, datagram := range conn.sendQueue {
-			datagram.pk.content = datagram.pk.content[:0]
-			packetPool.Put(datagram.pk)
+			releasePacketChain(datagram.pk)
 		}
 		for _, datagram := range conn.controlQueue {
-			datagram.pk.content = datagram.pk.content[:0]
-			packetPool.Put(datagram.pk)
+			releasePacketChain(datagram.pk)
 		}
 		conn.controlQueue = nil
 		conn.sendQueue = nil
@@ -579,10 +576,10 @@ func (conn *Conn) closeImmediately() {
 // pool and forgets it. Only for a connection that is closing.
 func (conn *Conn) releaseUnacknowledged() {
 	for _, record := range conn.retransmission.unacknowledged {
-		record.pk.content = record.pk.content[:0]
-		packetPool.Put(record.pk)
+		releasePacketChain(record.pk)
 	}
 	clear(conn.retransmission.unacknowledged)
+	conn.retransmission.pendingFrames = 0
 }
 
 func (conn *Conn) sendDisconnect() error {
@@ -947,8 +944,7 @@ func (conn *Conn) handleACK(b []byte, now time.Time) error {
 			metricsBytesACKed.Add(uint64(record.inFlightBytes))
 			conn.congestion.acknowledged(record.inFlightBytes)
 			conn.congestion.ack(sequenceNumber, conn.seq)
-			record.pk.content = record.pk.content[:0]
-			packetPool.Put(record.pk)
+			releasePacketChain(record.pk)
 		}
 	}
 	// The window moved, so let the send loop recompute the budget and drain.
