@@ -151,7 +151,7 @@ func (h listenerConnectionHandler) handleOpenConnectionRequest2(b []byte, addr n
 	// nonsense request to the unproven maximum.
 	mtuSize := max(min(pk.MTU, h.l.maxMTU()), minMTUSize)
 
-	data, _ := (&message.OpenConnectionReply2{ServerGUID: h.l.id, ClientAddress: resolve(addr), MTU: mtuSize}).MarshalBinary()
+	data, _ := (&message.OpenConnectionReply2{ServerGUID: h.l.id, ClientAddress: resolveForWire(addr), MTU: mtuSize}).MarshalBinary()
 	if _, err := h.l.conn.WriteTo(data, addr); err != nil {
 		return fmt.Errorf("send OPEN_CONNECTION_REPLY_2: %w", err)
 	}
@@ -215,7 +215,7 @@ func (h listenerConnectionHandler) handleConnectionRequest(conn *Conn, b []byte)
 		return fmt.Errorf("read CONNECTION_REQUEST: %w", err)
 	}
 	return conn.send(&message.ConnectionRequestAccepted{
-		ClientAddress:   resolve(conn.raddr),
+		ClientAddress:   resolveForWire(conn.raddr),
 		SystemAddresses: message.NewResolvedSystemAddresses(resolve(conn.conn.LocalAddr()).Port(), h.localAddresses),
 		PingTime:        pk.RequestTime,
 		PongTime:        timestamp(),
@@ -283,7 +283,7 @@ func (h dialerConnectionHandler) handleConnectionRequestAccepted(conn *Conn, b [
 	default:
 		// Make sure to send NewIncomingConnection before closing conn.connected.
 		err := conn.send(&message.NewIncomingConnection{
-			ServerAddress:   resolve(conn.raddr),
+			ServerAddress:   resolveForWire(conn.raddr),
 			SystemAddresses: message.NewResolvedSystemAddresses(resolve(conn.conn.LocalAddr()).Port(), h.localAddresses),
 			PingTime:        pk.PongTime,
 			PongTime:        timestamp(),

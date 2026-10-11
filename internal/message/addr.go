@@ -3,6 +3,7 @@ package message
 import (
 	"encoding/binary"
 	"net/netip"
+	"strconv"
 )
 
 // SystemAddressCount is the number of entries in a connected-handshake address list.
@@ -60,9 +61,13 @@ func putAddr(b []byte, addrPort netip.AddrPort) int {
 		b[0] = 6
 		binary.LittleEndian.PutUint16(b[1:], uint16(23)) // syscall.AF_INET6 on Windows.
 		binary.BigEndian.PutUint16(b[3:], port)
-		// 4 bytes.
+		binary.LittleEndian.PutUint32(b[5:], 0)
 		copy(b[9:], ip16[:])
-		// 4 bytes.
+		scope, err := strconv.ParseUint(addr.Zone(), 10, 32)
+		if err != nil {
+			scope = 0
+		}
+		binary.LittleEndian.PutUint32(b[25:], uint32(scope))
 		return sizeofAddr6
 	}
 }
@@ -75,6 +80,9 @@ func addr(b []byte) (netip.AddrPort, int) {
 	} else {
 		port := binary.BigEndian.Uint16(b[3:])
 		ip := netip.AddrFrom16([16]byte(b[9:]))
+		if scope := binary.LittleEndian.Uint32(b[25:]); scope != 0 {
+			ip = ip.WithZone(strconv.FormatUint(uint64(scope), 10))
+		}
 		return netip.AddrPortFrom(ip, port), sizeofAddr6
 	}
 }
