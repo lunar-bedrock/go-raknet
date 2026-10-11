@@ -101,6 +101,8 @@ func (r reliability) sequencedOrOrdered() bool {
 // packet is an encapsulation around every packet sent after the connection is
 // established.
 type packet struct {
+	// next links frames sharing one outbound datagram or recovery record.
+	next        *packet
 	reliability reliability
 
 	messageIndex  uint24
