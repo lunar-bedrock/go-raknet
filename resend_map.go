@@ -7,6 +7,7 @@ import (
 // resendMap is a map of packets, used to recover datagrams if the other end of
 // the connection ended up not having them.
 type resendMap struct {
+	pendingFrames  int
 	unacknowledged map[uint24]resendRecord
 	estimatedRTT   time.Duration
 	deviationRTT   time.Duration
@@ -16,8 +17,8 @@ type resendMap struct {
 	deadline time.Time
 }
 
-// resendRecord represents a single packet with a timestamp from when it was
-// initially sent. It may be either acknowledged or NACKed by the other end.
+// resendRecord owns the reliable frame chain from one numbered datagram.
+// Acknowledgements release the entire chain; resends retain its frame indices.
 type resendRecord struct {
 	pk            *packet
 	inFlightBytes uint32
@@ -35,6 +36,7 @@ func newRecoveryQueue() *resendMap {
 // add stores a packet by its sequence number and schedules the retransmit one
 // RTO out.
 func (m *resendMap) add(index uint24, pk *packet, inFlightBytes uint32, now time.Time) {
+	m.pendingFrames += packetChainCount(pk)
 	nextSend := now.Add(m.rto())
 	m.unacknowledged[index] = resendRecord{
 		pk: pk, inFlightBytes: inFlightBytes, timestamp: now, nextSend: nextSend,
@@ -76,6 +78,7 @@ func (m *resendMap) remove(index uint24) (resendRecord, bool) {
 		return resendRecord{}, false
 	}
 	delete(m.unacknowledged, index)
+	m.pendingFrames -= packetChainCount(record.pk)
 	return record, true
 }
 

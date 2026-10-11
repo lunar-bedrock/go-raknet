@@ -101,6 +101,8 @@ func (r reliability) sequencedOrOrdered() bool {
 // packet is an encapsulation around every packet sent after the connection is
 // established.
 type packet struct {
+	// next links frames sharing one outbound datagram or recovery record.
+	next        *packet
 	reliability reliability
 
 	messageIndex  uint24
@@ -205,45 +207,46 @@ func (pk *packet) read(b []byte) (int, error) {
 }
 
 const (
-	// Datagram header +
-	// Datagram sequence number +
-	// Packet header +
-	// Packet content length +
-	// Packet message index +
-	// Packet order index +
-	// Packet order channel
-	packetAdditionalSize = 1 + 3 + 1 + 2 + 3 + 3 + 1
-	// Packet split count +
-	// Packet split ID +
-	// Packet split index
+	// splitHeaderBudget reserves framing space from the negotiated UDP budget.
+	splitHeaderBudget = 32
+	// splitAdditionalSize covers the split count, ID and index on the wire.
 	splitAdditionalSize = 4 + 2 + 4
 )
 
-// fragmentSize returns the payload each fragment of an n byte packet carries.
-func fragmentSize(n int, mtu uint16) int {
-	maxSize := int(mtu - packetAdditionalSize)
-	if n > maxSize {
-		// If the content size is bigger than the maximum size here, it means
-		// the packet will get split. This means that the packet will get even
-		// bigger because a split packet uses 4 + 2 + 4 more bytes.
-		maxSize -= splitAdditionalSize
-	}
-	return maxSize
+// packetNeedsSplit reports whether the payload exceeds one fragment in bytes.
+func packetNeedsSplit(n int, mtu uint16) bool {
+	return n > fragmentSize(mtu)
 }
 
-// splitCount returns how many fragments an n byte packet is split into.
+// fragmentSize returns the payload ceiling within the negotiated UDP budget.
+func fragmentSize(mtu uint16) int {
+	return int(mtu) - splitHeaderBudget
+}
+
+// splitCount returns the number of fragments needed to carry the payload.
 func splitCount(n int, mtu uint16) int {
-	maxSize := fragmentSize(n, mtu)
-	// If the content length can't be divided by maxSize perfectly, we need
-	// to reserve another fragment for the last bit of the packet.
+	maxSize := fragmentSize(mtu)
 	return n/maxSize + min(n%maxSize, 1)
+}
+
+// splitReliability ensures that split fragments have reliable delivery.
+func splitReliability(rel reliability, split bool) reliability {
+	if split {
+		switch rel {
+		case reliabilityUnreliable:
+			return reliabilityReliable
+		case reliabilityUnreliableSequenced:
+			return reliabilityReliableSequenced
+		}
+	}
+	return rel
 }
 
 // split splits a content buffer in smaller buffers so that they do not exceed
 // the MTU size that the connection holds.
 func split(b []byte, mtu uint16) [][]byte {
 	n := len(b)
-	maxSize := fragmentSize(n, mtu)
+	maxSize := fragmentSize(mtu)
 	fragmentCount := splitCount(n, mtu)
 	fragments := make([][]byte, fragmentCount)
 	for i := range fragmentCount - 1 {

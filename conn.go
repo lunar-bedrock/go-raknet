@@ -68,10 +68,8 @@ const (
 	// bounds how far the peer's round trip estimate can be inflated by us.
 	ackDelay = time.Millisecond * 10
 
-	// resendBufferSize caps reliable datagrams awaiting acknowledgement. The
-	// client indexes a fixed 512 slot resend buffer and refuses to send new
-	// reliable data while the slot for the next message number is taken, which
-	// bounds a burst even when the congestion window is far larger.
+	// resendBufferSize bounds reliable frames retained for acknowledgement,
+	// independent of how many frames share a datagram.
 	resendBufferSize = 512
 )
 
@@ -434,9 +432,12 @@ func (conn *Conn) writeWithReliability(b []byte, rel reliability) (n int, err er
 // queuedSize returns the wire bytes b occupies in the send queue, headers and
 // fragmentation included.
 func (conn *Conn) queuedSize(b []byte, rel reliability) uint32 {
-	count := splitCount(len(b), conn.effectiveMTU())
+	mtu := conn.effectiveMTU()
+	count := splitCount(len(b), mtu)
+	isSplit := packetNeedsSplit(len(b), mtu)
+	rel = splitReliability(rel, isSplit)
 	// Fragment payloads sum to len(b), and every fragment costs the same header.
-	return uint32(len(b) + count*(encapsulatedPacketSize(0, rel, count > 1)+4))
+	return uint32(len(b) + count*(encapsulatedPacketSize(0, rel, isSplit)+4))
 }
 
 // write writes a buffer b over the RakNet connection. The amount of bytes
@@ -445,18 +446,22 @@ func (conn *Conn) queuedSize(b []byte, rel reliability) uint32 {
 // simultaneously from multiple goroutines, but will write one by one. Unlike
 // Write, write will not lock.
 func (conn *Conn) write(b []byte, rel reliability, control bool) (n int, err error) {
-	fragments := split(b, conn.effectiveMTU())
+	mtu := conn.effectiveMTU()
+	isSplit := packetNeedsSplit(len(b), mtu)
+	rel = splitReliability(rel, isSplit)
+	fragments := split(b, mtu)
 	var orderIndex uint24
 	if rel.sequencedOrOrdered() {
 		orderIndex = conn.orderIndex.Inc()
 	}
 
 	splitID := uint16(conn.splitID)
-	if len(fragments) > 1 {
+	if isSplit {
 		conn.splitID++
 	}
 	for splitIndex, content := range fragments {
 		pk := packetPool.Get().(*packet)
+		pk.next = nil
 		if cap(pk.content) < len(content) {
 			pk.content = make([]byte, len(content))
 		}
@@ -471,9 +476,7 @@ func (conn *Conn) write(b []byte, rel reliability, control bool) (n int, err err
 		if rel.reliable() {
 			pk.messageIndex = conn.messageIndex.Inc()
 		}
-		if pk.split = len(fragments) > 1; pk.split {
-			// If there were more than one fragment, the pk was split, so we
-			// need to make sure we set the appropriate fields.
+		if pk.split = isSplit; pk.split {
 			pk.splitCount = uint32(len(fragments))
 			pk.splitIndex = uint32(splitIndex)
 			pk.splitID = splitID
@@ -561,12 +564,10 @@ func (conn *Conn) closeImmediately() {
 		// The flush re-added whatever it sent.
 		conn.releaseUnacknowledged()
 		for _, datagram := range conn.sendQueue {
-			datagram.pk.content = datagram.pk.content[:0]
-			packetPool.Put(datagram.pk)
+			releasePacketChain(datagram.pk)
 		}
 		for _, datagram := range conn.controlQueue {
-			datagram.pk.content = datagram.pk.content[:0]
-			packetPool.Put(datagram.pk)
+			releasePacketChain(datagram.pk)
 		}
 		conn.controlQueue = nil
 		conn.sendQueue = nil
@@ -579,10 +580,10 @@ func (conn *Conn) closeImmediately() {
 // pool and forgets it. Only for a connection that is closing.
 func (conn *Conn) releaseUnacknowledged() {
 	for _, record := range conn.retransmission.unacknowledged {
-		record.pk.content = record.pk.content[:0]
-		packetPool.Put(record.pk)
+		releasePacketChain(record.pk)
 	}
 	clear(conn.retransmission.unacknowledged)
+	conn.retransmission.pendingFrames = 0
 }
 
 func (conn *Conn) sendDisconnect() error {
@@ -947,8 +948,7 @@ func (conn *Conn) handleACK(b []byte, now time.Time) error {
 			metricsBytesACKed.Add(uint64(record.inFlightBytes))
 			conn.congestion.acknowledged(record.inFlightBytes)
 			conn.congestion.ack(sequenceNumber, conn.seq)
-			record.pk.content = record.pk.content[:0]
-			packetPool.Put(record.pk)
+			releasePacketChain(record.pk)
 		}
 	}
 	// The window moved, so let the send loop recompute the budget and drain.

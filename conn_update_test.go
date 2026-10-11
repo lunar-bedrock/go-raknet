@@ -59,12 +59,17 @@ func TestResendBufferCapsOutstanding(t *testing.T) {
 	if err != nil {
 		t.Fatalf("drain: %v", err)
 	}
-	if got := len(packetConn.writes); got != resendBufferSize {
-		t.Fatalf("datagrams sent: got %d, want %d", got, resendBufferSize)
+	sent := 0
+	for _, datagram := range packetConn.writes {
+		sent += len(decodeBatchFrames(t, datagram))
 	}
-	if got := len(conn.retransmission.unacknowledged); got != resendBufferSize {
-		t.Fatalf("outstanding reliable datagrams: got %d, want %d", got, resendBufferSize)
+	if sent != resendBufferSize {
+		t.Fatalf("reliable frames sent=%d, want%d", sent, resendBufferSize)
 	}
+	if conn.retransmission.pendingFrames != resendBufferSize {
+		t.Fatal("reliable resend frame bound not enforced")
+	}
+
 	if len(conn.sendQueue) != 10 {
 		t.Fatalf("queue beyond the resend buffer: got %d, want 10", len(conn.sendQueue))
 	}
