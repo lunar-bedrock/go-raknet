@@ -142,7 +142,8 @@ type Conn struct {
 	// win is an ordered queue used to track which datagrams were received and
 	// which datagrams were missing, so that we can send NACKs to request
 	// missing datagrams.
-	win *datagramWindow
+	win            *datagramWindow
+	reliableWindow reliableReceiveWindow
 
 	ackMu sync.Mutex
 	// ackSlice is a slice containing sequence numbers of datagrams that were
@@ -749,6 +750,14 @@ func (conn *Conn) handleDatagram(b []byte) error {
 			return fmt.Errorf("handle datagram: read packet: %w", err)
 		}
 		b = b[n:]
+		if conn.pk.reliability.reliable() && !conn.reliableWindow.accept(conn.pk.messageIndex) {
+			distance := (conn.pk.messageIndex - conn.reliableWindow.next) & 0xffffff
+			if distance > maxDatagramGap && distance < 1<<23 {
+				metricsReliableWindowDrops.Add(1)
+				conn.handler.log().Debug("drop reliable message outside receive window", "message_index", conn.pk.messageIndex)
+			}
+			continue
+		}
 
 		handle := conn.receivePacket
 		if conn.pk.split {
