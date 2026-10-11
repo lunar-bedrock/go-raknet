@@ -573,15 +573,6 @@ func TestOpenConnectionRejectsRepeatedReplyAboveMaxMTU(t *testing.T) {
 	requestMTU := make(chan uint16, 1)
 	go func() {
 		b := make([]byte, 2048)
-		_, addr, err := server.ReadFrom(b)
-		if err != nil {
-			return
-		}
-		repeated, _ := (&message.OpenConnectionReply1{ServerGUID: 1, MTU: maxMTUSize, Padded: true}).MarshalBinary()
-		if _, err = server.WriteTo(repeated, addr); err != nil {
-			return
-		}
-
 		n, addr, err := server.ReadFrom(b)
 		if err != nil || n == 0 || b[0] != message.IDOpenConnectionRequest2 {
 			return
@@ -591,7 +582,13 @@ func TestOpenConnectionRejectsRepeatedReplyAboveMaxMTU(t *testing.T) {
 			return
 		}
 		requestMTU <- request.MTU
-		reply, _ := (&message.OpenConnectionReply2{ServerGUID: 1, ClientAddress: netip.MustParseAddrPort("127.0.0.1:1"), MTU: request.MTU}).MarshalBinary()
+		repeated, _ := (&message.OpenConnectionReply1{ServerGUID: 1, MTU: maxMTUSize, Padded: true}).MarshalBinary()
+		if _, err = server.WriteTo(repeated, addr); err != nil {
+			return
+		}
+		// Complete the existing exchange without requiring an independent retry.
+		// Accepting the oversized repeated grant would now raise the final MTU.
+		reply, _ := (&message.OpenConnectionReply2{ServerGUID: 1, ClientAddress: netip.MustParseAddrPort("127.0.0.1:1"), MTU: maxMTUSize}).MarshalBinary()
 		_, _ = server.WriteTo(reply, addr)
 	}()
 

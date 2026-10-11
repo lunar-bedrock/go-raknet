@@ -478,11 +478,13 @@ func (state *connState) request1(ctx context.Context, sizes []uint16) {
 	})
 }
 
-// openConnection sends open connection request 2 packets continuously
-// until it receives an open connection reply 2 packet from the server.
+// openConnection answers each accepted Reply 1 grant with one Request 2,
+// then waits for Reply 2 while the separate Request 1 ladder continues.
 func (state *connState) openConnection(ctx context.Context) error {
-	stopRequests := state.startRequest2(ctx)
-	defer func() { stopRequests() }()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	state.openConnectionRequest2(state.mtu, state.serverSecurity, state.cookie)
 	maxMTU := clampMTU(state.maxMTU, minSupportedMTU)
 
 	b := make([]byte, maxMTUSize)
@@ -510,12 +512,10 @@ func (state *connState) openConnection(ctx context.Context) error {
 			if pk.ServerGUID == 0 || pk.MTU < minMTUSize || pk.MTU > maxMTU {
 				continue
 			}
-			// Adopt the repeated reply's cookie and advertised MTU together
-			// so the next Request 2 matches the latest grant.
+			// Answer the repeated reply immediately with its cookie and MTU.
 			state.serverSecurity, state.cookie = pk.ServerHasSecurity, pk.Cookie
 			state.mtu = pk.MTU
-			stopRequests()
-			stopRequests = state.startRequest2(ctx)
+			state.openConnectionRequest2(state.mtu, state.serverSecurity, state.cookie)
 		case message.IDOpenConnectionReply2:
 			pk := &message.OpenConnectionReply2{}
 			if err = pk.UnmarshalBinary(b[1:n]); err != nil {
@@ -526,40 +526,6 @@ func (state *connState) openConnection(ctx context.Context) error {
 				state.mtu = min(state.mtu, pk.MTU)
 			}
 			return nil
-		}
-	}
-}
-
-// startRequest2 starts retries with a snapshot of the current grant and cookie.
-// The returned function cancels and joins the sender before its replacement starts.
-func (state *connState) startRequest2(ctx context.Context) func() {
-	ctx, cancel := context.WithCancel(ctx)
-	done := make(chan struct{})
-	mtu, security, cookie := state.mtu, state.serverSecurity, state.cookie
-	go func() {
-		defer close(done)
-		state.request2(ctx, mtu, security, cookie)
-	}()
-	return func() {
-		cancel()
-		<-done
-	}
-}
-
-// request2 continuously sends a message.OpenConnectionRequest2 every 500ms.
-func (state *connState) request2(ctx context.Context, mtu uint16, serverSecurity bool, cookie uint32) {
-	ticker := time.NewTicker(time.Second / 2)
-	defer ticker.Stop()
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-		state.openConnectionRequest2(mtu, serverSecurity, cookie)
-		select {
-		case <-ticker.C:
-			continue
-		case <-ctx.Done():
-			return
 		}
 	}
 }
