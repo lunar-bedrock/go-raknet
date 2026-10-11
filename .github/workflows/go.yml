@@ -1,29 +1,55 @@
 name: Go
-on: [push]
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     name: Build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
+      - name: Check out code
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
-          go-version: '1.26.x'
-        id: go
+          go-version: stable
 
-      - name: Check out code into the Go module directory
-        uses: actions/checkout@v6
-
-      - name: Vet
-        run: go vet ./...
-
-      - name: Staticcheck
-        run: |
-          GOBIN=$PWD/bin go install honnef.co/go/tools/cmd/staticcheck@2026.2.1
-          ./bin/staticcheck ./...
-
-      - name: Test local transport behavior
-        run: go test -race ./... -skip '^(TestPing|TestPingWithCustomDialer|TestDial|TestDialWithCustomDialer|ExamplePing)$'
+      - name: Test
+        run: go test -race ./...
 
       - name: Build
-        run: go build -o raknet_exe -v .
+        run: go build ./...
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: stable
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.14.0
