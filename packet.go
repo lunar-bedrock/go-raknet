@@ -213,10 +213,9 @@ const (
 	splitAdditionalSize = 4 + 2 + 4
 )
 
-// packetNeedsSplit compares payload bits, including byte rounding, with the
-// remaining byte budget. This also admits single-fragment split envelopes.
+// packetNeedsSplit reports whether the payload exceeds one fragment in bytes.
 func packetNeedsSplit(n int, mtu uint16) bool {
-	return n > (int(mtu)-splitHeaderBudget-7)/8
+	return n > fragmentSize(mtu)
 }
 
 // fragmentSize returns the payload ceiling within the negotiated UDP budget.
@@ -224,7 +223,7 @@ func fragmentSize(mtu uint16) int {
 	return int(mtu) - splitHeaderBudget
 }
 
-// splitCount returns the number of payload fragments, including a single split.
+// splitCount returns the number of fragments needed to carry the payload.
 func splitCount(n int, mtu uint16) int {
 	maxSize := fragmentSize(mtu)
 	return n/maxSize + min(n%maxSize, 1)

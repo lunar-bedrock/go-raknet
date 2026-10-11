@@ -49,8 +49,8 @@ func TestOutboundFragmentBoundaries(t *testing.T) {
 		lastUnsplit, fragment int
 		lengths               []int
 	}{
-		{1400, 166, 1340, []int{166, 167, 1340, 1341, 1358, 1359}},
-		{1492, 178, 1432, []int{178, 179, 1432, 1433}},
+		{1400, 1340, 1340, []int{166, 167, 1000, 1340, 1341, 1358, 1359}},
+		{1492, 1432, 1432, []int{178, 179, 1000, 1432, 1433}},
 	} {
 		for _, family := range []string{"ipv4", "ipv6"} {
 			for _, size := range tc.lengths {
@@ -97,21 +97,19 @@ func TestOutboundSplitIDProgression(t *testing.T) {
 			defer cancel()
 			conn.mtu = 1400
 			conn.splitID = initial
-			frames := sendFragmentTest(t, conn, socket, 166, reliabilityReliableOrdered)
-			if frames[0].split {
-				t.Fatal("small message was split")
+			frames := sendFragmentTest(t, conn, socket, 1340, reliabilityReliableOrdered)
+			if len(frames) != 1 || frames[0].split {
+				t.Fatal("message at the fragment boundary was split")
 			}
-			frames = sendFragmentTest(t, conn, socket, 167, reliabilityReliableOrdered)
-			if !frames[0].split || frames[0].splitID != uint16(initial) || frames[0].orderIndex != 1 || frames[0].messageIndex != 1 {
-				t.Fatalf("single-fragment split envelope: %+v", frames[0])
-			}
-			frames = sendFragmentTest(t, conn, socket, 1341, reliabilityReliableOrdered)
-			if len(frames) != 2 {
-				t.Fatalf("multi-fragment count: %d", len(frames))
-			}
-			for i, frame := range frames {
-				if !frame.split || frame.splitID != uint16(initial+1) || frame.orderIndex != 2 || frame.messageIndex != uint24(i+2) {
-					t.Fatalf("multi-fragment %d envelope: %+v", i, frame)
+			for message := range 2 {
+				frames = sendFragmentTest(t, conn, socket, 1341, reliabilityReliableOrdered)
+				if len(frames) != 2 {
+					t.Fatalf("fragment count: %d", len(frames))
+				}
+				for i, frame := range frames {
+					if !frame.split || frame.splitID != uint16(initial+uint32(message)) || frame.orderIndex != uint24(message+1) || frame.messageIndex != uint24(1+message*2+i) {
+						t.Fatalf("message %d fragment %d envelope: %+v", message, i, frame)
+					}
 				}
 			}
 		})
@@ -126,13 +124,13 @@ func TestOutboundSplitReliabilityPromotion(t *testing.T) {
 		{"unreliable", reliabilityUnreliable, reliabilityReliable},
 		{"sequenced", reliabilityUnreliableSequenced, reliabilityReliableSequenced},
 	} {
-		for _, size := range []int{166, 167, 1341} {
+		for _, size := range []int{166, 167, 1000, 1340, 1341} {
 			t.Run(fmt.Sprintf("%s/bytes%d", tc.name, size), func(t *testing.T) {
 				conn, socket, cancel := newSendTestConn()
 				defer cancel()
 				conn.mtu = 1400
 				want := tc.input
-				if size > 166 {
+				if size > 1340 {
 					want = tc.split
 				}
 				frames := sendFragmentTest(t, conn, socket, size, tc.input)
@@ -149,30 +147,28 @@ func TestOutboundSplitReliabilityPromotion(t *testing.T) {
 	}
 }
 
-func TestOutboundSingleSplitQueueBudget(t *testing.T) {
+func TestOutboundFragmentQueueBudget(t *testing.T) {
 	for _, rel := range []reliability{reliabilityUnreliable, reliabilityUnreliableSequenced, reliabilityReliableOrdered} {
-		t.Run(fmt.Sprint(rel), func(t *testing.T) {
-			conn, _, cancel := newSendTestConn()
-			defer cancel()
-			conn.mtu = 1400
-			payload := make([]byte, 167)
-			wantRel := rel
-			if rel == reliabilityUnreliable {
-				wantRel = reliabilityReliable
-			}
-			if rel == reliabilityUnreliableSequenced {
-				wantRel = reliabilityReliableSequenced
-			}
-			want := uint32(encapsulatedPacketSize(len(payload), wantRel, true) + 4)
-			if got := conn.queuedSize(payload, rel); got != want {
-				t.Fatalf("reserved bytes: got %d, want %d", got, want)
-			}
-			if _, err := conn.write(payload, rel, false); err != nil {
-				t.Fatal(err)
-			}
-			if conn.sendQueueBytes != want {
-				t.Fatalf("queued bytes: got %d, want %d", conn.sendQueueBytes, want)
-			}
-		})
+		for _, size := range []int{167, 1340, 1341} {
+			t.Run(fmt.Sprintf("reliability%d/bytes%d", rel, size), func(t *testing.T) {
+				conn, _, cancel := newSendTestConn()
+				defer cancel()
+				conn.mtu = 1400
+				payload := make([]byte, size)
+				reserved := conn.queuedSize(payload, rel)
+				if _, err := conn.write(payload, rel, false); err != nil {
+					t.Fatal(err)
+				}
+				var wireBytes uint32
+				for _, datagram := range conn.sendQueue {
+					var wire bytes.Buffer
+					datagram.pk.write(&wire)
+					wireBytes += uint32(wire.Len() + 4)
+				}
+				if reserved != wireBytes || conn.sendQueueBytes != wireBytes {
+					t.Fatalf("wire bytes %d, reserved %d, queued %d", wireBytes, reserved, conn.sendQueueBytes)
+				}
+			})
+		}
 	}
 }
