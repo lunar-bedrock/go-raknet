@@ -472,11 +472,7 @@ func (state *connState) request1(ctx context.Context, sizes []uint16) {
 	if !timer.Stop() {
 		<-timer.C
 	}
-	sendMTUProbes(ctx, sizes, func(size uint16) (time.Duration, error) {
-		started := time.Now()
-		err := state.openConnectionRequest1(size)
-		return time.Since(started), err
-	}, func(delay time.Duration) bool {
+	sendMTUProbes(ctx, sizes, state.openConnectionRequest1, func(delay time.Duration) bool {
 		if ctx.Err() != nil {
 			return false
 		}
@@ -578,10 +574,11 @@ func (state *connState) request2(ctx context.Context, mtu uint16, serverSecurity
 
 // openConnectionRequest1 sends an open connection request 1 packet to the
 // server. If not successful, an error is returned.
-func (state *connState) openConnectionRequest1(mtu uint16) error {
+func (state *connState) openConnectionRequest1(mtu uint16) (time.Duration, error) {
 	data, _ := (&message.OpenConnectionRequest1{ClientProtocol: protocolVersion, MTU: mtu}).MarshalBinary()
+	started := time.Now()
 	_, err := state.conn.Write(data)
-	return err
+	return time.Since(started), err
 }
 
 // openConnectionRequest2 sends an open connection request 2 packet to the
