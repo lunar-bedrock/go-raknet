@@ -69,6 +69,9 @@ const (
 	// duplicated.
 	reliabilityReliableSequenced
 
+	// reliabilityReceiptOrdered carries an ordering header on the wire.
+	reliabilityReceiptOrdered reliability = 7
+
 	// splitFlag is set in the header if the packet was split. If so, the
 	// encapsulation contains additional data about the fragment.
 	splitFlag = 0x10
@@ -98,6 +101,11 @@ func (r reliability) sequencedOrOrdered() bool {
 	return r.sequenced() || r == reliabilityReliableOrdered
 }
 
+// hasOrderingHeader distinguishes wire framing from receive-delivery semantics.
+func (r reliability) hasOrderingHeader() bool {
+	return r.sequencedOrOrdered() || r == reliabilityReceiptOrdered
+}
+
 // packet is an encapsulation around every packet sent after the connection is
 // established.
 type packet struct {
@@ -106,6 +114,7 @@ type packet struct {
 	messageIndex  uint24
 	sequenceIndex uint24
 	orderIndex    uint24
+	orderChannel  byte
 
 	content []byte
 
@@ -132,8 +141,7 @@ func (pk *packet) write(buf *bytes.Buffer) {
 	}
 	if pk.reliability.sequencedOrOrdered() {
 		writeUint24(buf, pk.orderIndex)
-		// Order channel, we don't care about this.
-		buf.WriteByte(0)
+		buf.WriteByte(pk.orderChannel)
 	}
 	if pk.split {
 		writeUint32(buf, pk.splitCount)
@@ -175,7 +183,7 @@ func (pk *packet) read(b []byte) (int, error) {
 		offset += 3
 	}
 
-	if pk.reliability.sequencedOrOrdered() {
+	if pk.reliability.hasOrderingHeader() {
 		if len(b)-offset < 4 {
 			return 0, io.ErrUnexpectedEOF
 		}
@@ -183,6 +191,7 @@ func (pk *packet) read(b []byte) (int, error) {
 		if b[offset+3] >= orderChannelCount {
 			return 0, fmt.Errorf("packet order channel %d is out of range", b[offset+3])
 		}
+		pk.orderChannel = b[offset+3]
 		offset += 4
 	}
 

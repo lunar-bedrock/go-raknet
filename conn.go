@@ -40,6 +40,8 @@ const (
 	// maxWindowSize bounds the ordered packet queue, whose entries cannot be
 	// dropped without a delivery gap; overflowing it closes the connection.
 	maxWindowSize = 2048
+	// maxOrderedQueueBytes bounds retained payloads across all ordering streams.
+	maxOrderedQueueBytes = 16 << 20
 
 	// maxSplitCount allows large packets from third-party servers. Vanilla
 	// accepts 2048 fragments; Cloudburst's limit is 8192.
@@ -140,7 +142,8 @@ type Conn struct {
 	// win is an ordered queue used to track which datagrams were received and
 	// which datagrams were missing, so that we can send NACKs to request
 	// missing datagrams.
-	win *datagramWindow
+	win            *datagramWindow
+	reliableWindow reliableReceiveWindow
 
 	ackMu sync.Mutex
 	// ackSlice is a slice containing sequence numbers of datagrams that were
@@ -157,9 +160,9 @@ type Conn struct {
 	// a batch that no further traffic follows is not left until the next tick.
 	ackTimer *time.Timer
 
-	// packetQueue is an ordered queue containing packets indexed by their order
-	// index.
-	packetQueue *packetQueue
+	// packetQueues retain independent ordered receive streams by channel.
+	packetQueues      [orderChannelCount]*packetQueue
+	orderedQueueBytes int
 	// packets is a channel containing content of packets that were fully
 	// processed. Calling Conn.Read() consumes a value from this channel.
 	packets *internal.ElasticChan[[]byte]
@@ -202,7 +205,6 @@ func newConn(conn net.PacketConn, raddr net.Addr, mtu uint16, h connectionHandle
 		packets:        internal.Chan[[]byte](4, 4096),
 		splits:         make(map[uint16]splitEntry),
 		win:            newDatagramWindow(),
-		packetQueue:    newPacketQueue(),
 		retransmission: newRecoveryQueue(),
 		congestion:     newCongestionWindow(mtu - 28),
 		sendQueueFreed: make(chan struct{}),
@@ -748,6 +750,9 @@ func (conn *Conn) handleDatagram(b []byte) error {
 			return fmt.Errorf("handle datagram: read packet: %w", err)
 		}
 		b = b[n:]
+		if conn.pk.reliability.reliable() && !conn.reliableWindow.accept(conn.pk.messageIndex) {
+			continue
+		}
 
 		handle := conn.receivePacket
 		if conn.pk.split {
@@ -755,31 +760,6 @@ func (conn *Conn) handleDatagram(b []byte) error {
 		}
 		if err := handle(conn.pk); err != nil {
 			return fmt.Errorf("handle datagram: receive packet: %w", err)
-		}
-	}
-	return nil
-}
-
-// receivePacket handles the receiving of a packet. It puts the packet in the
-// queue and takes out all packets that were obtainable after that, and handles
-// them.
-func (conn *Conn) receivePacket(packet *packet) error {
-	if packet.reliability != reliabilityReliableOrdered {
-		// If it isn't a reliable ordered packet, handle it immediately.
-		return conn.handlePacket(packet.content)
-	}
-	if !conn.packetQueue.put(packet.orderIndex, packet.content) {
-		// An ordered packet arrived twice.
-		return nil
-	}
-	if conn.packetQueue.WindowSize() > maxWindowSize {
-		// An acknowledged ordered packet can't be dropped without a gap, so an
-		// overflowing ordered window closes the connection instead of trimming.
-		return fmt.Errorf("packet queue window size is too big (%v-%v)", conn.packetQueue.lowest, conn.packetQueue.highest)
-	}
-	for _, content := range conn.packetQueue.fetch() {
-		if err := conn.handlePacket(content); err != nil {
-			return err
 		}
 	}
 	return nil
