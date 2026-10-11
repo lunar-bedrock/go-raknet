@@ -474,12 +474,25 @@ func (state *connState) discoverMTU() error {
 
 // request1 drives MTU probes with cancellable timers and measured socket writes.
 func (state *connState) request1(ctx context.Context, sizes []uint16) {
+	state.request1WithSender(ctx, sizes, state.openConnectionRequest1)
+}
+
+// request1WithSender owns retry deadlines; send reports only its socket-write duration.
+func (state *connState) request1WithSender(ctx context.Context, sizes []uint16, send func(uint16) (time.Duration, error)) {
 	timer := time.NewTimer(time.Hour)
 	defer timer.Stop()
 	if !timer.Stop() {
 		<-timer.C
 	}
-	sendMTUProbes(ctx, sizes, state.openConnectionRequest1, func(delay time.Duration) bool {
+	var deadline time.Time
+	sendMTUProbes(ctx, sizes, func(size uint16) (time.Duration, error) {
+		deadline = time.Now().Add(mtuProbeInterval)
+		return send(size)
+	}, func(delay time.Duration) bool {
+		// Urgent transitions yield; ordinary retries keep the pre-send deadline.
+		if delay > mtuProbeWakeInterval {
+			delay = max(mtuProbeWakeInterval, time.Until(deadline))
+		}
 		if ctx.Err() != nil {
 			return false
 		}
