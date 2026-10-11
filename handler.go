@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"math"
 	"net"
+	"net/netip"
 	"sync/atomic"
 	"time"
 
@@ -21,9 +22,10 @@ type connectionHandler interface {
 }
 
 type listenerConnectionHandler struct {
-	l            *Listener
-	cookieSalt   *atomic.Uint64
-	previousSalt *atomic.Uint64
+	localAddresses []netip.Addr
+	l              *Listener
+	cookieSalt     *atomic.Uint64
+	previousSalt   *atomic.Uint64
 }
 
 var (
@@ -149,7 +151,7 @@ func (h listenerConnectionHandler) handleOpenConnectionRequest2(b []byte, addr n
 	// nonsense request to the unproven maximum.
 	mtuSize := max(min(pk.MTU, h.l.maxMTU()), minMTUSize)
 
-	data, _ := (&message.OpenConnectionReply2{ServerGUID: h.l.id, ClientAddress: resolve(addr), MTU: mtuSize}).MarshalBinary()
+	data, _ := (&message.OpenConnectionReply2{ServerGUID: h.l.id, ClientAddress: resolveForWire(addr), MTU: mtuSize}).MarshalBinary()
 	if _, err := h.l.conn.WriteTo(data, addr); err != nil {
 		return fmt.Errorf("send OPEN_CONNECTION_REPLY_2: %w", err)
 	}
@@ -213,8 +215,8 @@ func (h listenerConnectionHandler) handleConnectionRequest(conn *Conn, b []byte)
 		return fmt.Errorf("read CONNECTION_REQUEST: %w", err)
 	}
 	return conn.send(&message.ConnectionRequestAccepted{
-		ClientAddress:   resolve(conn.raddr),
-		SystemAddresses: message.NewLocalSystemAddresses(resolve(conn.conn.LocalAddr())),
+		ClientAddress:   resolveForWire(conn.raddr),
+		SystemAddresses: message.NewResolvedSystemAddresses(resolve(conn.conn.LocalAddr()).Port(), h.localAddresses),
 		PingTime:        pk.RequestTime,
 		PongTime:        timestamp(),
 	})
@@ -232,7 +234,10 @@ func (h listenerConnectionHandler) handleNewIncomingConnection(conn *Conn) error
 	return nil
 }
 
-type dialerConnectionHandler struct{ l *slog.Logger }
+type dialerConnectionHandler struct {
+	l              *slog.Logger
+	localAddresses []netip.Addr
+}
 
 func (h dialerConnectionHandler) log() *slog.Logger {
 	return h.l
@@ -278,8 +283,8 @@ func (h dialerConnectionHandler) handleConnectionRequestAccepted(conn *Conn, b [
 	default:
 		// Make sure to send NewIncomingConnection before closing conn.connected.
 		err := conn.send(&message.NewIncomingConnection{
-			ServerAddress:   resolve(conn.raddr),
-			SystemAddresses: message.NewSystemAddresses(resolve(conn.conn.LocalAddr())),
+			ServerAddress:   resolveForWire(conn.raddr),
+			SystemAddresses: message.NewResolvedSystemAddresses(resolve(conn.conn.LocalAddr()).Port(), h.localAddresses),
 			PingTime:        pk.PongTime,
 			PongTime:        timestamp(),
 		})

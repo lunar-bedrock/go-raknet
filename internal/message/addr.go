@@ -3,9 +3,13 @@ package message
 import (
 	"encoding/binary"
 	"net/netip"
+	"strconv"
 )
 
-type systemAddresses [20]netip.AddrPort
+// SystemAddressCount is the number of entries in a connected-handshake address list.
+const SystemAddressCount = 20
+
+type systemAddresses [SystemAddressCount]netip.AddrPort
 
 // NewSystemAddresses returns a fixed RakNet system address list filled with the addresses passed.
 func NewSystemAddresses(addrs ...netip.AddrPort) systemAddresses {
@@ -15,28 +19,6 @@ func NewSystemAddresses(addrs ...netip.AddrPort) systemAddresses {
 			break
 		}
 		addresses[i] = addr
-	}
-	return addresses
-}
-
-// NewLocalSystemAddresses returns the internal address list used during
-// connection setup, preserving the address family used by the connection.
-func NewLocalSystemAddresses(local netip.AddrPort) systemAddresses {
-	var (
-		first netip.Addr
-		zero  netip.Addr
-	)
-	if local.Addr().Is6() {
-		first = netip.IPv6Loopback()
-		zero = netip.IPv6Unspecified()
-	} else {
-		first = netip.MustParseAddr("127.0.0.1")
-		zero = netip.IPv4Unspecified()
-	}
-
-	addresses := NewSystemAddresses(netip.AddrPortFrom(first, 0))
-	for i := 1; i < len(addresses); i++ {
-		addresses[i] = netip.AddrPortFrom(zero, 0)
 	}
 	return addresses
 }
@@ -79,9 +61,13 @@ func putAddr(b []byte, addrPort netip.AddrPort) int {
 		b[0] = 6
 		binary.LittleEndian.PutUint16(b[1:], uint16(23)) // syscall.AF_INET6 on Windows.
 		binary.BigEndian.PutUint16(b[3:], port)
-		// 4 bytes.
+		binary.LittleEndian.PutUint32(b[5:], 0)
 		copy(b[9:], ip16[:])
-		// 4 bytes.
+		scope, err := strconv.ParseUint(addr.Zone(), 10, 32)
+		if err != nil {
+			scope = 0
+		}
+		binary.LittleEndian.PutUint32(b[25:], uint32(scope))
 		return sizeofAddr6
 	}
 }
@@ -94,6 +80,9 @@ func addr(b []byte) (netip.AddrPort, int) {
 	} else {
 		port := binary.BigEndian.Uint16(b[3:])
 		ip := netip.AddrFrom16([16]byte(b[9:]))
+		if scope := binary.LittleEndian.Uint32(b[25:]); scope != 0 {
+			ip = ip.WithZone(strconv.FormatUint(uint64(scope), 10))
+		}
 		return netip.AddrPortFrom(ip, port), sizeofAddr6
 	}
 }
