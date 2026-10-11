@@ -25,7 +25,7 @@ func NewResolvedSystemAddresses(port uint16, ips []netip.Addr) systemAddresses {
 	}
 	for first := 0; first < count-1 && first < SystemAddressCount-2; first++ {
 		selected := first
-		for next := first + 1; next < count && next < SystemAddressCount-2; next++ {
+		for next := first + 1; next < count && next < SystemAddressCount-1; next++ {
 			if systemAddressBefore(addresses[next].Addr(), addresses[first].Addr()) {
 				selected = next
 			}

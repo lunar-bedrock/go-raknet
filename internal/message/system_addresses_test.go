@@ -49,10 +49,8 @@ func TestResolvedSystemAddressesCapAdmissionAndPreserveTail(t *testing.T) {
 		ips[i] = netip.MustParseAddr(fmt.Sprintf("192.0.2.%d", SystemAddressCount+1-i))
 	}
 	addresses := NewResolvedSystemAddresses(32123, ips)
-	for i := SystemAddressCount - 2; i < SystemAddressCount; i++ {
-		if addresses[i].Addr() != ips[i] {
-			t.Fatalf("tail %d moved: %v", i, addresses[i])
-		}
+	if addresses[SystemAddressCount-1].Addr() != ips[SystemAddressCount-1] {
+		t.Fatalf("last address moved: %v", addresses[SystemAddressCount-1])
 	}
 	for _, address := range addresses {
 		if address.Addr() == ips[SystemAddressCount] || address.Port() != 32123 {
@@ -63,6 +61,35 @@ func TestResolvedSystemAddressesCapAdmissionAndPreserveTail(t *testing.T) {
 	addresses = NewResolvedSystemAddresses(0, []netip.Addr{duplicate, duplicate})
 	if addresses[0].Addr() != duplicate || addresses[1].Addr() != duplicate {
 		t.Fatal("duplicate resolver entries were removed")
+	}
+}
+
+func TestResolvedSystemAddressesSortNineteenthAddress(t *testing.T) {
+	for _, count := range []int{SystemAddressCount - 1, SystemAddressCount} {
+		t.Run(fmt.Sprintf("count_%d", count), func(t *testing.T) {
+			ips := make([]netip.Addr, count)
+			for i := range ips {
+				ips[i] = netip.MustParseAddr("192.0.2.1")
+			}
+			ips[SystemAddressCount-3] = netip.MustParseAddr("192.0.2.200")
+			ips[SystemAddressCount-2] = netip.MustParseAddr("192.0.2.100")
+			if count == SystemAddressCount {
+				// The twentieth address remains outside the sorting window even
+				// when it would outrank every other admitted address.
+				ips[SystemAddressCount-1] = netip.MustParseAddr("192.0.2.0")
+			}
+			addresses := NewResolvedSystemAddresses(32123, ips)
+			for i, ip := range ips {
+				if i == SystemAddressCount-3 {
+					ip = ips[SystemAddressCount-2]
+				} else if i == SystemAddressCount-2 {
+					ip = ips[SystemAddressCount-3]
+				}
+				if want := netip.AddrPortFrom(ip, 32123); addresses[i] != want {
+					t.Fatalf("address %d = %v, want %v", i, addresses[i], want)
+				}
+			}
+		})
 	}
 }
 
