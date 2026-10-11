@@ -107,7 +107,8 @@ type Dialer struct {
 	MaxTransientErrors int
 
 	// MaxMTU caps the largest MTU value used during the connection
-	// handshake. If zero, probes start at the maximum supported MTU.
+	// handshake and connected datagrams. Zero uses the maximum supported MTU.
+	// A nonzero limit below the supported minimum of 576 returns an error.
 	//
 	// Set this to your local interface MTU when it is below 1500 (for
 	// example 1400 on hosts behind a tunnel or VPN). With the default,
@@ -231,6 +232,9 @@ func (dialer Dialer) DialTimeout(address string, timeout time.Duration) (*Conn, 
 // can take. DialContext will terminate as soon as possible when the
 // context.Context is closed.
 func (dialer Dialer) DialContext(ctx context.Context, address string) (*Conn, error) {
+	if dialer.MaxMTU != 0 && dialer.MaxMTU < minSupportedMTU {
+		return nil, dialer.error("dial", fmt.Errorf("MaxMTU %d is below the supported minimum %d", dialer.MaxMTU, minSupportedMTU))
+	}
 	if dialer.ErrorLog == nil {
 		dialer.ErrorLog = slog.New(slog.NewTextHandler(os.Stdout, nil))
 	}
@@ -538,10 +542,8 @@ func (state *connState) openConnection(ctx context.Context) error {
 				}
 				return fmt.Errorf("read open connection reply 2: %w", err)
 			}
-			if pk.MTU >= minMTUSize {
-				// Reply 2 may lower the MTU from the Reply 1 grant.
-				state.mtu = min(state.mtu, pk.MTU)
-			}
+			// Reply 2 selects the connected budget independently of Reply 1.
+			state.mtu = min(max(pk.MTU, minSupportedMTU), maxMTU)
 			return nil
 		}
 	}
