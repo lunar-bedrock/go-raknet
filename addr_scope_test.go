@@ -40,3 +40,10 @@ func TestResolveIPv6ZoneUsesLocalInterfaceIndex(t *testing.T) {
 		t.Fatal("nil UDP endpoint resolved to valid address")
 	}
 }
+
+func TestResolveRetainsNamedIPv6ZoneWithoutInterfaceLookup(t *testing.T) {
+	got := resolve(&net.UDPAddr{IP: net.ParseIP("fe80::20"), Port: 32123, Zone: "synthetic-interface"})
+	if want := netip.MustParseAddrPort("[fe80::20%synthetic-interface]:32123"); got != want {
+		t.Fatalf("resolved = %v, want %v", got, want)
+	}
+}

@@ -784,7 +784,7 @@ func (conn *Conn) handlePacket(b []byte) error {
 	return nil
 }
 
-// resolve converts a UDP endpoint and its local interface zone to wire address data.
+// resolve converts a UDP endpoint without looking up local interfaces.
 func resolve(addr net.Addr) netip.AddrPort {
 	if udpAddr, ok := addr.(*net.UDPAddr); ok && udpAddr != nil {
 		uaddr := *udpAddr
@@ -793,7 +793,7 @@ func resolve(addr net.Addr) netip.AddrPort {
 			ip = ip.Unmap()
 		}
 		if ip.Is6() {
-			ip = numericIPv6Zone(ip.WithZone(uaddr.Zone))
+			ip = ip.WithZone(uaddr.Zone)
 		}
 		return netip.AddrPortFrom(ip, uint16(uaddr.Port))
 	}

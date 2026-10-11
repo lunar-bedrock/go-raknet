@@ -35,3 +35,9 @@ func resolveIPv6Zone(ip netip.Addr, index func(string) (int, error)) netip.Addr 
 	}
 	return ip.WithZone(strconv.FormatUint(uint64(scope), 10))
 }
+
+// resolveForWire converts a UDP endpoint's interface name only when serializing it.
+func resolveForWire(addr net.Addr) netip.AddrPort {
+	resolved := resolve(addr)
+	return netip.AddrPortFrom(numericIPv6Zone(resolved.Addr()), resolved.Port())
+}
