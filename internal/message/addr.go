@@ -5,7 +5,10 @@ import (
 	"net/netip"
 )
 
-type systemAddresses [20]netip.AddrPort
+// SystemAddressCount is the number of entries in a connected-handshake address list.
+const SystemAddressCount = 20
+
+type systemAddresses [SystemAddressCount]netip.AddrPort
 
 // NewSystemAddresses returns a fixed RakNet system address list filled with the addresses passed.
 func NewSystemAddresses(addrs ...netip.AddrPort) systemAddresses {
@@ -15,28 +18,6 @@ func NewSystemAddresses(addrs ...netip.AddrPort) systemAddresses {
 			break
 		}
 		addresses[i] = addr
-	}
-	return addresses
-}
-
-// NewLocalSystemAddresses returns the internal address list used during
-// connection setup, preserving the address family used by the connection.
-func NewLocalSystemAddresses(local netip.AddrPort) systemAddresses {
-	var (
-		first netip.Addr
-		zero  netip.Addr
-	)
-	if local.Addr().Is6() {
-		first = netip.IPv6Loopback()
-		zero = netip.IPv6Unspecified()
-	} else {
-		first = netip.MustParseAddr("127.0.0.1")
-		zero = netip.IPv4Unspecified()
-	}
-
-	addresses := NewSystemAddresses(netip.AddrPortFrom(first, 0))
-	for i := 1; i < len(addresses); i++ {
-		addresses[i] = netip.AddrPortFrom(zero, 0)
 	}
 	return addresses
 }

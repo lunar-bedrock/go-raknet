@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -273,6 +274,7 @@ func (dialer Dialer) DialContext(ctx context.Context, address string) (*Conn, er
 		ticker:             time.NewTicker(time.Second / 2),
 		maxTransientErrors: dialer.MaxTransientErrors,
 		maxMTU:             dialer.MaxMTU,
+		localAddresses:     resolveLocalAddresses(ctx, conn.LocalAddr(), dialer.ErrorLog),
 	}
 	defer cs.ticker.Stop()
 	if err = cs.negotiate(ctx); err != nil {
@@ -284,7 +286,7 @@ func (dialer Dialer) DialContext(ctx context.Context, address string) (*Conn, er
 // dial finishes the RakNet connection sequence and returns a Conn if
 // successful.
 func (dialer Dialer) connect(ctx context.Context, state *connState) (*Conn, error) {
-	conn := newConn(internal.ConnToPacketConn(state.conn), state.raddr, state.mtu, dialerConnectionHandler{l: dialer.ErrorLog})
+	conn := newConn(internal.ConnToPacketConn(state.conn), state.raddr, state.mtu, dialerConnectionHandler{l: dialer.ErrorLog, localAddresses: state.localAddresses})
 	if err := conn.sendReliable((&message.ConnectionRequest{ClientGUID: state.id, RequestTime: timestamp()})); err != nil {
 		return nil, dialer.error("dial", fmt.Errorf("send connection request: %w", err))
 	}
@@ -350,9 +352,10 @@ func (dialer Dialer) clientListen(rakConn *Conn, conn net.Conn) {
 // connState represents a state of a connection before the connection is
 // finalised. It holds some data collected during the connection.
 type connState struct {
-	conn  net.Conn
-	raddr net.Addr
-	id    int64
+	localAddresses []netip.Addr
+	conn           net.Conn
+	raddr          net.Addr
+	id             int64
 
 	// mtu is advertised by Reply 1 and finalized by Reply 2.
 	mtu uint16
