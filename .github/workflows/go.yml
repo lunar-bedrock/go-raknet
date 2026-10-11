@@ -8,7 +8,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
-          go-version: '1.26.x'
+          go-version: stable
         id: go
 
       - name: Check out code into the Go module directory
@@ -23,7 +23,7 @@ jobs:
           ./bin/staticcheck ./...
 
       - name: Test local transport behavior
-        run: go test -race ./... -skip '^(TestPing|TestPingWithCustomDialer|TestDial|TestDialWithCustomDialer|ExamplePing)$'
+        run: go test -race ./... -skip '^(TestPing|TestPingWithCustomDialer|TestDial|TestDialWithCustomDialer)$'
 
       - name: Build
         run: go build -o raknet_exe -v .
