@@ -1,6 +1,12 @@
 package raknet
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
+
+// errOrderingBudget marks receive limits that cannot discard acknowledged frames safely.
+var errOrderingBudget = errors.New("ordering stream receive limit reached")
 
 // receivePacket admits ordered and sequenced packets against their independent
 // channel state; other reliabilities are delivered immediately.
@@ -21,7 +27,7 @@ func (conn *Conn) receivePacket(pk *packet) error {
 		return nil
 	}
 	if distance >= maxWindowSize {
-		return fmt.Errorf("packet queue window is too big on channel %d", pk.orderChannel)
+		return fmt.Errorf("%w: packet queue window is too big on channel %d", errOrderingBudget, pk.orderChannel)
 	}
 	if pk.reliability.sequenced() {
 		if distance == 0 {
@@ -60,10 +66,10 @@ func (conn *Conn) receivePacket(pk *packet) error {
 // canQueueOrdered enforces shared payload and per-channel metadata limits.
 func (conn *Conn) canQueueOrdered(queue *packetQueue, size int) error {
 	if len(queue.future) >= maxWindowSize {
-		return fmt.Errorf("ordering stream has too many queued packets")
+		return fmt.Errorf("%w: ordering stream has too many queued packets", errOrderingBudget)
 	}
 	if conn.orderedQueueBytes+size > maxOrderedQueueBytes {
-		return fmt.Errorf("ordered packet queues exceed %d bytes", maxOrderedQueueBytes)
+		return fmt.Errorf("%w: ordered packet queues exceed %d bytes", errOrderingBudget, maxOrderedQueueBytes)
 	}
 	return nil
 }
