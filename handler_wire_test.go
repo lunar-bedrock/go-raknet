@@ -23,7 +23,12 @@ func TestAcceptedHandshakeSendsInitialUnreliablePing(t *testing.T) {
 	if err := h.handleConnectionRequestAccepted(conn, wire[1:]); err != nil {
 		t.Fatal(err)
 	}
-	conn.update(time.Unix(1, 0))
+	conn.mu.Lock()
+	drainErr := conn.drainSendQueue(time.Unix(1, 0))
+	conn.mu.Unlock()
+	if drainErr != nil {
+		t.Fatal(drainErr)
+	}
 	var frames []packet
 	for _, datagram := range socket.writes {
 		for payload := datagram[4:]; len(payload) > 0; {
