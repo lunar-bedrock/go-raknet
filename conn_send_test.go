@@ -276,10 +276,17 @@ func TestUnreliableDatagramsConsumeSendBudget(t *testing.T) {
 	conn, packetConn, cancel := newSendTestConn()
 	defer cancel()
 
-	payload := make([]byte, int(conn.effectiveMTU())*2)
-	writeQueued(t, conn, payload, reliabilityUnreliable)
-	if got := len(packetConn.writes); got != 2 {
-		t.Fatalf("initial datagrams: got %d, want 2", got)
+	// Split admission promotes unreliable delivery, so queue small unsplit messages.
+	for range 800 {
+		if _, err := conn.write([]byte{1}, reliabilityUnreliable, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := conn.drainSendQueue(time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if len(packetConn.writes) == 0 {
+		t.Fatal("unreliable messages were not sent")
 	}
 	if conn.sendBudget != 0 {
 		t.Fatalf("send budget: got %d, want 0", conn.sendBudget)

@@ -235,55 +235,6 @@ func (conn *Conn) effectiveMTU() uint16 {
 	return conn.mtu - 28
 }
 
-// startTicking makes the connection start ticking, sending ACKs and pings to
-// the other end where necessary and checking if the connection should be timed
-// out.
-func (conn *Conn) startTicking() {
-	var (
-		interval = time.Second / 10
-		ticker   = time.NewTicker(interval)
-	)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-conn.sendSignal:
-			// Protocol activity opened the window, queued data or made a
-			// retransmission due. The client runs the same update on a 10ms
-			// timer that network activity signals early.
-			conn.flushACKs()
-			if conn.update(time.Now()) {
-				_ = conn.Close()
-			}
-		case t := <-ticker.C:
-			conn.flushACKs()
-			if conn.update(t) {
-				_ = conn.Close()
-			}
-			if unix := conn.closing.Load(); unix != 0 {
-				conn.mu.Lock()
-				acksLeft := len(conn.retransmission.unacknowledged) + len(conn.sendQueue) + len(conn.controlQueue)
-				conn.mu.Unlock()
-
-				since := t.Sub(time.Unix(unix, 0))
-				if since > time.Second*5 {
-					conn.closeImmediately()
-				} else if acksLeft == 0 {
-					if conn.disconnectSent.Load() {
-						conn.closeImmediately()
-					} else {
-						// Keep ticking so the final notification is retransmitted
-						// until acknowledged, just like the application data.
-						_ = conn.sendDisconnect()
-					}
-				}
-				continue
-			}
-		case <-conn.ctx.Done():
-			return
-		}
-	}
-}
-
 // flushACKs flushes pending datagram acknowledgements once they have been held
 // for ackDelay, batching the sequence numbers received in that window.
 func (conn *Conn) flushACKs() {
