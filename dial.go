@@ -8,6 +8,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -343,7 +344,8 @@ type connState struct {
 	serverSecurity bool
 	cookie         uint32
 
-	ticker *time.Ticker
+	ticker  *time.Ticker
+	writeMu sync.Mutex
 
 	transientErrorCount int
 	maxTransientErrors  int
@@ -572,7 +574,9 @@ func (state *connState) request2(ctx context.Context, mtu uint16, serverSecurity
 // server. If not successful, an error is returned.
 func (state *connState) openConnectionRequest1(mtu uint16) {
 	data, _ := (&message.OpenConnectionRequest1{ClientProtocol: protocolVersion, MTU: mtu}).MarshalBinary()
-	_, _ = state.conn.Write(data)
+	state.writeMu.Lock()
+	defer state.writeMu.Unlock()
+	_, _ = writeMTUProbe(state.conn, data)
 }
 
 // openConnectionRequest2 sends an open connection request 2 packet to the
@@ -585,6 +589,8 @@ func (state *connState) openConnectionRequest2(mtu uint16, serverSecurity bool, 
 		ServerHasSecurity: serverSecurity,
 		Cookie:            cookie,
 	}).MarshalBinary()
+	state.writeMu.Lock()
+	defer state.writeMu.Unlock()
 	_, _ = state.conn.Write(data)
 }
 
