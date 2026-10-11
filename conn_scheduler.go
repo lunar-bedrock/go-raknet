@@ -28,9 +28,7 @@ func (conn *Conn) startTicking() {
 		if conn.update(now) {
 			_ = conn.Close()
 		}
-		if periodic {
-			conn.updateClosing(now)
-		}
+		conn.updateClosing(now)
 		resetUpdateTimer(timer, conn.nextUpdateDelay(time.Now()), periodic)
 	}
 }

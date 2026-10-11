@@ -198,3 +198,34 @@ func TestSendLoopQuietKeepaliveDeadline(t *testing.T) {
 		<-done
 	})
 }
+
+func TestSendLoopActivityCannotStarveGracefulClose(t *testing.T) {
+	t.Setenv("GODEBUG", os.Getenv("GODEBUG")+",asynctimerchan=0")
+	synctest.Test(t, func(t *testing.T) {
+		conn, _, cancel := newSendTestConn()
+		defer cancel()
+		done := startControlledSendLoop(conn)
+		if _, err := conn.Write([]byte{0xfe}); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		if err := conn.Close(); err != nil {
+			t.Fatal(err)
+		}
+		for range 1020 {
+			advanceSendLoop(5 * time.Millisecond)
+			if conn.ctx.Err() != nil {
+				break
+			}
+			// An empty well-framed ACK supplies activity without releasing reliable data.
+			if err := conn.receive([]byte{bitFlagDatagram | bitFlagACK, 0, 0}); err != nil {
+				t.Fatal(err)
+			}
+			synctest.Wait()
+		}
+		if conn.ctx.Err() == nil {
+			t.Fatal("continued activity starved the bounded graceful close")
+		}
+		<-done
+	})
+}
