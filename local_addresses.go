@@ -18,7 +18,7 @@ func resolveLocalAddresses(ctx context.Context, local net.Addr, logger *slog.Log
 	if udp, ok := local.(*net.UDPAddr); !ok || udp == nil {
 		return nil
 	}
-	ips, err := lookupLocalAddresses(ctx, os.Hostname, net.DefaultResolver.LookupNetIP)
+	ips, err := lookupLocalAddresses(ctx, os.Hostname, lookupLocalIPAddresses)
 	if err != nil {
 		logger.Debug("local system address lookup unavailable")
 		return nil
@@ -58,4 +58,30 @@ func startLocalAddressLookup(ctx context.Context, lookup func(context.Context) [
 		<-done
 		return ips
 	}
+}
+
+// localIPAddresses converts resolver endpoints while normalizing local scope indices.
+func localIPAddresses(ips []net.IPAddr, normalize func(netip.Addr) netip.Addr) []netip.Addr {
+	addresses := make([]netip.Addr, 0, len(ips))
+	for _, endpoint := range ips {
+		ip, valid := netip.AddrFromSlice(endpoint.IP)
+		if !valid {
+			continue
+		}
+		ip = ip.Unmap()
+		if ip.Is6() {
+			ip = ip.WithZone(endpoint.Zone)
+		}
+		addresses = append(addresses, normalize(ip))
+	}
+	return addresses
+}
+
+// lookupLocalIPAddresses retains the resolver's interface zones before wire conversion.
+func lookupLocalIPAddresses(ctx context.Context, _ string, name string) ([]netip.Addr, error) {
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	return localIPAddresses(ips, numericIPv6Zone), nil
 }
