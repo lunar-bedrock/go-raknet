@@ -198,8 +198,8 @@ func (h listenerConnectionHandler) handle(conn *Conn, b []byte) (handled bool, e
 		conn.closeImmediately()
 		return true, nil
 	case message.IDDetectLostConnections:
-		// Let the other end know the connection is still alive.
-		return true, conn.send(&message.ConnectedPing{PingTime: timestamp()})
+		// The enclosing datagram acknowledgement answers the probe.
+		return true, nil
 	default:
 		return false, nil
 	}
@@ -258,8 +258,8 @@ func (h dialerConnectionHandler) handle(conn *Conn, b []byte) (handled bool, err
 		conn.closeImmediately()
 		return true, nil
 	case message.IDDetectLostConnections:
-		// Let the other end know the connection is still alive.
-		return true, conn.send(&message.ConnectedPing{PingTime: timestamp()})
+		// The enclosing datagram acknowledgement answers the probe.
+		return true, nil
 	default:
 		return false, nil
 	}
