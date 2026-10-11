@@ -108,11 +108,12 @@ func advanceOfflineScript(duration time.Duration) {
 
 // offlineScriptConn supplies synthetic peer replies and records complete writes.
 type offlineScriptConn struct {
-	mu     sync.Mutex
-	reads  chan []byte
-	writes [][]byte
-	closed chan struct{}
-	once   sync.Once
+	mu       sync.Mutex
+	reads    chan []byte
+	writes   [][]byte
+	writeErr error
+	closed   chan struct{}
+	once     sync.Once
 }
 
 // newOfflineScriptConn creates an in-memory endpoint without network I/O.
@@ -135,6 +136,9 @@ func (c *offlineScriptConn) Write(b []byte) (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.writes = append(c.writes, bytes.Clone(b))
+	if c.writeErr != nil {
+		return 0, c.writeErr
+	}
 	return len(b), nil
 }
 

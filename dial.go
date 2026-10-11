@@ -82,7 +82,8 @@ func DialTimeout(address string, timeout time.Duration) (*Conn, error) {
 // is separated with ':'. DialContext will use the deadline (ctx.Deadline) of
 // the context.Context passed for the maximum amount of time that the dialing
 // can take. DialContext will terminate as soon as possible when the
-// context.Context is closed.
+// context.Context is closed. The offline handshake also times out when its
+// MTU probe attempts are exhausted.
 func DialContext(ctx context.Context, address string) (*Conn, error) {
 	var d Dialer
 	return d.DialContext(ctx, address)
@@ -103,7 +104,7 @@ type Dialer struct {
 	// MaxTransientErrors is the maximum number of transient errors to ignore
 	// before returning an error. These include errors that can occur on
 	// bad connections such as EMSGSIZE, ECONNREFUSED, EHOSTUNREACH, ENETUNREACH, ECONNRESET.
-	// If there is no limit it will continue to retry reading until the context deadline.
+	// A value of -1 ignores these errors while handshake attempts remain.
 	// Default is 10. -1 means no limit.
 	// This is only used for the initial connection handshake.
 	MaxTransientErrors int
@@ -112,11 +113,9 @@ type Dialer struct {
 	// handshake. If zero, probes start at the maximum supported MTU.
 	//
 	// Set this to your local interface MTU when it is below 1500 (for
-	// example 1400 on hosts behind a tunnel or VPN). With the default,
-	// the kernel will fragment the first probes into two IP packets, and
-	// some firewalls drop fragmented UDP and never deliver them to the
-	// server. Capping the MTU keeps every packet inside a single IP
-	// datagram for the entire connection.
+	// example 1400 on hosts behind a tunnel or VPN). This avoids probing
+	// sizes that the local path cannot carry. Probes disable fragmentation
+	// when the underlying UDP socket supports it.
 	MaxMTU uint16
 }
 
@@ -231,7 +230,8 @@ func (dialer Dialer) DialTimeout(address string, timeout time.Duration) (*Conn, 
 // is separated with ':'. DialContext will use the deadline (ctx.Deadline) of
 // the context.Context passed for the maximum amount of time that the dialing
 // can take. DialContext will terminate as soon as possible when the
-// context.Context is closed.
+// context.Context is closed. The offline handshake also times out when its
+// MTU probe attempts are exhausted.
 func (dialer Dialer) DialContext(ctx context.Context, address string) (*Conn, error) {
 	if dialer.ErrorLog == nil {
 		dialer.ErrorLog = slog.New(slog.NewTextHandler(os.Stdout, nil))
@@ -378,13 +378,15 @@ func mtuSizesFor(maxMTU uint16) []uint16 {
 }
 
 // negotiate keeps MTU probes running until Reply 2 completes the offline handshake.
+// Exhausting the probes closes the socket after the final response window.
 // All senders stop before the connected packet reader takes over the socket.
-func (state *connState) negotiate(ctx context.Context) error {
-	ctx, cancel := context.WithCancel(ctx)
+func (state *connState) negotiate(ctx context.Context) (err error) {
+	ctx, cancel := context.WithCancelCause(ctx)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		state.request1(ctx, mtuSizesFor(state.maxMTU))
+		cancel(os.ErrDeadlineExceeded)
 	}()
 	closed := make(chan struct{})
 	stopClose := context.AfterFunc(ctx, func() {
@@ -394,8 +396,11 @@ func (state *connState) negotiate(ctx context.Context) error {
 	defer func() {
 		if !stopClose() {
 			<-closed
+			// A cancellation that closed the socket must not return success,
+			// even if Reply 2 was read at the same time.
+			err = context.Cause(ctx)
 		}
-		cancel()
+		cancel(nil)
 		<-done
 	}()
 	if err := state.discoverMTU(); err != nil {
@@ -464,8 +469,7 @@ func (state *connState) discoverMTU() error {
 }
 
 // request1 sends a message.OpenConnectionRequest1 four times for each mtu size
-// passed, spaced by 500ms, matching the vanilla client's connection-attempt
-// cadence (12 attempts across the 3 rungs, one every 500ms).
+// passed, spaced by 500ms. The final attempt gets the same response window.
 func (state *connState) request1(ctx context.Context, sizes []uint16) {
 	state.ticker.Reset(time.Second / 2)
 	sendMTUProbes(ctx, sizes, state.openConnectionRequest1, func() bool {
