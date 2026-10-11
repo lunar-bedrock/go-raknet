@@ -488,20 +488,14 @@ func (state *connState) discoverMTU() error {
 // cadence (12 attempts across the 3 rungs, one every 500ms).
 func (state *connState) request1(ctx context.Context, sizes []uint16) {
 	state.ticker.Reset(time.Second / 2)
-	for _, size := range sizes {
-		for range 4 {
-			if ctx.Err() != nil {
-				return
-			}
-			state.openConnectionRequest1(size)
-			select {
-			case <-state.ticker.C:
-				continue
-			case <-ctx.Done():
-				return
-			}
+	sendMTUProbes(ctx, sizes, state.openConnectionRequest1, func() bool {
+		select {
+		case <-state.ticker.C:
+			return true
+		case <-ctx.Done():
+			return false
 		}
-	}
+	})
 }
 
 // openConnection sends open connection request 2 packets continuously
@@ -592,11 +586,12 @@ func (state *connState) request2(ctx context.Context, mtu uint16, serverSecurity
 
 // openConnectionRequest1 sends an open connection request 1 packet to the
 // server. If not successful, an error is returned.
-func (state *connState) openConnectionRequest1(mtu uint16) {
+func (state *connState) openConnectionRequest1(mtu uint16) error {
 	data, _ := (&message.OpenConnectionRequest1{ClientProtocol: protocolVersion, MTU: mtu}).MarshalBinary()
 	state.writeMu.Lock()
 	defer state.writeMu.Unlock()
-	_, _ = writeMTUProbe(state.conn, data)
+	_, err := writeMTUProbe(state.conn, data)
+	return err
 }
 
 // openConnectionRequest2 sends an open connection request 2 packet to the
