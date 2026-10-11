@@ -54,22 +54,17 @@ func TestResendBufferCapsOutstanding(t *testing.T) {
 		conn.mu.Unlock()
 	}
 	conn.mu.Lock()
-	err := conn.drainSendQueue(time.Now())
+	err := conn.drainSendQueue()
 	conn.mu.Unlock()
 	if err != nil {
 		t.Fatalf("drain: %v", err)
 	}
-	sent := 0
-	for _, datagram := range packetConn.writes {
-		sent += len(decodeBatchFrames(t, datagram))
+	if got := len(packetConn.writes); got != resendBufferSize {
+		t.Fatalf("datagrams sent: got %d, want %d", got, resendBufferSize)
 	}
-	if sent != resendBufferSize {
-		t.Fatalf("reliable frames sent=%d, want%d", sent, resendBufferSize)
+	if got := len(conn.retransmission.unacknowledged); got != resendBufferSize {
+		t.Fatalf("outstanding reliable datagrams: got %d, want %d", got, resendBufferSize)
 	}
-	if conn.retransmission.pendingFrames != resendBufferSize {
-		t.Fatal("reliable resend frame bound not enforced")
-	}
-
 	if len(conn.sendQueue) != 10 {
 		t.Fatalf("queue beyond the resend buffer: got %d, want 10", len(conn.sendQueue))
 	}
@@ -82,12 +77,12 @@ func TestUnreliableIgnoresResendBuffer(t *testing.T) {
 	defer cancel()
 	conn.sendBudget = 1 << 20
 	for i := range resendBufferSize {
-		conn.retransmission.add(uint24(i), &packet{reliability: reliabilityReliableOrdered}, 1, time.Now())
+		conn.retransmission.add(uint24(i), &packet{reliability: reliabilityReliableOrdered}, 1)
 	}
 	conn.mu.Lock()
 	_, err := conn.write([]byte{1}, reliabilityUnreliable, false)
 	if err == nil {
-		err = conn.drainSendQueue(time.Now())
+		err = conn.drainSendQueue()
 	}
 	conn.mu.Unlock()
 	if err != nil {
@@ -104,7 +99,7 @@ func TestNACKDefersToUpdate(t *testing.T) {
 	conn, packetConn, cancel := newSendTestConn()
 	defer cancel()
 	conn.congestion.inFlight = 100
-	conn.retransmission.add(7, &packet{reliability: reliabilityReliableOrdered, content: []byte{1}}, 100, time.Now())
+	conn.retransmission.add(7, &packet{reliability: reliabilityReliableOrdered, content: []byte{1}}, 100)
 	conn.retransmission.unacknowledged[7] = resendRecord{
 		pk:            conn.retransmission.unacknowledged[7].pk,
 		inFlightBytes: 100,
@@ -142,7 +137,7 @@ func TestACKDefersToUpdate(t *testing.T) {
 
 	ackBuffer := bytes.NewBuffer(nil)
 	(&acknowledgement{packets: []uint24{0}}).write(ackBuffer, conn.effectiveMTU())
-	if err := conn.handleACK(ackBuffer.Bytes(), time.Now()); err != nil {
+	if err := conn.handleACK(ackBuffer.Bytes()); err != nil {
 		t.Fatalf("handle ACK: %v", err)
 	}
 	if got := len(packetConn.writes); got != sent {
@@ -167,7 +162,7 @@ func TestSendDatagramErrorRestoresAccounting(t *testing.T) {
 
 	pk := &packet{reliability: reliabilityReliableOrdered, content: []byte{1}}
 	conn.mu.Lock()
-	err := conn.sendDatagram(pk, 100, false, time.Now())
+	err := conn.sendDatagram(pk, 100, false)
 	conn.mu.Unlock()
 	if err == nil {
 		t.Fatal("expected an error from a failing packet conn")

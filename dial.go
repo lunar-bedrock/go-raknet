@@ -2,14 +2,13 @@ package raknet
 
 import (
 	"context"
-	"crypto/rand"
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"net"
-	"net/netip"
 	"os"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sandertv/go-raknet/internal"
@@ -158,11 +157,7 @@ func (dialer Dialer) PingContext(ctx context.Context, address string) (response 
 	}
 	defer conn.Close()
 
-	id, err := newClientGUID(rand.Reader)
-	if err != nil {
-		return nil, dialer.error("ping", err)
-	}
-	data, _ := (&message.UnconnectedPing{PingTime: timestamp(), ClientGUID: id}).MarshalBinary()
+	data, _ := (&message.UnconnectedPing{PingTime: timestamp(), ClientGUID: atomic.AddInt64(&dialerID, 1)}).MarshalBinary()
 	if _, err := conn.Write(data); err != nil {
 		return nil, dialer.error("ping", err)
 	}
@@ -204,6 +199,10 @@ func (dialer Dialer) dial(ctx context.Context, address string) (net.Conn, error)
 	return conn, nil
 }
 
+// dialerID is a counter used to produce an ID for the client.
+// This should always be negative as per the vanilla client implementation.
+var dialerID = -rand.Int64()
+
 // Dial attempts to dial a RakNet connection to the address passed. The address
 // may be either an IP address or a hostname, combined with a port that is
 // separated with ':'. Dial will attempt to dial a connection within 10
@@ -244,21 +243,12 @@ func (dialer Dialer) DialContext(ctx context.Context, address string) (*Conn, er
 	if err != nil {
 		return nil, dialer.error("dial", err)
 	}
-	id, err := newClientGUID(rand.Reader)
-	if err != nil {
-		_ = conn.Close()
-		return nil, dialer.error("dial", err)
-	}
 	dialer.ErrorLog = dialer.ErrorLog.With("src", "dialer", "raddr", conn.RemoteAddr().String())
 
-	finishAddresses := startLocalAddressLookup(ctx, func(ctx context.Context) []netip.Addr {
-		return resolveLocalAddresses(ctx, conn.LocalAddr(), dialer.ErrorLog)
-	})
-	defer finishAddresses()
 	cs := &connState{
 		conn:               conn,
 		raddr:              conn.RemoteAddr(),
-		id:                 id,
+		id:                 atomic.AddInt64(&dialerID, 1),
 		ticker:             time.NewTicker(time.Second / 2),
 		maxTransientErrors: dialer.MaxTransientErrors,
 		maxMTU:             dialer.MaxMTU,
@@ -267,15 +257,14 @@ func (dialer Dialer) DialContext(ctx context.Context, address string) (*Conn, er
 	if err = cs.negotiate(ctx); err != nil {
 		return nil, dialer.error("dial", err)
 	}
-	cs.localAddresses = finishAddresses()
 	return dialer.connect(ctx, cs)
 }
 
 // dial finishes the RakNet connection sequence and returns a Conn if
 // successful.
 func (dialer Dialer) connect(ctx context.Context, state *connState) (*Conn, error) {
-	conn := newConn(internal.ConnToPacketConn(state.conn), state.raddr, state.mtu, dialerConnectionHandler{l: dialer.ErrorLog, localAddresses: state.localAddresses})
-	if err := conn.sendReliable((&message.ConnectionRequest{ClientGUID: state.id, RequestTime: timestamp()})); err != nil {
+	conn := newConn(internal.ConnToPacketConn(state.conn), state.raddr, state.mtu, dialerConnectionHandler{l: dialer.ErrorLog})
+	if err := conn.send((&message.ConnectionRequest{ClientGUID: state.id, RequestTime: timestamp()})); err != nil {
 		return nil, dialer.error("dial", fmt.Errorf("send connection request: %w", err))
 	}
 	// dialer.ErrorLog.Debug("raknet connection request sent",
@@ -340,10 +329,9 @@ func (dialer Dialer) clientListen(rakConn *Conn, conn net.Conn) {
 // connState represents a state of a connection before the connection is
 // finalised. It holds some data collected during the connection.
 type connState struct {
-	localAddresses []netip.Addr
-	conn           net.Conn
-	raddr          net.Addr
-	id             int64
+	conn  net.Conn
+	raddr net.Addr
+	id    int64
 
 	// mtu is advertised by Reply 1 and finalized by Reply 2.
 	mtu uint16
@@ -355,8 +343,7 @@ type connState struct {
 	serverSecurity bool
 	cookie         uint32
 
-	ticker  *time.Ticker
-	writeMu sync.Mutex
+	ticker *time.Ticker
 
 	transientErrorCount int
 	maxTransientErrors  int
@@ -479,23 +466,27 @@ func (state *connState) discoverMTU() error {
 // cadence (12 attempts across the 3 rungs, one every 500ms).
 func (state *connState) request1(ctx context.Context, sizes []uint16) {
 	state.ticker.Reset(time.Second / 2)
-	sendMTUProbes(ctx, sizes, state.openConnectionRequest1, func() bool {
-		select {
-		case <-state.ticker.C:
-			return true
-		case <-ctx.Done():
-			return false
+	for _, size := range sizes {
+		for range 4 {
+			if ctx.Err() != nil {
+				return
+			}
+			state.openConnectionRequest1(size)
+			select {
+			case <-state.ticker.C:
+				continue
+			case <-ctx.Done():
+				return
+			}
 		}
-	})
+	}
 }
 
-// openConnection answers each accepted Reply 1 grant with one Request 2,
-// then waits for Reply 2 while the separate Request 1 ladder continues.
+// openConnection sends open connection request 2 packets continuously
+// until it receives an open connection reply 2 packet from the server.
 func (state *connState) openConnection(ctx context.Context) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	state.openConnectionRequest2(state.mtu, state.serverSecurity, state.cookie)
+	stopRequests := state.startRequest2(ctx)
+	defer func() { stopRequests() }()
 	maxMTU := clampMTU(state.maxMTU, minSupportedMTU)
 
 	b := make([]byte, maxMTUSize)
@@ -523,10 +514,12 @@ func (state *connState) openConnection(ctx context.Context) error {
 			if pk.ServerGUID == 0 || pk.MTU < minMTUSize || pk.MTU > maxMTU {
 				continue
 			}
-			// Answer the repeated reply immediately with its cookie and MTU.
+			// Adopt the repeated reply's cookie and advertised MTU together
+			// so the next Request 2 matches the latest grant.
 			state.serverSecurity, state.cookie = pk.ServerHasSecurity, pk.Cookie
 			state.mtu = pk.MTU
-			state.openConnectionRequest2(state.mtu, state.serverSecurity, state.cookie)
+			stopRequests()
+			stopRequests = state.startRequest2(ctx)
 		case message.IDOpenConnectionReply2:
 			pk := &message.OpenConnectionReply2{}
 			if err = pk.UnmarshalBinary(b[1:n]); err != nil {
@@ -541,28 +534,57 @@ func (state *connState) openConnection(ctx context.Context) error {
 	}
 }
 
+// startRequest2 starts retries with a snapshot of the current grant and cookie.
+// The returned function cancels and joins the sender before its replacement starts.
+func (state *connState) startRequest2(ctx context.Context) func() {
+	ctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	mtu, security, cookie := state.mtu, state.serverSecurity, state.cookie
+	go func() {
+		defer close(done)
+		state.request2(ctx, mtu, security, cookie)
+	}()
+	return func() {
+		cancel()
+		<-done
+	}
+}
+
+// request2 continuously sends a message.OpenConnectionRequest2 every 500ms.
+func (state *connState) request2(ctx context.Context, mtu uint16, serverSecurity bool, cookie uint32) {
+	ticker := time.NewTicker(time.Second / 2)
+	defer ticker.Stop()
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		state.openConnectionRequest2(mtu, serverSecurity, cookie)
+		select {
+		case <-ticker.C:
+			continue
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
 // openConnectionRequest1 sends an open connection request 1 packet to the
 // server. If not successful, an error is returned.
-func (state *connState) openConnectionRequest1(mtu uint16) error {
+func (state *connState) openConnectionRequest1(mtu uint16) {
 	data, _ := (&message.OpenConnectionRequest1{ClientProtocol: protocolVersion, MTU: mtu}).MarshalBinary()
-	state.writeMu.Lock()
-	defer state.writeMu.Unlock()
-	_, err := writeMTUProbe(state.conn, data)
-	return err
+	_, _ = state.conn.Write(data)
 }
 
 // openConnectionRequest2 sends an open connection request 2 packet to the
 // server. If not successful, an error is returned.
 func (state *connState) openConnectionRequest2(mtu uint16, serverSecurity bool, cookie uint32) {
 	data, _ := (&message.OpenConnectionRequest2{
-		ServerAddress:     resolveForWire(state.raddr),
+		ServerAddress:     resolve(state.raddr),
 		MTU:               mtu,
 		ClientGUID:        state.id,
 		ServerHasSecurity: serverSecurity,
 		Cookie:            cookie,
 	}).MarshalBinary()
-	state.writeMu.Lock()
-	defer state.writeMu.Unlock()
 	_, _ = state.conn.Write(data)
 }
 

@@ -114,7 +114,7 @@ func TestReceiveDatagramDropsFarAhead(t *testing.T) {
 // ordered packet cannot be dropped without a gap, so this closes rather than
 // trims.
 func TestReceivePacketBoundsOrderedWindow(t *testing.T) {
-	conn := &Conn{handler: dialerConnectionHandler{}}
+	conn := &Conn{packetQueue: newPacketQueue(), handler: dialerConnectionHandler{}}
 	pk := &packet{
 		reliability: reliabilityReliableOrdered,
 		orderIndex:  maxWindowSize + 1,
