@@ -3,7 +3,6 @@ package raknet
 import (
 	"context"
 	"crypto/rand"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -11,7 +10,6 @@ import (
 	"net/netip"
 	"os"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/sandertv/go-raknet/internal"
@@ -160,7 +158,11 @@ func (dialer Dialer) PingContext(ctx context.Context, address string) (response 
 	}
 	defer conn.Close()
 
-	data, _ := (&message.UnconnectedPing{PingTime: timestamp(), ClientGUID: nextClientGUID(&dialerID)}).MarshalBinary()
+	id, err := newClientGUID(rand.Reader)
+	if err != nil {
+		return nil, dialer.error("ping", err)
+	}
+	data, _ := (&message.UnconnectedPing{PingTime: timestamp(), ClientGUID: id}).MarshalBinary()
 	if _, err := conn.Write(data); err != nil {
 		return nil, dialer.error("ping", err)
 	}
@@ -200,29 +202,6 @@ func (dialer Dialer) dial(ctx context.Context, address string) (net.Conn, error)
 		_ = conn.SetDeadline(deadline)
 	}
 	return conn, nil
-}
-
-const (
-	clientGUIDPayloadMask int64 = 1<<62 - 1
-	clientGUIDTypeBits    int64 = -1 << 63
-)
-
-// dialerID is the randomly seeded counter used to produce client GUIDs.
-var dialerID = newClientGUIDSeed()
-
-// newClientGUIDSeed starts the counter from eight cryptographically random bytes.
-func newClientGUIDSeed() int64 {
-	var seed [8]byte
-	if _, err := rand.Read(seed[:]); err != nil {
-		panic(fmt.Errorf("generate client GUID seed: %w", err))
-	}
-	return int64(binary.LittleEndian.Uint64(seed[:]))
-}
-
-// nextClientGUID advances counter atomically and returns a GUID with the top
-// two bits set to 10. Its lower 62 bits remain unique for a full counter cycle.
-func nextClientGUID(counter *int64) int64 {
-	return atomic.AddInt64(counter, 1)&clientGUIDPayloadMask | clientGUIDTypeBits
 }
 
 // Dial attempts to dial a RakNet connection to the address passed. The address
@@ -265,6 +244,11 @@ func (dialer Dialer) DialContext(ctx context.Context, address string) (*Conn, er
 	if err != nil {
 		return nil, dialer.error("dial", err)
 	}
+	id, err := newClientGUID(rand.Reader)
+	if err != nil {
+		_ = conn.Close()
+		return nil, dialer.error("dial", err)
+	}
 	dialer.ErrorLog = dialer.ErrorLog.With("src", "dialer", "raddr", conn.RemoteAddr().String())
 
 	finishAddresses := startLocalAddressLookup(ctx, func(ctx context.Context) []netip.Addr {
@@ -274,7 +258,7 @@ func (dialer Dialer) DialContext(ctx context.Context, address string) (*Conn, er
 	cs := &connState{
 		conn:               conn,
 		raddr:              conn.RemoteAddr(),
-		id:                 nextClientGUID(&dialerID),
+		id:                 id,
 		ticker:             time.NewTicker(time.Second / 2),
 		maxTransientErrors: dialer.MaxTransientErrors,
 		maxMTU:             dialer.MaxMTU,

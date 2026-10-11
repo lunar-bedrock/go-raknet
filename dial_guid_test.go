@@ -1,43 +1,72 @@
 package raknet
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/binary"
-	"math"
+	"errors"
+	"io"
 	"net"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/sandertv/go-raknet/internal/message"
 )
 
-func TestPingClientGUIDFormatAcrossCounterBoundaries(t *testing.T) {
-	original := atomic.LoadInt64(&dialerID)
-	t.Cleanup(func() { atomic.StoreInt64(&dialerID, original) })
-	for _, seed := range []int64{0, clientGUIDPayloadMask - 1, clientGUIDPayloadMask, math.MaxInt64, -1} {
-		atomic.StoreInt64(&dialerID, seed)
-		seen := make(map[int64]struct{}, 4)
-		for range 4 {
+func TestPingClientGUIDUsesFreshEntropy(t *testing.T) {
+	entropy := make([]byte, 16)
+	binary.LittleEndian.PutUint64(entropy[:8], 0x1122334455667788)
+	binary.LittleEndian.PutUint64(entropy[8:], 0xffeeddccbbaa0099)
+	source := bytes.NewReader(entropy)
+	original := rand.Reader
+	rand.Reader = source
+	t.Cleanup(func() { rand.Reader = original })
+	for i := range 2 {
+		conn := &guidPingConn{}
+		dialer := Dialer{UpstreamDialer: guidPingDialer{conn: conn}}
+		if _, err := dialer.PingContext(context.Background(), "127.0.0.1:19132"); err != nil {
+			t.Fatal(err)
+		}
+		var ping message.UnconnectedPing
+		if err := ping.UnmarshalBinary(conn.packet[1:]); err != nil {
+			t.Fatal(err)
+		}
+		want := int64(binary.LittleEndian.Uint64(entropy[i*8:]))&clientGUIDPayloadMask | clientGUIDTypeBits
+		if ping.ClientGUID != want {
+			t.Fatalf("peer %d GUID=%016x, want fresh entropy %016x", i, uint64(ping.ClientGUID), uint64(want))
+		}
+		if !conn.closed {
+			t.Fatal("ping socket remained open")
+		}
+	}
+	if source.Len() != 0 {
+		t.Fatalf("unused entropy bytes=%d", source.Len())
+	}
+}
+
+func TestClientGUIDEntropyFailureClosesSocket(t *testing.T) {
+	original := rand.Reader
+	rand.Reader = bytes.NewReader([]byte{1})
+	t.Cleanup(func() { rand.Reader = original })
+	for _, operation := range []string{"ping", "dial"} {
+		t.Run(operation, func(t *testing.T) {
+			rand.Reader = bytes.NewReader([]byte{1})
 			conn := &guidPingConn{}
 			dialer := Dialer{UpstreamDialer: guidPingDialer{conn: conn}}
-			if _, err := dialer.PingContext(context.Background(), "127.0.0.1:19132"); err != nil {
-				t.Fatal(err)
+			var err error
+			if operation == "ping" {
+				_, err = dialer.PingContext(context.Background(), "127.0.0.1:19132")
+			} else {
+				_, err = dialer.DialContext(context.Background(), "127.0.0.1:19132")
 			}
-			var ping message.UnconnectedPing
-			if err := ping.UnmarshalBinary(conn.packet[1:]); err != nil {
-				t.Fatal(err)
+			if !errors.Is(err, io.ErrUnexpectedEOF) {
+				t.Fatalf("entropy failure: %v", err)
 			}
-			if uint64(ping.ClientGUID)>>62 != 2 {
-				t.Fatalf("seed %d: GUID %016x has prefix %02b, want 10",
-					seed, uint64(ping.ClientGUID), uint64(ping.ClientGUID)>>62)
+			if !conn.closed || len(conn.packet) != 0 {
+				t.Fatal("entropy failure did not close socket before sending")
 			}
-			if _, exists := seen[ping.ClientGUID]; exists {
-				t.Fatalf("seed %d: repeated GUID %016x", seed, uint64(ping.ClientGUID))
-			}
-			seen[ping.ClientGUID] = struct{}{}
-		}
+		})
 	}
 }
 
@@ -48,7 +77,10 @@ func (d guidPingDialer) DialContext(context.Context, string, string) (net.Conn, 
 	return d.conn, nil
 }
 
-type guidPingConn struct{ packet []byte }
+type guidPingConn struct {
+	packet []byte
+	closed bool
+}
 
 // Write records the outbound ping for its wire assertions.
 func (c *guidPingConn) Write(b []byte) (int, error) {
@@ -66,38 +98,9 @@ func (c *guidPingConn) Read(b []byte) (int, error) {
 	return copy(b, data), nil
 }
 
-func (*guidPingConn) Close() error                     { return nil }
+func (c *guidPingConn) Close() error                   { c.closed = true; return nil }
 func (*guidPingConn) LocalAddr() net.Addr              { return &net.UDPAddr{} }
 func (*guidPingConn) RemoteAddr() net.Addr             { return &net.UDPAddr{} }
 func (*guidPingConn) SetDeadline(time.Time) error      { return nil }
 func (*guidPingConn) SetReadDeadline(time.Time) error  { return nil }
 func (*guidPingConn) SetWriteDeadline(time.Time) error { return nil }
-
-func TestClientGUIDConcurrentUniquenessAcrossCounterBoundary(t *testing.T) {
-	for _, seed := range []int64{clientGUIDPayloadMask - 1, math.MaxInt64 - 1, -2} {
-		counter := seed
-		const workers, perWorker = 16, 64
-		ids := make([]int64, workers*perWorker)
-		var wg sync.WaitGroup
-		for worker := range workers {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for i := range perWorker {
-					ids[worker*perWorker+i] = nextClientGUID(&counter)
-				}
-			}()
-		}
-		wg.Wait()
-		seen := make(map[int64]struct{}, len(ids))
-		for _, id := range ids {
-			if uint64(id)>>62 != 2 {
-				t.Fatalf("seed %d: GUID %016x has incorrect type bits", seed, uint64(id))
-			}
-			if _, exists := seen[id]; exists {
-				t.Fatalf("seed %d: duplicate GUID %016x", seed, uint64(id))
-			}
-			seen[id] = struct{}{}
-		}
-	}
-}
