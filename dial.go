@@ -603,7 +603,7 @@ func (state *connState) openConnectionRequest1(mtu uint16) {
 // server. If not successful, an error is returned.
 func (state *connState) openConnectionRequest2(mtu uint16, serverSecurity bool, cookie uint32) {
 	data, _ := (&message.OpenConnectionRequest2{
-		ServerAddress:     resolve(state.raddr),
+		ServerAddress:     resolveForWire(state.raddr),
 		MTU:               mtu,
 		ClientGUID:        state.id,
 		ServerHasSecurity: serverSecurity,

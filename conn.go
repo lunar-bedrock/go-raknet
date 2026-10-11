@@ -784,12 +784,16 @@ func (conn *Conn) handlePacket(b []byte) error {
 	return nil
 }
 
+// resolve converts a UDP endpoint without looking up local interfaces.
 func resolve(addr net.Addr) netip.AddrPort {
-	if udpAddr, ok := addr.(*net.UDPAddr); ok {
+	if udpAddr, ok := addr.(*net.UDPAddr); ok && udpAddr != nil {
 		uaddr := *udpAddr
 		ip, _ := netip.AddrFromSlice(uaddr.IP)
 		if ip.Is4In6() {
 			ip = ip.Unmap()
+		}
+		if ip.Is6() {
+			ip = ip.WithZone(uaddr.Zone)
 		}
 		return netip.AddrPortFrom(ip, uint16(uaddr.Port))
 	}
