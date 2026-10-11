@@ -13,6 +13,7 @@ func NewResolvedSystemAddresses(port uint16, ips []netip.Addr) systemAddresses {
 	var addresses systemAddresses
 	count := 0
 	for _, ip := range ips {
+		ip = ip.Unmap()
 		if !ip.IsValid() || ip.IsUnspecified() {
 			continue
 		}

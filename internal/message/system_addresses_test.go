@@ -65,3 +65,16 @@ func TestResolvedSystemAddressesCapAdmissionAndPreserveTail(t *testing.T) {
 		t.Fatal("duplicate resolver entries were removed")
 	}
 }
+
+func TestResolvedSystemAddressesNormalizeMappedIPv4(t *testing.T) {
+	ips := []netip.Addr{netip.MustParseAddr("::ffff:0.0.0.0"), netip.MustParseAddr("::ffff:192.0.2.20"), netip.MustParseAddr("192.0.2.5"), netip.MustParseAddr("2001:db8::20")}
+	addresses := NewResolvedSystemAddresses(32123, ips)
+	for i, want := range []string{"[2001:db8::20]:32123", "192.0.2.5:32123", "192.0.2.20:32123"} {
+		if addresses[i] != netip.MustParseAddrPort(want) {
+			t.Fatalf("address %d = %v, want %s", i, addresses[i], want)
+		}
+	}
+	if addresses[3].IsValid() {
+		t.Fatal("mapped unspecified address was admitted")
+	}
+}
