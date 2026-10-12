@@ -4,6 +4,10 @@ import (
 	"time"
 )
 
+// resendRetryDelay is how soon a record that is already due is retried when a
+// pass leaves it unsent, matching the client's longest wait between updates.
+const resendRetryDelay = time.Millisecond * 10
+
 // resendMap is a map of packets, used to recover datagrams if the other end of
 // the connection ended up not having them.
 type resendMap struct {
@@ -14,6 +18,11 @@ type resendMap struct {
 	// deadline is a lower bound on the earliest nextSend of any record. It lets
 	// a frequently woken send loop skip the scan when nothing is due yet.
 	deadline time.Time
+	// timer calls wake at deadline, so a resend goes out when due rather than
+	// on the next tick.
+	timer   *time.Timer
+	timerAt time.Time // when timer fires; zero while unarmed
+	wake    func()
 }
 
 // resendRecord represents a single packet with a timestamp from when it was
@@ -25,10 +34,12 @@ type resendRecord struct {
 	nextSend      time.Time
 }
 
-// newRecoveryQueue returns a new initialised recovery queue.
-func newRecoveryQueue() *resendMap {
+// newRecoveryQueue returns a new initialised recovery queue that calls wake
+// once a resend becomes due. wake may be nil.
+func newRecoveryQueue(wake func()) *resendMap {
 	return &resendMap{
 		unacknowledged: make(map[uint24]resendRecord),
+		wake:           wake,
 	}
 }
 
@@ -46,7 +57,37 @@ func (m *resendMap) add(index uint24, pk *packet, inFlightBytes uint32) {
 // lowerDeadline keeps deadline a lower bound on every record's nextSend.
 func (m *resendMap) lowerDeadline(t time.Time) {
 	if m.deadline.IsZero() || t.Before(m.deadline) {
-		m.deadline = t
+		m.setDeadline(t)
+	}
+}
+
+// setDeadline replaces deadline and makes sure the timer fires by then.
+func (m *resendMap) setDeadline(t time.Time) {
+	m.deadline = t
+	m.armTimer()
+}
+
+// armTimer makes sure the timer fires by deadline. A timer that fires earlier
+// leads to an update that is not due, which must call armTimer again.
+func (m *resendMap) armTimer() {
+	if m.wake == nil || m.deadline.IsZero() {
+		return
+	}
+	now := time.Now()
+	if m.timerAt.After(now) && !m.timerAt.After(m.deadline) {
+		return
+	}
+	delay, at := m.deadline.Sub(now), m.deadline
+	if delay <= 0 {
+		// Already due: whoever made it due signals the send loop. Retry shortly
+		// rather than spin if that pass cannot send it.
+		delay, at = resendRetryDelay, now.Add(resendRetryDelay)
+	}
+	m.timerAt = at
+	if m.timer == nil {
+		m.timer = time.AfterFunc(delay, m.wake)
+	} else {
+		m.timer.Reset(delay)
 	}
 }
 
