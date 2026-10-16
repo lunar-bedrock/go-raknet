@@ -41,6 +41,21 @@ func (c *ElasticChan[T]) Recv(ctx context.Context) (val T, ok bool) {
 	}
 }
 
+// TryRecv drains one queued value without waiting for another sender.
+func (c *ElasticChan[T]) TryRecv() (val T, ok bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	select {
+	case val = <-c.ch:
+		if c.len.Add(-1) < 0 {
+			panic("unreachable")
+		}
+		return val, true
+	default:
+		return val, false
+	}
+}
+
 // Send sends a value to the channel. Send never blocks, because if the maximum
 // capacity of the underlying channel is reached, a larger one is created.
 func (c *ElasticChan[T]) Send(val T) {
