@@ -86,3 +86,27 @@ func TestPingerSkipsOtherDatagrams(t *testing.T) {
 		t.Fatalf("ReadPong() = %q, %v, want MCPE", got.Data, err)
 	}
 }
+
+// A pong larger than one MTU arrives whole.
+func TestPingerReadsLargePongs(t *testing.T) {
+	l, err := Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer l.Close()
+	data := bytes.Repeat([]byte("x"), 2000)
+	l.PongData(data)
+	p, err := ListenPinger("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPinger: %v", err)
+	}
+	defer p.Close()
+	if err := p.Ping(l.Addr()); err != nil {
+		t.Fatalf("Ping: %v", err)
+	}
+	_ = p.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	got, err := p.ReadPong()
+	if err != nil || !bytes.Equal(got.Data, data) {
+		t.Fatalf("ReadPong() = %d bytes, %v, want %d", len(got.Data), err, len(data))
+	}
+}

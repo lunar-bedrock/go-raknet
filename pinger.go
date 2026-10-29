@@ -54,7 +54,8 @@ func (p *Pinger) Ping(addr net.Addr) error {
 // ReadPong blocks until the next unconnected pong arrives, skipping any other datagram. It
 // returns an error once the Pinger is closed.
 func (p *Pinger) ReadPong() (Pong, error) {
-	b := make([]byte, maxMTUSize)
+	// A pong may carry more data than fits one MTU; read up to the largest UDP payload.
+	b := make([]byte, 65535)
 	for {
 		n, addr, err := p.conn.ReadFrom(b)
 		if err != nil {
