@@ -173,6 +173,16 @@ func (dialer Dialer) PingContext(ctx context.Context, address string) (response 
 	data = make([]byte, maxMTUSize)
 	n, err := conn.Read(data)
 	if err != nil {
+		// On deadline expiry the AfterFunc close can beat the socket deadline, turning a timeout
+		// into net.ErrClosed. Restore the ctx-driven classification so a deadline still reports a
+		// timeout (os.ErrDeadlineExceeded) and a cancellation reports its own cause.
+		if errors.Is(err, net.ErrClosed) && ctx.Err() != nil {
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				err = os.ErrDeadlineExceeded
+			} else {
+				err = ctx.Err()
+			}
+		}
 		return nil, dialer.error("ping", err)
 	}
 	if n == 0 || data[0] != message.IDUnconnectedPong {

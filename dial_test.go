@@ -2,6 +2,7 @@ package raknet_test
 
 import (
 	"context"
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -9,10 +10,9 @@ import (
 	"github.com/sandertv/go-raknet"
 )
 
-// A ping to a server that never pongs must end when ctx is cancelled, even with no deadline set,
-// or the goroutine and UDP socket leak until the deadline expires (or forever without one).
-func TestPingContextStopsOnCancel(t *testing.T) {
-	// A UDP socket that receives the ping but never replies.
+// A ping that ends on deadline expiry must still classify as a timeout, even though the socket is
+// also closed when the context ends; Ping/PingTimeout document a lost reply as a timeout.
+func TestPingContextDeadlineReportsTimeout(t *testing.T) {
 	silent, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -27,11 +27,48 @@ func TestPingContextStopsOnCancel(t *testing.T) {
 		}
 	}()
 
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	_, err = raknet.PingContext(ctx, silent.LocalAddr().String())
+	var netErr net.Error
+	if !errors.As(err, &netErr) || !netErr.Timeout() {
+		t.Fatalf("deadline ping error = %v, want a timeout error", err)
+	}
+}
+
+// A ping to a server that never pongs must end when ctx is cancelled, even with no deadline set,
+// or the goroutine and UDP socket leak until the deadline expires (or forever without one).
+func TestPingContextStopsOnCancel(t *testing.T) {
+	// A UDP socket that receives the ping but never replies.
+	silent, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer silent.Close()
+	pinged := make(chan struct{}, 1)
+	go func() {
+		buf := make([]byte, 1500)
+		for {
+			if _, _, err := silent.ReadFrom(buf); err != nil {
+				return
+			}
+			select {
+			case pinged <- struct{}{}:
+			default:
+			}
+		}
+	}()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { _, err := raknet.PingContext(ctx, silent.LocalAddr().String()); done <- err }()
 
-	time.Sleep(50 * time.Millisecond) // let the ping send and block on Read.
+	// Cancel only once the ping has actually been sent, so the read (not the dial) is what unblocks.
+	select {
+	case <-pinged:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ping was never sent")
+	}
 	cancel()
 
 	select {
