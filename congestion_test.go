@@ -2,11 +2,17 @@ package raknet
 
 import "testing"
 
+// A new connection may send four MTUs before its first ACK.
+func TestCongestionWindowInitialBudget(t *testing.T) {
+	c := newCongestionWindow(1200)
+	if got := c.transmissionBandwidth(); got != 4*1200 {
+		t.Fatalf("initial bandwidth: got %d, want %d", got, 4*1200)
+	}
+}
+
 func TestCongestionWindowSlowStart(t *testing.T) {
 	c := newCongestionWindow(1200)
-	if got := c.transmissionBandwidth(); got != 1200 {
-		t.Fatalf("initial bandwidth: got %d, want 1200", got)
-	}
+	c.window = 1200
 	c.sent(900)
 	if got := c.transmissionBandwidth(); got != 300 {
 		t.Fatalf("remaining bandwidth: got %d, want 300", got)
@@ -68,8 +74,9 @@ func TestCongestionWindowCrossesThreshold(t *testing.T) {
 
 func TestCongestionWindowDoesNotGrowWhileIdle(t *testing.T) {
 	c := newCongestionWindow(1200)
+	initial := c.window
 	c.ack(1, 2)
-	if c.window != 1200 {
+	if c.window != initial {
 		t.Fatalf("idle window grew to %f", c.window)
 	}
 }

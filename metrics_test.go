@@ -109,7 +109,7 @@ func TestMetricsSnapshotRetainsReliableSendCounters(t *testing.T) {
 		mtu:            maxMTUSize,
 		handler:        dialerConnectionHandler{l: slog.New(slog.NewTextHandler(io.Discard, nil))},
 		buf:            bytes.NewBuffer(make([]byte, 0, maxMTUSize-28)),
-		retransmission: newRecoveryQueue(),
+		retransmission: newRecoveryQueue(nil),
 		congestion:     newCongestionWindow(maxMTUSize - 28),
 	}
 	pk := &packet{content: []byte{1, 2, 3}, reliability: reliabilityReliableOrdered}
@@ -140,7 +140,7 @@ func TestMetricsSnapshotRetainsRetransmitCounters(t *testing.T) {
 		mtu:            maxMTUSize,
 		handler:        dialerConnectionHandler{l: slog.New(slog.NewTextHandler(io.Discard, nil))},
 		buf:            bytes.NewBuffer(make([]byte, 0, maxMTUSize-28)),
-		retransmission: newRecoveryQueue(),
+		retransmission: newRecoveryQueue(nil),
 		congestion:     newCongestionWindow(maxMTUSize - 28),
 	}
 	pk := &packet{content: []byte{1, 2, 3}, reliability: reliabilityReliableOrdered}

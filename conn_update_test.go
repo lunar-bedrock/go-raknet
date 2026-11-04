@@ -249,3 +249,41 @@ func TestPendingACKsWakeSendLoop(t *testing.T) {
 		t.Fatal("ACKs were woken before the batching window elapsed")
 	}
 }
+
+// An unacknowledged reliable datagram is resent at its deadline by the resend
+// timer alone, not on the next tick.
+func TestResendTimerWakesSendLoop(t *testing.T) {
+	conn, packetConn, cancel := newSendTestConn()
+	defer cancel()
+	conn.retransmission = newRecoveryQueue(conn.signalSend)
+	conn.retransmission.observeRTT(time.Millisecond)
+
+	writeQueued(t, conn, []byte{1}, reliabilityReliableOrdered)
+	select {
+	case <-conn.sendSignal:
+	default:
+	}
+	conn.mu.Lock()
+	record, ok := conn.retransmission.unacknowledged[0]
+	timerAt := conn.retransmission.timerAt
+	conn.mu.Unlock()
+	if !ok {
+		t.Fatal("reliable datagram not tracked for resend")
+	}
+	if !timerAt.Equal(record.nextSend) {
+		t.Fatalf("resend timer armed for %v, want the record's nextSend %v", timerAt, record.nextSend)
+	}
+
+	select {
+	case <-conn.sendSignal:
+	case <-time.After(time.Second):
+		t.Fatal("resend timer did not wake the send loop")
+	}
+	if now := time.Now(); now.Before(record.nextSend) {
+		t.Fatalf("send loop woken %v before the deadline", record.nextSend.Sub(now))
+	}
+	conn.update(time.Now())
+	if got := len(packetConn.writes); got != 2 {
+		t.Fatalf("datagrams after the deadline: got %d, want 2", got)
+	}
+}
