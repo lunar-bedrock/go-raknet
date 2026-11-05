@@ -325,6 +325,14 @@ func (dialer Dialer) clientListen(rakConn *Conn, conn net.Conn) {
 			if errors.Is(err, net.ErrClosed) {
 				return
 			}
+			if isUnreachableError(err) {
+				rakConn.markUnreachable(err)
+				if rakConn.closing.Load() != 0 {
+					rakConn.closeImmediately()
+					return
+				}
+				continue
+			}
 			if errors.Is(err, errSplitBudget) {
 				rakConn.closeImmediately()
 				return

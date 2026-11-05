@@ -108,6 +108,9 @@ type Conn struct {
 
 	closing        atomic.Int64
 	disconnectSent atomic.Bool
+	// unreachable is set by the first ICMP error that says datagrams no longer reach
+	// the peer. A closing connection then stops waiting for acknowledgements.
+	unreachable atomic.Bool
 
 	ctx        context.Context
 	cancelFunc context.CancelFunc
@@ -265,7 +268,7 @@ func (conn *Conn) startTicking() {
 				conn.mu.Unlock()
 
 				since := t.Sub(time.Unix(unix, 0))
-				if since > time.Second*5 {
+				if since > time.Second*5 || conn.unreachable.Load() {
 					conn.closeImmediately()
 				} else if acksLeft == 0 {
 					if conn.disconnectSent.Load() {
@@ -1128,10 +1131,30 @@ func (conn *Conn) sendDatagram(pk *packet, size uint32, retransmit bool) error {
 func (conn *Conn) writeTo(p []byte, raddr net.Addr) error {
 	if _, err := conn.conn.WriteTo(p, raddr); errors.Is(err, net.ErrClosed) {
 		return fmt.Errorf("write to: %w", err)
+	} else if _, dialed := conn.handler.(dialerConnectionHandler); dialed && isUnreachableError(err) {
+		// Only a dialed connection owns its socket: a listener's socket is shared, so an
+		// ICMP error there may belong to another peer.
+		conn.markUnreachable(err)
 	} else if err != nil {
 		conn.handler.log().Error("write to: "+err.Error(), "raddr", raddr.String())
 	}
 	return nil
+}
+
+// markUnreachable records an ICMP error saying datagrams no longer reach the peer. On a
+// connected socket every later resend and ping draws another one, so only the first is
+// logged, at debug level. An open connection still ends through its ping timeout, because
+// such errors can be transient; a closing one closes at its next tick.
+func (conn *Conn) markUnreachable(err error) {
+	if conn.unreachable.CompareAndSwap(false, true) {
+		conn.handler.log().Debug("peer unreachable: "+err.Error(), "raddr", conn.raddr.String())
+	}
+}
+
+// isUnreachableError reports whether err is an ICMP error from a connected UDP socket that
+// says the peer cannot be reached. An oversized datagram is an MTU problem, not that.
+func isUnreachableError(err error) bool {
+	return isTransientUDPReadError(err) && !isMTUProbeSizeError(err)
 }
 
 // SystemUptime estimates the remote system's uptime from its connection request.
