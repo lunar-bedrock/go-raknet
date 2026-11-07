@@ -148,14 +148,18 @@ func (dialer Dialer) PingTimeout(address string, timeout time.Duration) ([]byte,
 // If the ping failed, an error is returned describing the failure. Note that
 // the packet sent to the server may be lost due to the nature of UDP. If this
 // is the case, PingContext could last indefinitely, hence a timeout should
-// always be attached to the context passed. PingContext cancels as soon as the
-// deadline expires.
+// always be attached to the context passed. PingContext stops as soon as the
+// deadline expires or ctx is cancelled.
 func (dialer Dialer) PingContext(ctx context.Context, address string) (response []byte, err error) {
 	conn, err := dialer.dial(ctx, address)
 	if err != nil {
 		return nil, dialer.error("ping", err)
 	}
 	defer conn.Close()
+	// dial sets only the socket deadline, so a blocked Read ignores ctx cancellation. Closing the
+	// connection when ctx ends unblocks the Read, so a cancelled ping stops at once instead of
+	// leaking the goroutine and socket until the deadline (or forever when ctx carries none).
+	defer context.AfterFunc(ctx, func() { _ = conn.Close() })()
 
 	id, err := newClientGUID(rand.Reader)
 	if err != nil {
@@ -169,6 +173,16 @@ func (dialer Dialer) PingContext(ctx context.Context, address string) (response 
 	data = make([]byte, maxMTUSize)
 	n, err := conn.Read(data)
 	if err != nil {
+		// On deadline expiry the AfterFunc close can beat the socket deadline, turning a timeout
+		// into net.ErrClosed. Restore the ctx-driven classification so a deadline still reports a
+		// timeout (os.ErrDeadlineExceeded) and a cancellation reports its own cause.
+		if errors.Is(err, net.ErrClosed) && ctx.Err() != nil {
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				err = os.ErrDeadlineExceeded
+			} else {
+				err = ctx.Err()
+			}
+		}
 		return nil, dialer.error("ping", err)
 	}
 	if n == 0 || data[0] != message.IDUnconnectedPong {
