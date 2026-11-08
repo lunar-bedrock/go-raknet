@@ -5,6 +5,8 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"github.com/sandertv/go-raknet/internal/message"
 )
 
 // One Pinger reaches several listeners and reports each pong with its sender.
@@ -57,7 +59,7 @@ func TestPingerCollectsPongsFromSeveralListeners(t *testing.T) {
 	}
 }
 
-// Datagrams other than unconnected pongs are skipped.
+// Datagrams other than unconnected pongs, and pongs without the offline magic, are skipped.
 func TestPingerSkipsOtherDatagrams(t *testing.T) {
 	p, err := ListenPinger("udp4", "127.0.0.1:0")
 	if err != nil {
@@ -70,20 +72,18 @@ func TestPingerSkipsOtherDatagrams(t *testing.T) {
 	}
 	defer sender.Close()
 
-	pong := make([]byte, 35+4)
-	pong[0] = 0x1c
-	copy(pong[17:], []byte{0x00, 0xff, 0xff, 0x00, 0xfe, 0xfe, 0xfe, 0xfe, 0xfd, 0xfd, 0xfd, 0xfd, 0x12, 0x34, 0x56, 0x78})
-	pong[34] = 4
-	copy(pong[35:], "MCPE")
-	for _, datagram := range [][]byte{{0x05, 1, 2}, pong} {
+	pong, _ := (&message.UnconnectedPong{ServerGUID: 7, Data: []byte("MCPE")}).MarshalBinary()
+	badMagic, _ := (&message.UnconnectedPong{ServerGUID: 8, Data: []byte("FAKE")}).MarshalBinary()
+	badMagic[17] ^= 0xff
+	for _, datagram := range [][]byte{{0x05, 1, 2}, badMagic, pong} {
 		if _, err := sender.WriteTo(datagram, p.LocalAddr()); err != nil {
 			t.Fatalf("WriteTo: %v", err)
 		}
 	}
 	_ = p.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	got, err := p.ReadPong()
-	if err != nil || !bytes.Equal(got.Data, []byte("MCPE")) {
-		t.Fatalf("ReadPong() = %q, %v, want MCPE", got.Data, err)
+	if err != nil || got.ServerGUID != 7 || !bytes.Equal(got.Data, []byte("MCPE")) {
+		t.Fatalf("ReadPong() = %d %q, %v, want 7 MCPE", got.ServerGUID, got.Data, err)
 	}
 }
 

@@ -51,14 +51,19 @@ func (p *Pinger) Ping(addr net.Addr) error {
 	return err
 }
 
-// ReadPong blocks until the next unconnected pong arrives, skipping any other datagram. It
-// returns an error once the Pinger is closed.
+// ReadPong blocks until the next unconnected pong arrives, skipping any other datagram and ICMP
+// errors from earlier pings. It returns an error once the Pinger is closed.
 func (p *Pinger) ReadPong() (Pong, error) {
 	// A pong may carry more data than fits one MTU; read up to the largest UDP payload.
 	b := make([]byte, 65535)
 	for {
 		n, addr, err := p.conn.ReadFrom(b)
 		if err != nil {
+			// An ICMP error for an earlier ping, such as to a loopback port no world listens on,
+			// surfaces on the next read; it says nothing about the pongs still to come.
+			if isTransientUDPReadError(err) {
+				continue
+			}
 			return Pong{}, err
 		}
 		if n == 0 || b[0] != message.IDUnconnectedPong {
