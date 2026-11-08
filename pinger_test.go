@@ -1,0 +1,112 @@
+package raknet
+
+import (
+	"bytes"
+	"net"
+	"testing"
+	"time"
+
+	"github.com/sandertv/go-raknet/internal/message"
+)
+
+// One Pinger reaches several listeners and reports each pong with its sender.
+func TestPingerCollectsPongsFromSeveralListeners(t *testing.T) {
+	var addrs []net.Addr
+	for _, motd := range []string{"first", "second"} {
+		l, err := Listen("127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("Listen: %v", err)
+		}
+		t.Cleanup(func() { _ = l.Close() })
+		l.PongData([]byte(motd))
+		addrs = append(addrs, l.Addr())
+	}
+
+	p, err := ListenPinger("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPinger: %v", err)
+	}
+	defer p.Close()
+	for _, addr := range addrs {
+		if err := p.Ping(addr); err != nil {
+			t.Fatalf("Ping(%v): %v", addr, err)
+		}
+	}
+
+	got := map[string]string{}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for len(got) < len(addrs) {
+			pong, err := p.ReadPong()
+			if err != nil {
+				return
+			}
+			got[pong.Addr.String()] = string(pong.Data)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		_ = p.Close()
+		<-done
+		t.Fatalf("pongs = %v, want one from each of %v", got, addrs)
+	}
+	for i, want := range []string{"first", "second"} {
+		if got[addrs[i].String()] != want {
+			t.Fatalf("pong from %v = %q, want %q", addrs[i], got[addrs[i].String()], want)
+		}
+	}
+}
+
+// Datagrams other than unconnected pongs, and pongs without the offline magic, are skipped.
+func TestPingerSkipsOtherDatagrams(t *testing.T) {
+	p, err := ListenPinger("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPinger: %v", err)
+	}
+	defer p.Close()
+	sender, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket: %v", err)
+	}
+	defer sender.Close()
+
+	pong, _ := (&message.UnconnectedPong{ServerGUID: 7, Data: []byte("MCPE")}).MarshalBinary()
+	badMagic, _ := (&message.UnconnectedPong{ServerGUID: 8, Data: []byte("FAKE")}).MarshalBinary()
+	badMagic[17] ^= 0xff
+	for _, datagram := range [][]byte{{0x05, 1, 2}, badMagic, pong} {
+		if _, err := sender.WriteTo(datagram, p.LocalAddr()); err != nil {
+			t.Fatalf("WriteTo: %v", err)
+		}
+	}
+	_ = p.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	got, err := p.ReadPong()
+	if err != nil || got.ServerGUID != 7 || !bytes.Equal(got.Data, []byte("MCPE")) {
+		t.Fatalf("ReadPong() = %d %q, %v, want 7 MCPE", got.ServerGUID, got.Data, err)
+	}
+}
+
+// A pong larger than one MTU arrives whole.
+func TestPingerReadsLargePongs(t *testing.T) {
+	l, err := Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer l.Close()
+	data := bytes.Repeat([]byte("x"), 2000)
+	l.PongData(data)
+	p, err := ListenPinger("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPinger: %v", err)
+	}
+	defer p.Close()
+	if err := p.Ping(l.Addr()); err != nil {
+		t.Fatalf("Ping: %v", err)
+	}
+	_ = p.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	got, err := p.ReadPong()
+	if err != nil || !bytes.Equal(got.Data, data) {
+		t.Fatalf("ReadPong() = %d bytes, %v, want %d", len(got.Data), err, len(data))
+	}
+}

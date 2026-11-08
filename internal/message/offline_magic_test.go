@@ -37,3 +37,17 @@ func TestOfflineReplyMagicValidation(t *testing.T) {
 		}
 	}
 }
+
+// An unconnected pong decodes only with the offline magic.
+func TestUnconnectedPongMagicValidation(t *testing.T) {
+	pong := &UnconnectedPong{PingTime: 3, ServerGUID: 1, Data: []byte("MCPE")}
+	b, _ := pong.MarshalBinary()
+	decoded := &UnconnectedPong{}
+	if err := decoded.UnmarshalBinary(b[1:]); err != nil || decoded.ServerGUID != 1 || string(decoded.Data) != "MCPE" {
+		t.Fatalf("round trip: %+v, %v", decoded, err)
+	}
+	b[17] ^= 1
+	if err := (&UnconnectedPong{}).UnmarshalBinary(b[1:]); err == nil {
+		t.Fatal("accepted wrong magic")
+	}
+}
