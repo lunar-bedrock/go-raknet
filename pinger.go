@@ -17,12 +17,9 @@ type Pinger struct {
 
 // Pong is one unconnected pong and the address that sent it.
 type Pong struct {
-	// Addr is the address the pong came from.
-	Addr net.Addr
-	// ServerGUID is the GUID of the RakNet peer that answered.
-	ServerGUID int64
-	// Data is the application data of the pong.
-	Data []byte
+	Addr       net.Addr // the address the pong came from
+	ServerGUID int64    // the GUID of the RakNet peer that answered
+	Data       []byte   // the pong's application data
 }
 
 // ListenPinger opens a Pinger on a UDP socket bound to address, for example "udp4" and ":0".

@@ -7,9 +7,9 @@ import (
 	"syscall"
 )
 
-// isTransientUDPReadError returns true for read errors on connected UDP sockets
-// commonly caused by ICMP errors. These may be due to lossy client networks or
-// normal transient conditions, and are safe to retry during the handshake.
+// isTransientUDPReadError returns true for read errors commonly caused by ICMP
+// errors for an earlier write, which are safe to retry: during a handshake, and
+// on a Pinger's unconnected socket, where Windows reports them too.
 func isTransientUDPReadError(err error) bool {
 	if err == nil {
 		return false

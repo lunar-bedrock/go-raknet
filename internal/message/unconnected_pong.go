@@ -17,11 +17,11 @@ func (pk *UnconnectedPong) UnmarshalBinary(data []byte) error {
 	if len(data) < 32 {
 		return io.ErrUnexpectedEOF
 	}
-	pk.PingTime = int64(binary.BigEndian.Uint64(data))
-	pk.ServerGUID = int64(binary.BigEndian.Uint64(data[8:]))
 	if err := checkOfflineMagic(data[16:]); err != nil {
 		return err
 	}
+	pk.PingTime = int64(binary.BigEndian.Uint64(data))
+	pk.ServerGUID = int64(binary.BigEndian.Uint64(data[8:]))
 
 	// if there are fewer than 34 bytes then length field is absent -> no Data
 	if len(data) < 34 {
