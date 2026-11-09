@@ -87,3 +87,32 @@ func testStalledReader(t *testing.T, drop, dup float64) {
 		}
 	}
 }
+
+// TestRefusedDatagramsKeepWindowInStep accepts datagrams again once the reader drains, even after the peer's
+// sequence numbers moved past the recoverable gap while every datagram was refused.
+func TestRefusedDatagramsKeepWindowInStep(t *testing.T) {
+	conn, _, cancel := newSendTestConn()
+	defer cancel()
+	conn.win = newDatagramWindow()
+	for range maxQueuedPackets {
+		conn.packets.Send([]byte{0xfe})
+	}
+	var seq uint24
+	for ; seq < maxDatagramGap+100; seq++ {
+		if err := conn.receiveDatagram(datagram(seq)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(conn.ackSlice) != 0 {
+		t.Fatalf("%v refused datagrams were acknowledged", len(conn.ackSlice))
+	}
+	for range maxQueuedPackets {
+		conn.packets.Recv(context.Background())
+	}
+	if err := conn.receiveDatagram(datagram(seq)); err != nil {
+		t.Fatal(err)
+	}
+	if len(conn.ackSlice) != 1 || conn.ackSlice[0] != seq {
+		t.Fatalf("datagram %v after draining was not accepted: acks %v", seq, conn.ackSlice)
+	}
+}

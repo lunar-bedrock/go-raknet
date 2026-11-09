@@ -694,14 +694,6 @@ func (conn *Conn) receiveDatagram(b []byte) error {
 	if len(b) < 3 {
 		return fmt.Errorf("read datagram: %w", io.ErrUnexpectedEOF)
 	}
-	if conn.packets.Full() {
-		// The reader is behind. Refuse the datagram before it is recorded or
-		// acknowledged, so the peer resends it and backs off, instead of blocking
-		// the receive loop a Listener shares with every other connection.
-		conn.stalledSince.CompareAndSwap(0, time.Now().UnixNano())
-		return nil
-	}
-	conn.stalledSince.Store(0)
 	seq := loadUint24(b)
 	ok, skipped := conn.win.add(seq)
 	if !ok {
@@ -710,6 +702,16 @@ func (conn *Conn) receiveDatagram(b []byte) error {
 		// the jump the same way, on every connection.
 		return nil
 	}
+	if conn.packets.Full() {
+		// The reader is behind. Refuse the datagram without acknowledging,
+		// NACKing or handling it, so the peer resends its contents under a new
+		// sequence number and backs off, instead of blocking the receive loop a
+		// Listener shares with every other connection. The window above still
+		// advances, so those resends are not rejected as too far ahead.
+		conn.stalledSince.CompareAndSwap(0, time.Now().UnixNano())
+		return nil
+	}
+	conn.stalledSince.Store(0)
 	conn.ackMu.Lock()
 	// Add this sequence number to the received datagrams, so that it is
 	// included in an ACK.
