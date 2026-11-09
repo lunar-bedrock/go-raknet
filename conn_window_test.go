@@ -1,6 +1,7 @@
 package raknet
 
 import (
+	"github.com/sandertv/go-raknet/internal"
 	"testing"
 )
 
@@ -97,7 +98,7 @@ func TestDatagramWindowWraps(t *testing.T) {
 // TestReceiveDatagramDropsFarAhead is the regression guard: one far-ahead
 // datagram must be dropped without advancing the window or being acknowledged.
 func TestReceiveDatagramDropsFarAhead(t *testing.T) {
-	conn := &Conn{win: newDatagramWindow()}
+	conn := &Conn{win: newDatagramWindow(), packets: internal.Chan[[]byte](4, maxQueuedPackets)}
 	if err := conn.receiveDatagram(datagram(1 << 23)); err != nil {
 		t.Fatalf("far-ahead datagram: unexpected error: %v", err)
 	}

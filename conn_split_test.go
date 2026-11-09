@@ -15,7 +15,7 @@ func newSplitTestConn() *Conn {
 		splits:  make(map[uint16]splitEntry),
 		win:     newDatagramWindow(),
 		handler: dialerConnectionHandler{},
-		packets: internal.Chan[[]byte](4, 4096),
+		packets: internal.Chan[[]byte](4, maxQueuedPackets),
 	}
 }
 

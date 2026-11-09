@@ -6,9 +6,10 @@ import (
 	"sync/atomic"
 )
 
-// ElasticChan is a channel that grows if its capacity is reached. ElasticChan
-// is safe for concurrent use with multiple readers and 1 sender. Calling Send
-// from multiple goroutines simultaneously is unsafe.
+// ElasticChan is a channel that grows if its capacity is reached. Its limit is
+// advisory: Full reports it, and the sender decides what to stop admitting.
+// ElasticChan is safe for concurrent use with multiple readers and 1 sender.
+// Calling Send from multiple goroutines simultaneously is unsafe.
 type ElasticChan[T any] struct {
 	mu  sync.RWMutex
 	len atomic.Int64
@@ -16,7 +17,7 @@ type ElasticChan[T any] struct {
 	lim int64
 }
 
-// Chan creates an ElasticChan of a size.
+// Chan creates an ElasticChan of a size, reporting Full once it holds max values.
 func Chan[T any](size, max int) *ElasticChan[T] {
 	c := new(ElasticChan[T])
 	c.lim = int64(max)
@@ -41,10 +42,11 @@ func (c *ElasticChan[T]) Recv(ctx context.Context) (val T, ok bool) {
 	}
 }
 
-// Send sends a value to the channel. Send never blocks, because if the maximum
-// capacity of the underlying channel is reached, a larger one is created.
+// Send sends a value to the channel. Send never blocks: the channel grows
+// past its limit instead, so callers must check Full and stop admitting values
+// to keep it bounded.
 func (c *ElasticChan[T]) Send(val T) {
-	if ccap := int64(cap(c.ch)); c.len.Add(1) >= ccap && ccap < c.lim {
+	if c.len.Add(1) >= int64(cap(c.ch)) {
 		// This check happens outside a lock, meaning in the meantime, a call to
 		// Recv could cause the length to decrease, technically meaning growing
 		// is then unnecessary. That isn't a major issue though, as in most
@@ -55,9 +57,18 @@ func (c *ElasticChan[T]) Send(val T) {
 	c.ch <- val
 }
 
-// growSend grows the channel to double the capacity, capped by the configured
-// limit, copying all values currently in the channel, and sends the value to
-// the new channel.
+// Full reports whether the channel holds at least its limit of values.
+func (c *ElasticChan[T]) Full() bool {
+	return c.len.Load() >= c.lim
+}
+
+// Len returns the number of values in the channel.
+func (c *ElasticChan[T]) Len() int {
+	return int(c.len.Load())
+}
+
+// growSend grows the channel to double the capacity, copying all values
+// currently in the channel, and sends the value to the new channel.
 func (c *ElasticChan[T]) growSend(val T) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -65,9 +76,6 @@ func (c *ElasticChan[T]) growSend(val T) {
 	next := cap(c.ch) * 2
 	if next == 0 {
 		next = 1
-	}
-	if lim := int(c.lim); next > lim {
-		next = lim
 	}
 	c.grow(next)
 	c.ch <- val
