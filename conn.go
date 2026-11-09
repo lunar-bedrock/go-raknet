@@ -113,6 +113,9 @@ type Conn struct {
 	// It is nil until a connection request is received.
 	systemStart atomic.Pointer[time.Time]
 
+	// pings holds round-trip times measured from connected pongs.
+	pings pingHistory
+
 	closing        atomic.Int64
 	disconnectSent atomic.Bool
 
