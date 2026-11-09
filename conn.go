@@ -196,7 +196,7 @@ type Conn struct {
 	sendSignal chan struct{}
 
 	lastActivity atomic.Pointer[time.Time]
-	stalledSince atomic.Int64 // UnixNano since the reader left packets full, or 0
+	stalledSince atomic.Int64 // UnixNano since datagrams were first refused, or 0 once admitted again
 }
 
 // newConn constructs a new connection specifically dedicated to the address
@@ -292,12 +292,8 @@ func (conn *Conn) startTicking() {
 				conn.mu.Lock()
 				timedOut := t.Sub(*conn.lastActivity.Load()) > time.Second*5+conn.retransmission.rtt()*2
 				conn.mu.Unlock()
-				if since := conn.stalledSince.Load(); since != 0 {
-					if !conn.packets.Full() {
-						conn.stalledSince.CompareAndSwap(since, 0)
-					} else if t.Sub(time.Unix(0, since)) > stallTimeout {
-						timedOut = true
-					}
+				if since := conn.stalledSince.Load(); since != 0 && conn.packets.Full() && t.Sub(time.Unix(0, since)) > stallTimeout {
+					timedOut = true
 				}
 				if timedOut {
 					// Close sends a disconnect through Write, which takes conn.mu.
@@ -669,7 +665,13 @@ var packetPool = sync.Pool{New: func() any { return &packet{reliability: reliabi
 func (conn *Conn) receive(b []byte) error {
 	t := time.Now()
 	conn.lastActivity.Store(&t)
-	if len(conn.splits) != 0 && t.Sub(conn.lastSplitSweep) >= splitSweepInterval {
+	if since := conn.stalledSince.Load(); since != 0 && !conn.packets.Full() {
+		// The reader caught up. Reassemblies starved while datagrams were
+		// refused get their full timeout again: the peer did not stop sending.
+		conn.stalledSince.Store(0)
+		conn.resumeSplits(t)
+	}
+	if len(conn.splits) != 0 && t.Sub(conn.lastSplitSweep) >= splitSweepInterval && !conn.packets.Full() {
 		// Reclaim reassemblies that stopped advancing, so an abandoned set
 		// cannot hold its slots and memory for the rest of the session.
 		conn.lastSplitSweep = t
@@ -711,7 +713,6 @@ func (conn *Conn) receiveDatagram(b []byte) error {
 		conn.stalledSince.CompareAndSwap(0, time.Now().UnixNano())
 		return nil
 	}
-	conn.stalledSince.Store(0)
 	conn.ackMu.Lock()
 	// Add this sequence number to the received datagrams, so that it is
 	// included in an ACK.
@@ -888,6 +889,15 @@ func (conn *Conn) evictExpiredSplits(now time.Time) {
 		if now.Sub(entry.lastUpdate) >= splitTimeout {
 			conn.removeSplit(id)
 		}
+	}
+}
+
+// resumeSplits restarts the timeout of every reassembly after a stall this end
+// imposed by refusing datagrams.
+func (conn *Conn) resumeSplits(now time.Time) {
+	for id, entry := range conn.splits {
+		entry.lastUpdate = now
+		conn.splits[id] = entry
 	}
 }
 

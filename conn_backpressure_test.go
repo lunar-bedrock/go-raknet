@@ -116,3 +116,36 @@ func TestRefusedDatagramsKeepWindowInStep(t *testing.T) {
 		t.Fatalf("datagram %v after draining was not accepted: acks %v", seq, conn.ackSlice)
 	}
 }
+
+// TestRefusalStallKeepsReassemblies keeps a partial split packet through a stall this end imposed, and gives
+// it a fresh timeout once the reader drains, since its missing fragments were refused rather than lost.
+func TestRefusalStallKeepsReassemblies(t *testing.T) {
+	conn, _, cancel := newSendTestConn()
+	defer cancel()
+	conn.win = newDatagramWindow()
+	conn.splits = map[uint16]splitEntry{1: {
+		fragments:  map[uint32][]byte{0: {0xfe}},
+		count:      2,
+		size:       1,
+		lastUpdate: time.Now().Add(-2 * splitTimeout),
+	}}
+	for range maxQueuedPackets {
+		conn.packets.Send([]byte{0xfe})
+	}
+	if err := conn.receive(append([]byte{bitFlagDatagram}, datagram(0)...)); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := conn.splits[1]; !ok {
+		t.Fatal("reassembly expired while its fragments were being refused")
+	}
+	for range maxQueuedPackets {
+		conn.packets.Recv(context.Background())
+	}
+	if err := conn.receive(append([]byte{bitFlagDatagram}, datagram(1)...)); err != nil {
+		t.Fatal(err)
+	}
+	entry, ok := conn.splits[1]
+	if !ok || time.Since(entry.lastUpdate) > time.Second {
+		t.Fatalf("reassembly not resumed after the stall: present %v, last update %v ago", ok, time.Since(entry.lastUpdate))
+	}
+}
