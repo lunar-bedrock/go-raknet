@@ -290,7 +290,7 @@ func (conn *Conn) startTicking() {
 				continue
 			}
 			if i%5 == 0 {
-				_ = conn.send(&message.ConnectedPing{PingTime: timestamp()})
+				_ = conn.sendPing()
 
 				conn.mu.Lock()
 				timedOut := t.Sub(*conn.lastActivity.Load()) > time.Second*5+conn.retransmission.rtt()*2

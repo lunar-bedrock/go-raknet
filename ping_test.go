@@ -26,6 +26,39 @@ func TestPingHistoryAveragesLastFiveSamples(t *testing.T) {
 	}
 }
 
+func TestPingHistoryRoundsAverageDown(t *testing.T) {
+	var history pingHistory
+	history.add(30 * time.Millisecond)
+	history.add(31 * time.Millisecond)
+	if got, ok := history.average(); !ok || got != 30*time.Millisecond {
+		t.Fatalf("average() = %v, %v, want 30ms", got, ok)
+	}
+}
+
+func TestSendPingWritesUnreliableDatagramImmediately(t *testing.T) {
+	conn, packetConn, cancel := newSendTestConn()
+	defer cancel()
+	// A ping must leave even when queued data has used up the send budget.
+	conn.sendBudget = 0
+	if err := conn.sendPing(); err != nil {
+		t.Fatal(err)
+	}
+	if len(packetConn.writes) != 1 {
+		t.Fatalf("sendPing wrote %d datagrams, want 1", len(packetConn.writes))
+	}
+	pk := &packet{}
+	// Skip the datagram header byte and its three-byte sequence number.
+	if _, err := pk.read(packetConn.writes[0][4:]); err != nil {
+		t.Fatal(err)
+	}
+	if pk.reliability != reliabilityUnreliable || len(pk.content) == 0 || pk.content[0] != message.IDConnectedPing {
+		t.Fatalf("sent reliability %v, content %x, want an unreliable connected ping", pk.reliability, pk.content)
+	}
+	if n := len(conn.retransmission.unacknowledged); n != 0 {
+		t.Fatalf("%d pings kept for retransmission, want none", n)
+	}
+}
+
 func TestAveragePingRecordsConnectedPong(t *testing.T) {
 	conn, _, cancel := newSendTestConn()
 	defer cancel()
