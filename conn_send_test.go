@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"github.com/sandertv/go-raknet/internal"
 	"net"
 	"sync"
 	"testing"
@@ -54,6 +55,7 @@ func newSendTestConn() (*Conn, *recordingPacketConn, context.CancelFunc) {
 		sendQueueFreed: make(chan struct{}),
 		sendSignal:     make(chan struct{}, 1),
 		sendBudget:     maxMTUSize - 28,
+		packets:        internal.Chan[[]byte](4, maxQueuedPackets),
 	}
 	return conn, packetConn, cancel
 }

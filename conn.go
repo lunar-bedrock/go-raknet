@@ -54,6 +54,13 @@ const (
 	// splitTimeout is how long a reassembly may go without a new fragment
 	// before its slot may be reclaimed. The client uses its connection timeout.
 	splitTimeout = time.Second * 10
+	// maxQueuedPackets is how many received packets may wait for the reader before
+	// new datagrams are refused unacknowledged, so the peer resends them later. A
+	// datagram filling an ordered gap can still release up to maxWindowSize more.
+	maxQueuedPackets = 4096
+	// stallTimeout closes a connection whose reader has left that queue full for
+	// this long, matching the client's connection timeout.
+	stallTimeout = time.Second * 10
 	// splitSweepInterval bounds how often inbound traffic may sweep, so a peer
 	// cannot make every datagram it sends scan the whole reassembly map.
 	splitSweepInterval = time.Second
@@ -189,6 +196,7 @@ type Conn struct {
 	sendSignal chan struct{}
 
 	lastActivity atomic.Pointer[time.Time]
+	stalledSince atomic.Int64 // UnixNano since datagrams were first refused, or 0 once admitted again
 }
 
 // newConn constructs a new connection specifically dedicated to the address
@@ -202,7 +210,7 @@ func newConn(conn net.PacketConn, raddr net.Addr, mtu uint16, h connectionHandle
 		handler:        h,
 		pk:             new(packet),
 		connected:      make(chan struct{}),
-		packets:        internal.Chan[[]byte](4, 4096),
+		packets:        internal.Chan[[]byte](4, maxQueuedPackets),
 		splits:         make(map[uint16]splitEntry),
 		win:            newDatagramWindow(),
 		packetQueue:    newPacketQueue(),
@@ -284,6 +292,9 @@ func (conn *Conn) startTicking() {
 				conn.mu.Lock()
 				timedOut := t.Sub(*conn.lastActivity.Load()) > time.Second*5+conn.retransmission.rtt()*2
 				conn.mu.Unlock()
+				if since := conn.stalledSince.Load(); since != 0 && conn.packets.Full() && t.Sub(time.Unix(0, since)) > stallTimeout {
+					timedOut = true
+				}
 				if timedOut {
 					// Close sends a disconnect through Write, which takes conn.mu.
 					// Do not call it while holding the same non-reentrant mutex.
@@ -654,7 +665,13 @@ var packetPool = sync.Pool{New: func() any { return &packet{reliability: reliabi
 func (conn *Conn) receive(b []byte) error {
 	t := time.Now()
 	conn.lastActivity.Store(&t)
-	if len(conn.splits) != 0 && t.Sub(conn.lastSplitSweep) >= splitSweepInterval {
+	if since := conn.stalledSince.Load(); since != 0 && !conn.packets.Full() {
+		// The reader caught up. Reassemblies starved while datagrams were
+		// refused get their full timeout again: the peer did not stop sending.
+		conn.stalledSince.Store(0)
+		conn.resumeSplits(t)
+	}
+	if len(conn.splits) != 0 && t.Sub(conn.lastSplitSweep) >= splitSweepInterval && !conn.packets.Full() {
 		// Reclaim reassemblies that stopped advancing, so an abandoned set
 		// cannot hold its slots and memory for the rest of the session.
 		conn.lastSplitSweep = t
@@ -685,6 +702,15 @@ func (conn *Conn) receiveDatagram(b []byte) error {
 		// Too far ahead to recover: reporting the gap would NACK tens of
 		// thousands of datagrams. Drop it, unacknowledged. The client bounds
 		// the jump the same way, on every connection.
+		return nil
+	}
+	if conn.packets.Full() {
+		// The reader is behind. Refuse the datagram without acknowledging,
+		// NACKing or handling it, so the peer resends its contents under a new
+		// sequence number and backs off, instead of blocking the receive loop a
+		// Listener shares with every other connection. The window above still
+		// advances, so those resends are not rejected as too far ahead.
+		conn.stalledSince.CompareAndSwap(0, time.Now().UnixNano())
 		return nil
 	}
 	conn.ackMu.Lock()
@@ -863,6 +889,15 @@ func (conn *Conn) evictExpiredSplits(now time.Time) {
 		if now.Sub(entry.lastUpdate) >= splitTimeout {
 			conn.removeSplit(id)
 		}
+	}
+}
+
+// resumeSplits restarts the timeout of every reassembly after a stall this end
+// imposed by refusing datagrams.
+func (conn *Conn) resumeSplits(now time.Time) {
+	for id, entry := range conn.splits {
+		entry.lastUpdate = now
+		conn.splits[id] = entry
 	}
 }
 
